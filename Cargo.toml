@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "key-vault"
 version = "0.1.0"
 edition = "2024"
@@ -10,7 +10,7 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Enterprise-grade key management vault for Rust. Scattered in-memory key storage with multiple distortion strategies, mlock/zeroize protection, pluggable acquisition (TPM, keychain, file, env), master key recovery."
+description = "Enterprise-grade key management vault for Rust. 9-layer defense-in-depth: fragmentation, decoy bytes, codex transform, mlock + zeroize, constant-time ops, security monitoring. Pluggable key fetchers (TPM, keychain, file, env). Sub-microsecond access. REPS-compliant."
 
 # 5-slot search optimization: vault, keys, encryption, secure, keychain
 keywords = [
@@ -43,29 +43,55 @@ name = "key_vault"
 path = "src/lib.rs"
 
 [features]
-default = ["std", "mlock", "zeroize"]
+# Default: maximum security on, performance-impacting layers off
+default = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]
 
-# Core feature flags
+# Core
 std = []                              # Standard library (default on)
 mlock = []                            # Lock memory pages from swap (default on)
 zeroize = ["dep:zeroize"]             # Zero on drop (default on)
 
-# Acquirer feature flags (pluggable key sources)
-acquirer-keychain = ["dep:keyring"]   # OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service)
-acquirer-file = []                    # Encrypted file storage
-acquirer-env = []                     # Environment variable
-acquirer-tpm = []                     # TPM 2.0 hardware acquirer (Linux/Windows)
-acquirer-all = ["acquirer-keychain", "acquirer-file", "acquirer-env", "acquirer-tpm"]
+# Key fetchers (pluggable sources)
+fetcher-keychain = ["dep:keyring"]    # OS keychain (macOS, Windows, Linux)
+fetcher-file = []                     # Encrypted file storage
+fetcher-env = []                      # Environment variable
+fetcher-tpm = []                      # TPM 2.0 hardware (post-1.0)
+fetcher-all = ["fetcher-keychain", "fetcher-file", "fetcher-env"]
 
-# Scatter strategy feature flags
-scatter-standard = []                 # Chunked shuffle with filler (default)
-scatter-interleaved = []              # Interleaved bytes with filler
-scatter-fragmented = []               # Non-contiguous fragments
-scatter-layered = []                  # Compose multiple strategies
-scatter-all = ["scatter-standard", "scatter-interleaved", "scatter-fragmented", "scatter-layered"]
+# Fragment strategies (key splicing/shuffling)
+fragment-standard = []                # Variable chunks + self-ref decoy (default)
+fragment-interleaved = []             # Interleaved bytes pattern
+fragment-random = []                  # Non-contiguous random fragments
+fragment-layered = []                 # Compose multiple strategies
+fragment-all = ["fragment-standard", "fragment-interleaved", "fragment-random", "fragment-layered"]
 
-# Quality-of-life
-post-quantum = []                     # Marker for post-quantum-safe defaults (256-bit keys minimum)
+# Decoy strategies (byte filler/nonsense generators)
+decoy-random = []                     # Random bytes (weakest, fastest)
+decoy-self-ref = []                   # Bytes derived from key itself (default)
+decoy-key-derived = []                # Hash-derived bytes that match key entropy
+decoy-all = ["decoy-random", "decoy-self-ref", "decoy-key-derived"]
+
+# Layer 5: Codex transformation (byte swap layer)
+codex = []                            # Enable Codex layer (opt-in, adds ~5-10ns per byte)
+codex-dynamic = ["codex"]             # Per-vault randomized codex
+
+# Layer 8: Security monitoring
+monitor = []                          # Enable security event monitoring
+monitor-tracing = ["monitor", "dep:tracing"]  # tracing crate integration
+
+# Layer 9: Audit logging of key access
+audit = []                            # Enable access audit logging
+
+# TEE detection (no impact when no TEE present)
+tee-detect = []                       # Detect TEE availability at startup
+
+# Post-quantum marker (informational - 256-bit symmetric defaults)
+post-quantum = []
+
+# Convenience preset features
+preset-balanced = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]
+preset-paranoid = ["std", "mlock", "zeroize", "fragment-layered", "decoy-all", "codex", "monitor", "audit", "tee-detect"]
+preset-fast = ["std", "fragment-standard", "decoy-random"]
 
 [dependencies]
 # Constant-time comparisons (security-critical)
@@ -78,11 +104,17 @@ arc-swap = "1.7"
 getrandom = "0.2"
 rand_core = "0.6"
 
+# Cryptographic hashing for key normalization (BLAKE3 - fast, post-quantum safe)
+blake3 = "1"
+
 # Optional - secret zeroing on drop
 zeroize = { version = "1.7", optional = true, features = ["derive"] }
 
 # Optional - OS keychain integration
 keyring = { version = "3", optional = true }
+
+# Optional - tracing integration for monitor
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

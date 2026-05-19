@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to `key-vault` will be documented in this file.
 
@@ -27,7 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REPS compliance baseline.
 - CI for Linux/macOS/Windows on stable and MSRV (1.75).
 - Project documentation framework (PROMPT, DIRECTIVES, ROADMAP).
-- Cargo features for acquirers (keychain, file, env, tpm) and scatter strategies.
+- **9-layer security architecture** locked in:
+  - Layer 1: Secure Acquisition (`KeyFetch` trait)
+  - Layer 2: Memory Page Locking (mlock / VirtualLock)
+  - Layer 3: Fragment Strategy (variable chunks)
+  - Layer 4: Decoy Bytes (self-referential filler)
+  - Layer 5: Codex Transformation (involution-based byte swap)
+  - Layer 6: Constant-Time Operations
+  - Layer 7: Zero-On-Drop (zeroize)
+  - Layer 8: Security Monitor (failure detection)
+  - Layer 9: Audit Logging
+  - Bonus Layer 10: Page Protection Toggling
+- Cargo feature flags for all fetchers, fragment strategies, decoy strategies, codex, monitor, audit, mlock, zeroize, tee-detect, post-quantum
+- Convenience presets: preset-balanced, preset-paranoid, preset-fast
+- `docs/SECURITY.md` (24 KB) - comprehensive 9-layer security architecture
+- `docs/TRANSFORMATION.md` (12 KB) - visual walkthrough of key transformation
+- BLAKE3 key normalization
+- TEE detection in 1.0 scope (full TEE integration deferred to 1.x)
 
 [Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/jamesgober/key-vault/releases/tag/v0.1.0

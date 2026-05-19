@@ -1,15 +1,34 @@
-﻿//! # key-vault
+//! # key-vault
 //!
 //! ENTERPRISE-GRADE KEY MANAGEMENT VAULT
 //!
-//! Scattered in-memory key storage with multiple distortion strategies, mlock/zeroize protection, pluggable acquisition. Sub-microsecond access. Defense-in-depth for cryptographic key material.
+//! 9-layer defense-in-depth in-memory key storage. Fragmented across non-contiguous
+//! mlock'd allocations, interleaved with self-referential decoy bytes, optionally
+//! transformed through a codex layer, with constant-time operations, zero-on-drop,
+//! security monitoring, and audit logging.
+//!
+//! # The 9 Layers (plus bonus Layer 10)
+//!
+//! 1. **Secure Acquisition** (`KeyFetch` trait — TPM/HSM/Keychain/File/Env)
+//! 2. **Memory Page Locking** (`mlock` / `VirtualLock` — prevents swap)
+//! 3. **Fragment Strategy** (variable chunks, shuffled, non-contiguous)
+//! 4. **Decoy Bytes** (self-referential filler, statistically indistinguishable)
+//! 5. **Codex Transformation** (byte swap via involution)
+//! 6. **Constant-Time Operations** (subtle::ConstantTimeEq)
+//! 7. **Zero-On-Drop** (zeroize crate)
+//! 8. **Security Monitor** (failed decrypt detection, threshold lockout)
+//! 9. **Audit Logging** (every key access tracked)
+//! 10. **(Bonus) Page Protection Toggling** (PROT_NONE when not in use)
+//!
+//! See `docs/SECURITY.md` for the full architecture and `docs/TRANSFORMATION.md`
+//! for a visual walkthrough.
 //!
 //! # Design philosophy
 //!
-//! $name is a focused primitive for keeping cryptographic key material safe in memory
-//! while the application is running. It is deliberately **NOT**:
+//! `key-vault` is a focused primitive for keeping cryptographic key material safe in
+//! memory while the application is running. It is deliberately **NOT**:
 //!
-//! - A cryptographic library (use crypt-io or similar for actual encryption)
+//! - A cryptographic library (use `crypt-io` for actual encryption)
 //! - A secrets manager (use HashiCorp Vault for centralized secret distribution)
 //! - A password manager (different problem domain)
 //!
@@ -19,39 +38,28 @@
 //! - A pluggable key acquisition framework
 //! - A library for making memory-resident keys hard to extract via memory analysis
 //!
-//! # Defense layers
-//!
-//! $name employs multiple defense layers, configurable via features:
-//!
-//! 1. **Memory page locking** (mlock/VirtualLock) — prevents swap to disk
-//! 2. **Zero on drop** (zeroize) — overwrites memory when keys are dropped
-//! 3. **Scattered storage** — key bytes split across multiple non-contiguous allocations
-//! 4. **Distortion patterns** — filler bytes derived from key material itself
-//! 5. **Variable layout** — chunk sizes and counts randomized per scatter
-//! 6. **Constant-time comparison** — subtle for all key-related equality checks
-//!
-//! These layers compose. Each adds friction for an attacker with memory access.
-//! None are silver bullets; combined, they raise the bar significantly.
-//!
 //! # Threat model
 //!
-//! $name protects against:
+//! `key-vault` protects against:
 //!
 //! - **Memory scraping by code with read access** (some malware, forensic tools)
 //! - **Swap file persistence** (mlock prevents swap)
-//! - **Pattern recognition in memory dumps** (scatter + distortion defeats statistical analysis)
+//! - **Pattern recognition in memory dumps** (fragment + decoy + codex defeats analysis)
 //! - **Use-after-free leakage** (zeroize on drop)
+//! - **Brute-force decryption attempts** (security monitor + threshold lockout)
+//! - **Timing side-channels** (constant-time operations)
+//! - **Insider threats / compliance** (audit logging)
 //!
 //! It does NOT protect against:
 //!
-//! - **Code execution in your process** (an attacker running your code can call your reassemble logic)
+//! - **Code execution in your process** (an attacker running your code can call defrag)
 //! - **Hardware compromise** (TPM/HSM/TEE provide different guarantees)
-//! - **Side-channel attacks on the crypto layer** (separate concern, crypt-io's job)
+//! - **Side-channel attacks on the crypto layer** (separate concern, `crypt-io`'s job)
 //!
 //! # Status
 //!
 //! Early scaffolding. Public API not yet defined. See [the repository](https://github.com/jamesgober/key-vault)
-//! and .dev/ROADMAP.md for the milestone plan.
+//! and `.dev/ROADMAP.md` for the milestone plan.
 //!
 //! # License
 //!
