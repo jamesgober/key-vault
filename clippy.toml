@@ -1,0 +1,8 @@
+﻿# clippy configuration for key-vault
+avoid-breaking-exported-api = true
+msrv = "1.75"
+cognitive-complexity-threshold = 30
+type-complexity-threshold = 250
+too-many-arguments-threshold = 7
+trivial-copy-size-limit = 128
+single-char-binding-names-threshold = 5

@@ -1,0 +1,105 @@
+﻿[package]
+name = "key-vault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Enterprise-grade key management vault for Rust. Scattered in-memory key storage with multiple distortion strategies, mlock/zeroize protection, pluggable acquisition (TPM, keychain, file, env), master key recovery."
+
+# 5-slot search optimization: vault, keys, encryption, secure, keychain
+keywords = [
+    "vault",
+    "keys",
+    "encryption",
+    "secure",
+    "keychain"
+]
+
+# 5 categories for discoverability
+categories = [
+    "cryptography",
+    "authentication",
+    "memory-management",
+    "os",
+    "api-bindings"
+]
+
+documentation = "https://docs.rs/key-vault"
+repository    = "https://github.com/jamesgober/key-vault"
+homepage      = "https://github.com/jamesgober/key-vault"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "key_vault"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "mlock", "zeroize"]
+
+# Core feature flags
+std = []                              # Standard library (default on)
+mlock = []                            # Lock memory pages from swap (default on)
+zeroize = ["dep:zeroize"]             # Zero on drop (default on)
+
+# Acquirer feature flags (pluggable key sources)
+acquirer-keychain = ["dep:keyring"]   # OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service)
+acquirer-file = []                    # Encrypted file storage
+acquirer-env = []                     # Environment variable
+acquirer-tpm = []                     # TPM 2.0 hardware acquirer (Linux/Windows)
+acquirer-all = ["acquirer-keychain", "acquirer-file", "acquirer-env", "acquirer-tpm"]
+
+# Scatter strategy feature flags
+scatter-standard = []                 # Chunked shuffle with filler (default)
+scatter-interleaved = []              # Interleaved bytes with filler
+scatter-fragmented = []               # Non-contiguous fragments
+scatter-layered = []                  # Compose multiple strategies
+scatter-all = ["scatter-standard", "scatter-interleaved", "scatter-fragmented", "scatter-layered"]
+
+# Quality-of-life
+post-quantum = []                     # Marker for post-quantum-safe defaults (256-bit keys minimum)
+
+[dependencies]
+# Constant-time comparisons (security-critical)
+subtle = "2.5"
+
+# Lock-free read access to vault state
+arc-swap = "1.7"
+
+# Cryptographically secure RNG
+getrandom = "0.2"
+rand_core = "0.6"
+
+# Optional - secret zeroing on drop
+zeroize = { version = "1.7", optional = true, features = ["derive"] }
+
+# Optional - OS keychain integration
+keyring = { version = "3", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+
+[[bench]]
+name = "vault_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
