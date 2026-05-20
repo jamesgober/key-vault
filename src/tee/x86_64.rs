@@ -34,6 +34,9 @@ fn detect_sgx(standard_max: u32) -> Detection {
     }
 }
 
+// `ebx`/`edx`/`ecx` are CPUID register names. Renaming them would obscure the
+// architecture-level meaning, so allow the `similar_names` lint locally.
+#[allow(clippy::similar_names)]
 fn detect_tdx(vendor: [u8; 12], standard_max: u32) -> Detection {
     // TDX-host detection: CPUID.21H.0 returns the signature "IntelTDX    "
     // packed into EBX, EDX, ECX in that order. Only meaningful on Intel CPUs.
@@ -100,13 +103,18 @@ fn is_amd(vendor: [u8; 12]) -> bool {
 
 /// Thin wrapper around [`__cpuid_count`].
 ///
-/// In modern Rust the intrinsic is a safe function (CPUID is part of the
-/// baseline x86_64 ISA, has no preconditions on its operands, and invalid
-/// leaves return zeros in unused registers). The whole module is gated on
-/// `target_arch = "x86_64"` so this never compiles on a target that lacks the
-/// instruction.
+/// On Rust 1.85 the intrinsic is still `unsafe fn`; later toolchains relaxed
+/// it to safe. We keep the `unsafe { }` block (it is a no-op on the safe
+/// signature) and silence `unused_unsafe` so the same source compiles on both.
+///
+/// CPUID is part of the baseline x86_64 ISA, has no preconditions on its
+/// operands, and invalid leaves return zeros in unused registers. The whole
+/// module is gated on `target_arch = "x86_64"`, so this never compiles on a
+/// target that lacks the instruction.
+#[allow(unused_unsafe)]
 fn safe_cpuid_count(leaf: u32, sub_leaf: u32) -> CpuidResult {
-    __cpuid_count(leaf, sub_leaf)
+    // SAFETY: see function docs — CPUID is always defined on x86_64.
+    unsafe { __cpuid_count(leaf, sub_leaf) }
 }
 
 #[cfg(test)]

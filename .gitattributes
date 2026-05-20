@@ -1,0 +1,24 @@
+# Normalize all text to LF in the repo and on every checkout.
+# Without this, GitHub Actions on Windows uses core.autocrlf=true and
+# converts our files to CRLF, which trips `rustfmt`'s `newline_style = "Unix"`.
+
+* text=auto eol=lf
+
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.json     text eol=lf
+*.lock     text eol=lf
+LICENSE-*  text eol=lf
+.editorconfig  text eol=lf
+.gitignore     text eol=lf
+
+# Binary assets — never line-end normalize.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.svg  -text
