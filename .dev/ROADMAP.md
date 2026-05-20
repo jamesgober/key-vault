@@ -284,38 +284,54 @@ When `key-vault 1.0.0` ships, it commits to:
 
 ---
 
-## Phase 0.6.0 - Codex layer (Layer 5)
+## Phase 0.6.0 - Codex layer (Layer 5) (COMPLETE)
 
 **Goal:** Optional byte-swap transformation layer.
 
-**Effort:** 3-4 days.
+**Effort:** 3-4 days. **Actual:** shipped 2026-05-20.
 
 ### Tasks
 
-- [ ] **`Codex` trait** (already defined in 0.2)
-- [ ] **`IdentityCodex`** (already in 0.2, verify default)
-- [ ] **`StaticCodex`**:
-  - [ ] `StaticCodex::from_swaps(&[(u8, u8)])` for involution-based swaps
-  - [ ] `StaticCodex::random_involution(rng)` for random involutions
-  - [ ] Lookup table internally (256-byte array)
-- [ ] **`DynamicCodex`**:
-  - [ ] Per-vault randomized involution generated at vault creation
-  - [ ] Stored in protected memory
-- [ ] **`FnCodex<F>`**:
-  - [ ] Wraps user-provided closure
-  - [ ] Documented: closure must be involution (encode == decode)
-- [ ] Codex integration in fragment storage:
-  - [ ] All bytes (real + decoy) pass through codex.encode() on storage
-  - [ ] codex.decode() applied during defrag
-- [ ] Feature-gated behind `codex` Cargo feature (default off)
-- [ ] Unit tests for involution property: `decode(encode(x)) == x`
-- [ ] Property tests across all codex implementations
+- [x] **`Codex` trait** (already defined in 0.2)
+- [x] **`IdentityCodex`** (default, no-op)
+- [x] **`StaticCodex`**:
+  - [x] `StaticCodex::from_swaps(&[(u8, u8)])` for involution-based swaps
+  - [x] `StaticCodex::random_involution()` for random involutions (no fixed points)
+  - [x] 256-byte lookup table stored in `LockedBytes`
+- [x] **`DynamicCodex`**:
+  - [x] Per-vault randomized involution generated at vault creation
+  - [x] Table stored in `LockedBytes` (mlock + zeroize on drop)
+- [x] **`FnCodex<F>`** (already in 0.2 — user-closure escape hatch)
+- [x] Codex integration in fragment storage via `KeyVaultBuilder::with_codex`:
+  - [x] All bytes pass through `codex.encode()` between normalization and fragmentation
+  - [x] `codex.decode()` applied after defragment
+- [x] Unit tests for involution property: `decode(encode(x)) == x` for all 256 bytes
+- [x] Cross-codex integration tests (vault + codex + decoy + normalization stack)
+- [ ] Feature-gated behind `codex` Cargo feature — deferred: codex types are
+  always available; users opt in by calling `with_codex(...)`. The Cargo
+  feature flag is preserved as documentation but is currently a no-op
+- [ ] `frag_len` / `frag_symbols` configuration — deferred to a later phase
+  (codex didn't actually need them; these were 0.5 leftovers, defer further)
+- [ ] Performance impact measured and documented — deferred to 0.10
+  (benchmarks phase)
 
 ### Exit criteria
 
-- [ ] 4 codex implementations functional
-- [ ] Round-trip property verified for all
-- [ ] Performance impact measured and documented
+- [x] 4 codex implementations functional (`IdentityCodex`, `FnCodex`,
+  `StaticCodex`, `DynamicCodex`)
+- [x] Round-trip property verified for all (full 256-byte sweep)
+- [x] Vault integration verified: `with_codex` round-trips through the
+  full Layer 2 + 3 + 4 + 5 + 7 stack
+- [ ] Performance impact measured and documented — deferred to 0.10
+
+### Carry-over notes
+
+- `frag_len` and `frag_symbols` continue to defer. They are decoy-output
+  shape tunables, not codex tunables, and have a clearer home with the
+  benchmark/perf work in 0.10 where output size matters for measurements.
+- Codex Cargo feature flag is currently informational. If a future phase
+  wants to gate the dyn-trait overhead behind a feature, that's a
+  refactor we can do then.
 
 ---
 

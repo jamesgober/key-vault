@@ -69,7 +69,7 @@ mod normalize;
 pub mod tee;
 mod vault;
 
-pub use crate::codex::{Codex, IdentityCodex};
+pub use crate::codex::{Codex, DynamicCodex, IdentityCodex, StaticCodex};
 pub use crate::decoy::{DecoyStrategy, KeyDerivedDecoy, RandomDecoy, SelfReferenceDecoy};
 pub use crate::error::{Error, Result};
 pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};

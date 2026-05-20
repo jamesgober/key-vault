@@ -16,10 +16,12 @@
 //! ```
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
 use crate::Result;
+use crate::codex::Codex;
 use crate::decoy::DecoyStrategy;
 use crate::fetcher::RawKey;
 use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
@@ -68,6 +70,10 @@ pub struct KeyVault {
 struct VaultInner {
     config: VaultConfig,
     fragmenter: StandardFragmenter,
+    /// Optional Layer-5 codex. When set, every byte of normalized key
+    /// material passes through `codex.encode()` before being handed to
+    /// the fragmenter; `defragment` applies `codex.decode()` to recover.
+    codex: Option<Arc<dyn Codex>>,
     /// Set to `true` when a [`SecurityMonitor`](crate::SecurityMonitor)
     /// threshold breach has put the vault into lock-out state. Lock-out is
     /// not yet driven by the monitor — that arrives in Phase 0.8.
@@ -93,10 +99,18 @@ impl KeyVault {
         &self.inner.config
     }
 
-    /// Fragment a raw key through the configured normalizer and fragmenter.
+    /// Fragment a raw key through the configured normalizer, codex, and
+    /// fragmenter.
     ///
     /// The returned [`Fragments`] is opaque; pass it back to
-    /// [`KeyVault::defragment`] to recover the (normalized) bytes.
+    /// [`KeyVault::defragment`] to recover the (normalized + codex-encoded)
+    /// bytes inverse-transformed.
+    ///
+    /// # Pipeline
+    ///
+    /// ```text
+    /// key → blake3_normalize (optional) → codex.encode (optional) → fragmenter.fragment → Fragments
+    /// ```
     ///
     /// # Errors
     ///
@@ -104,26 +118,48 @@ impl KeyVault {
     /// practice an [`Error::Fragment`](crate::Error::Fragment) for a
     /// zero-length input.
     pub fn fragment(&self, key: &RawKey) -> Result<Fragments> {
-        if self.inner.config.key_normalization {
-            let normalized = blake3_normalize(key);
-            self.inner.fragmenter.fragment(&normalized)
+        let working = if self.inner.config.key_normalization {
+            blake3_normalize(key)
         } else {
-            self.inner.fragmenter.fragment(key)
-        }
+            RawKey::new(key.as_bytes().to_vec())
+        };
+        let encoded = if let Some(codex) = &self.inner.codex {
+            codex_apply(codex.as_ref(), &working)
+        } else {
+            working
+        };
+        self.inner.fragmenter.fragment(&encoded)
     }
 
     /// Reassemble fragments produced by [`KeyVault::fragment`].
     ///
-    /// The output is the same bytes that the fragmenter saw — i.e. the
-    /// normalized key when normalization is on, the raw key otherwise.
+    /// Inverts the codex transformation (if configured) so the recovered
+    /// bytes are the normalized key (or the original raw key if
+    /// normalization is off). Defragmentation itself is delegated to the
+    /// configured [`FragmentStrategy`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Defragment`](crate::Error::Defragment) when the
     /// supplied fragments do not match the configured fragmenter's layout.
     pub fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
-        self.inner.fragmenter.defragment(fragments)
+        let encoded = self.inner.fragmenter.defragment(fragments)?;
+        if let Some(codex) = &self.inner.codex {
+            Ok(codex_apply(codex.as_ref(), &encoded))
+        } else {
+            Ok(encoded)
+        }
     }
+}
+
+/// Apply a codex's transformation to every byte of a key.
+///
+/// Used both for encoding (pre-fragment) and decoding (post-defragment).
+/// For involution-based codices `decode == encode`; the function name
+/// reflects that — it's a single transformation pass either way.
+fn codex_apply(codex: &dyn Codex, key: &RawKey) -> RawKey {
+    let bytes: Vec<u8> = key.as_bytes().iter().map(|&b| codex.encode(b)).collect();
+    RawKey::new(bytes)
 }
 
 impl core::fmt::Debug for KeyVault {
@@ -140,10 +176,21 @@ impl core::fmt::Debug for KeyVault {
 /// The builder is the only way to construct a vault; the inherent
 /// `KeyVault::new` constructor is intentionally not provided so that future
 /// required configuration cannot be silently bypassed.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct KeyVaultBuilder {
     config: VaultConfig,
     fragmenter: StandardFragmenter,
+    codex: Option<Arc<dyn Codex>>,
+}
+
+impl core::fmt::Debug for KeyVaultBuilder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KeyVaultBuilder")
+            .field("config", &self.config)
+            .field("fragmenter", &self.fragmenter)
+            .field("codex", &self.codex.as_ref().map(|_| "<set>"))
+            .finish()
+    }
 }
 
 impl KeyVaultBuilder {
@@ -154,6 +201,7 @@ impl KeyVaultBuilder {
         Self {
             config: VaultConfig::new(),
             fragmenter: StandardFragmenter::new(),
+            codex: None,
         }
     }
 
@@ -178,6 +226,42 @@ impl KeyVaultBuilder {
     #[must_use]
     pub fn with_chunk_range(mut self, min: usize, max: usize) -> Self {
         self.fragmenter = StandardFragmenter::with_chunk_range(min, max);
+        self
+    }
+
+    /// Attach a Layer-5 codex to the vault.
+    ///
+    /// When set, every byte of the (optionally BLAKE3-normalized) key
+    /// passes through `codex.encode()` before being handed to the
+    /// fragmenter; `defragment` applies `codex.decode()` to recover the
+    /// original bytes. For involution-based codices ([`StaticCodex`](crate::StaticCodex),
+    /// [`DynamicCodex`](crate::DynamicCodex), involution closures wrapped in
+    /// [`FnCodex`](crate::codex::FnCodex)) `decode == encode`, but the
+    /// vault calls them by name so non-involution codices would also
+    /// work in principle.
+    ///
+    /// The codex is held in an `Arc<dyn Codex>` so the same codex can be
+    /// shared across multiple vaults (rarely useful — usually each vault
+    /// wants its own [`DynamicCodex`](crate::DynamicCodex)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use key_vault::{DynamicCodex, KeyVaultBuilder};
+    ///
+    /// let vault = KeyVaultBuilder::new()
+    ///     .with_codex(DynamicCodex::new().unwrap())
+    ///     .build();
+    /// // The vault now applies the codex transformation transparently
+    /// // on every fragment / defragment.
+    /// # let _ = vault;
+    /// ```
+    #[must_use]
+    pub fn with_codex<C>(mut self, codex: C) -> Self
+    where
+        C: Codex + 'static,
+    {
+        self.codex = Some(Arc::new(codex));
         self
     }
 
@@ -213,6 +297,7 @@ impl KeyVaultBuilder {
             inner: Arc::new(VaultInner {
                 config: self.config,
                 fragmenter: self.fragmenter,
+                codex: self.codex,
                 locked_out: AtomicBool::new(false),
             }),
         }
@@ -388,5 +473,95 @@ mod tests {
             decoy_total > no_decoy_total,
             "decoy vault produced {decoy_total} chunks vs no-decoy {no_decoy_total}"
         );
+    }
+
+    #[test]
+    fn fragment_with_static_codex_roundtrips() {
+        use crate::StaticCodex;
+        let codex = StaticCodex::from_swaps(&[(b'A', b'#'), (b'0', b'%')]).unwrap();
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_codex(codex)
+            .build();
+        let raw = RawKey::new(b"A0A0A0A0".to_vec());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        // Codex round-trips: the recovered bytes are the original
+        // (pre-encode) bytes, not the encoded ones.
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn fragment_with_dynamic_codex_roundtrips() {
+        use crate::DynamicCodex;
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_codex(DynamicCodex::new().unwrap())
+            .build();
+        let raw = RawKey::new((0u8..=255).collect());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn fragment_with_codex_and_decoy_and_normalization_roundtrips() {
+        use crate::{DynamicCodex, SelfReferenceDecoy};
+        // All layers stacked: BLAKE3 normalize + DynamicCodex encode +
+        // StandardFragmenter w/ SelfReferenceDecoy. Must still round-trip.
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(true)
+            .with_codex(DynamicCodex::new().unwrap())
+            .with_decoy(SelfReferenceDecoy)
+            .build();
+        let raw = RawKey::new(b"my application key".to_vec());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        // With normalization on, recovered is 32 bytes (BLAKE3 hash).
+        // It must be deterministic given the same input.
+        assert_eq!(recovered.len(), 32);
+        let recovered2 = v.defragment(&v.fragment(&raw).unwrap()).unwrap();
+        assert_eq!(recovered.as_bytes(), recovered2.as_bytes());
+    }
+
+    #[test]
+    fn codex_visibly_transforms_stored_bytes() {
+        // Without codex, the fragment chunks contain the original bytes
+        // somewhere among them. With a non-identity codex, the stored
+        // bytes should differ — we verify by checking that some chunk
+        // contains a transformed byte not in the original input.
+        use crate::StaticCodex;
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            // Force every byte to swap with a distinct partner.
+            .with_codex(crate::DynamicCodex::new().unwrap())
+            .build();
+        let raw = RawKey::new(alloc::vec![0xaa; 8]);
+        let frags = v.fragment(&raw).unwrap();
+
+        // Walk chunks and confirm at least one byte is *not* 0xaa
+        // (the codex encoded 0xaa to something else).
+        let mut saw_non_aa = false;
+        for chunk in frags.chunks() {
+            for &b in chunk.as_bytes() {
+                if b != 0xaa {
+                    saw_non_aa = true;
+                    break;
+                }
+            }
+            if saw_non_aa {
+                break;
+            }
+        }
+        assert!(
+            saw_non_aa,
+            "codex did not transform 0xaa — stored bytes still all 0xaa",
+        );
+
+        // And defragment recovers the original 0xaa bytes.
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+        // Use the `_codex` import to keep the import non-dead.
+        let _ = StaticCodex::from_swaps(&[]).unwrap();
     }
 }

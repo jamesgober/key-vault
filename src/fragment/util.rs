@@ -18,7 +18,7 @@ use crate::error::Error;
 /// fails. `getrandom` failure is a hard system-level event that the vault
 /// cannot meaningfully recover from on its own; the caller is informed and
 /// the operation aborts.
-pub(super) fn sample_range(min: usize, max: usize) -> Result<usize> {
+pub(crate) fn sample_range(min: usize, max: usize) -> Result<usize> {
     debug_assert!(min <= max);
     let span = max - min + 1;
     let r = random_u64()?;
@@ -32,7 +32,7 @@ pub(super) fn sample_range(min: usize, max: usize) -> Result<usize> {
 }
 
 /// Single 64-bit draw from the OS CSPRNG.
-pub(super) fn random_u64() -> Result<u64> {
+pub(crate) fn random_u64() -> Result<u64> {
     let mut buf = [0u8; 8];
     getrandom::getrandom(&mut buf).map_err(|_| Error::Internal("OS RNG failed"))?;
     Ok(u64::from_le_bytes(buf))
@@ -41,7 +41,7 @@ pub(super) fn random_u64() -> Result<u64> {
 /// In-place Fisher-Yates shuffle backed by [`random_u64`].
 ///
 /// Slices of length < 2 are left unchanged.
-pub(super) fn fisher_yates<T>(slice: &mut [T]) -> Result<()> {
+pub(crate) fn fisher_yates<T>(slice: &mut [T]) -> Result<()> {
     let len = slice.len();
     if len < 2 {
         return Ok(());
@@ -64,7 +64,7 @@ pub(super) fn fisher_yates<T>(slice: &mut [T]) -> Result<()> {
 /// Volatile-zero a byte slice and emit a `SeqCst` compiler fence. Used to
 /// scrub intermediate plaintext buffers (layout encodings, decoy temp
 /// buffers) before their `Vec` storage is dropped.
-pub(super) fn zero_buffer(buf: &mut [u8]) {
+pub(crate) fn zero_buffer(buf: &mut [u8]) {
     // SAFETY: `buf.as_mut_ptr()` is the start of a valid `buf.len()`-byte
     // slice; we write within bounds and only once per element.
     unsafe {
@@ -79,7 +79,7 @@ pub(super) fn zero_buffer(buf: &mut [u8]) {
 /// Volatile-zero an owned `Vec<u8>` and drop it. Convenience wrapper used
 /// when a decoy strategy hands back a fresh plaintext `Vec` that we
 /// immediately copy into a [`LockedBytes`](crate::memory::LockedBytes).
-pub(super) fn zero_buffer_owned(mut buf: Vec<u8>) {
+pub(crate) fn zero_buffer_owned(mut buf: Vec<u8>) {
     zero_buffer(&mut buf);
     drop(buf);
 }

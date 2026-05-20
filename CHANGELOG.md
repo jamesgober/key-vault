@@ -19,6 +19,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-05-20
+
+### Added
+
+- **Layer 5 — `StaticCodex`.** 256-byte involution lookup table held in
+  a `LockedBytes` buffer (mlock'd + zeroed on drop). Construct via
+  `StaticCodex::from_swaps(&[(u8, u8)])` for declarative swap pairs or
+  `StaticCodex::random_involution()` for a fresh random permutation with
+  no fixed points.
+- **Layer 5 — `DynamicCodex`.** Thin wrapper around
+  `StaticCodex::random_involution()` for the common "fresh random codex
+  per vault" use case.
+- **`KeyVaultBuilder::with_codex`.** Attach any `Codex + 'static` to the
+  vault; the codex transformation is applied transparently at the
+  fragment/defragment boundary (after BLAKE3 normalization, before
+  fragmentation; reversed on defragment).
+- **Crate-root re-exports.** `StaticCodex`, `DynamicCodex` available
+  at `key_vault::StaticCodex` / `key_vault::DynamicCodex`.
+
+### Changed
+
+- `KeyVaultBuilder` is no longer `#[derive(Debug)]` — it now holds an
+  `Option<Arc<dyn Codex>>` whose dyn trait is not `Debug`. A manual
+  `Debug` impl reports the codex as `Some("<set>")` / `None` without
+  inspecting it.
+- `crate::fragment::util` helpers (`random_u64`, `sample_range`,
+  `fisher_yates`, `zero_buffer`, `zero_buffer_owned`) promoted from
+  `pub(super)` to `pub(crate)` so the codex module can reuse the same
+  RNG/shuffle plumbing.
+
+### Security
+
+- **Codex table is `LockedBytes`-protected.** The 256-byte lookup table
+  in both `StaticCodex` and `DynamicCodex` lives in a `LockedBytes`
+  buffer — mlock'd against swap, volatile-zeroed before drop. Knowing
+  the table is equivalent to knowing the transformation, so the table
+  is treated as key-equivalent material.
+- **`random_involution` produces no fixed points.** Every byte
+  transforms to a *different* byte (pairs are formed by Fisher-Yates of
+  all 256 bytes). An attacker scanning the stored fragments sees no
+  byte that maps to itself.
+- **Per-call freshness.** Each `DynamicCodex::new()` and each
+  `StaticCodex::random_involution()` produces an independent random
+  table; CSPRNG entropy comes from `getrandom`.
+
+[0.6.0]: https://github.com/jamesgober/key-vault/compare/v0.5.0...v0.6.0
+
+---
+
 ## [0.5.0] - 2026-05-20
 
 ### Added
@@ -232,7 +281,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.6.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---

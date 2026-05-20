@@ -69,22 +69,20 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.5.0 |
+| Component | Status as of 0.6.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
 | **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | shipped |
-| **Layer 3 — All four fragment strategies**: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter` | **shipped** |
+| **Layer 3 — All four fragment strategies**: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter` | shipped |
 | **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | shipped |
-| Layer 5 — `IdentityCodex` + user-closure `FnCodex` | shipped |
+| **Layer 5 — Full codex stack**: `IdentityCodex`, `FnCodex`, `StaticCodex`, `DynamicCodex` (table in `LockedBytes`) | **shipped** |
 | **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | shipped |
-| **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer) | shipped |
+| **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer + codex table) | shipped |
 | BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | shipped |
 | TEE detection (`detect_tee_capabilities`) | shipped (real x86_64 + Apple SE + AWS Nitro probes) |
 | `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
-| `KeyVaultBuilder::with_chunk_range` / `with_decoy` | shipped |
-| `frag_len` configuration + `frag_symbols` whitelist | planned for 0.6.0 |
-| Layer 5 — `StaticCodex` / `DynamicCodex` | planned for 0.6.0 |
+| `KeyVaultBuilder::with_chunk_range` / `with_decoy` / `with_codex` | shipped |
 | Layer 1 — built-in fetchers (Keychain, File, Env, TPM) | planned for 0.7.0 |
 | Layer 8 — Monitor implementations | planned for 0.8.0 |
 | Layer 9 — Audit logging | planned for 0.8.0 |
@@ -135,12 +133,15 @@ per-strategy threat-model comparison.
 - **Self-Reference** — real key bytes used as filler (strongest, recommended default) — **shipped in 0.4.0**
 - **Key-Derived** — BLAKE3-XOF bytes seeded by key + per-call nonce — **shipped in 0.4.0**
 
-### Codex layer (Layer 5)
+### Codex layer (Layer 5, all four shipped in 0.6.0)
 
-- **`IdentityCodex`** — no transformation (default, max performance) — **shipped**
-- **`FnCodex`** — user-provided closure (involution-only) — **shipped**
-- **`StaticCodex`** — build-time transformation table for private builds — 0.6.0
-- **`DynamicCodex`** — per-vault randomized involution — 0.6.0
+- **`IdentityCodex`** — no transformation (default, max performance) — shipped in 0.2.0
+- **`FnCodex`** — user-provided closure (involution-only) — shipped in 0.2.0
+- **`StaticCodex`** — declarative swap table (`from_swaps(&[(u8, u8)])`) or fresh random involution (`random_involution()`) — **shipped in 0.6.0**
+- **`DynamicCodex`** — per-vault randomized involution with no fixed points — **shipped in 0.6.0**
+
+All codex tables live in `LockedBytes` (mlock'd, zeroed on drop).
+Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ### Security monitoring (Layer 8, trait shipped)
 
@@ -173,18 +174,20 @@ per-strategy threat-model comparison.
 
 ```toml
 [dependencies]
-key-vault = "0.5"
+key-vault = "0.6"
 ```
 
 ```rust
-use key_vault::{KeyVaultBuilder, RawKey, SelfReferenceDecoy};
+use key_vault::{DynamicCodex, KeyVaultBuilder, RawKey, SelfReferenceDecoy};
 use key_vault::tee::detect_tee_capabilities;
 
 // Build a vault with the full default stack: Layer 2 (mlock/VirtualLock)
 // + Layer 3 (StandardFragmenter) + Layer 4 (SelfReferenceDecoy — the
-// strongest decoy) + Layer 6 (ConstantTimeEq) + Layer 7 (zero-on-drop).
+// strongest decoy) + Layer 5 (per-vault DynamicCodex involution)
+// + Layer 6 (ConstantTimeEq) + Layer 7 (zero-on-drop).
 let vault = KeyVaultBuilder::new()
     .normalize_with_blake3(true) // default
+    .with_codex(DynamicCodex::new().expect("codex"))
     .with_decoy(SelfReferenceDecoy)
     .build();
 

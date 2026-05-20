@@ -21,9 +21,13 @@
 
 use core::marker::PhantomData;
 
+mod dynamic;
 mod identity;
+mod static_codex;
 
+pub use self::dynamic::DynamicCodex;
 pub use self::identity::IdentityCodex;
+pub use self::static_codex::StaticCodex;
 
 /// Byte-wise transformation applied to all stored bytes.
 ///

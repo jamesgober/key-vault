@@ -80,7 +80,7 @@ This crate is foundational for:
 
 ## Status
 
-**Version:** `0.5.0` — Layers **2 (mlock)**, **3 (all four fragment strategies: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter`)**, **4 (decoy: Random / SelfReference / KeyDerived)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. `LayeredFragmenter` composes by random routing among sub-strategies (strategy-index encoded in layout header). `docs/SECURITY.md` carries the per-strategy threat-model comparison. The codex layer (`StaticCodex` / `DynamicCodex`) and the deferred `frag_len` / `frag_symbols` configuration arrive next in 0.6.0.
+**Version:** `0.6.0` — Layers **2 (mlock)**, **3 (all four fragment strategies)**, **4 (3 decoy strategies)**, **5 (full codex: `IdentityCodex`, `FnCodex`, `StaticCodex`, `DynamicCodex` with `LockedBytes`-protected table)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. `KeyVaultBuilder::with_codex` transparently encodes bytes between normalization and fragmentation. Defense layers 2/3/4/5/6/7 (6 out of 9) are now complete. Layer 1 (built-in fetchers), Layer 8 (monitor implementations), and Layer 9 (audit logging) remain. Next phase: 0.7.0 — built-in fetchers (Keychain, File, Env, TPM detection).
 **Target:** `1.0.0` stable. Effort estimate: 4-5 weeks focused work.
 **MSRV:** Rust 1.85 (edition 2024).
 **Priority:** MAXIMUM. Premium quality on all deliverables.
