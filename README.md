@@ -69,7 +69,7 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.6.0 |
+| Component | Status as of 0.7.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
@@ -83,7 +83,7 @@ shipped code.
 | TEE detection (`detect_tee_capabilities`) | shipped (real x86_64 + Apple SE + AWS Nitro probes) |
 | `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
 | `KeyVaultBuilder::with_chunk_range` / `with_decoy` / `with_codex` | shipped |
-| Layer 1 — built-in fetchers (Keychain, File, Env, TPM) | planned for 0.7.0 |
+| **Layer 1 — built-in fetchers** (`EnvFetch`, `FileFetch`, `KeychainFetch`, `TpmFetch` detection) | **shipped** |
 | Layer 8 — Monitor implementations | planned for 0.8.0 |
 | Layer 9 — Audit logging | planned for 0.8.0 |
 | Multi-key vaults, rotation, master recovery | planned for 0.9.0 |
@@ -106,15 +106,13 @@ Each phase's exit criteria, scope, and timeline are tracked in
 - **Constant-time comparisons** via subtle prevent timing attacks
 - **No debug exposure** — `KeyHandle`'s `Debug` impl always prints `KeyHandle(<redacted>)` (shipped today)
 
-### Pluggable key fetchers (1.0 design, `KeyFetch` trait shipped)
+### Pluggable key fetchers (all four shipped in 0.7.0)
 
-The `KeyFetch` trait is in place today. Built-in implementations arrive in 0.7.0:
-
-- **TPM 2.0** hardware fetcher — detection-only in 1.0, full integration deferred to 1.x
-- **OS Keychain** — macOS Keychain, Windows Credential Manager, Linux Secret Service
-- **Encrypted file** with permission checks
-- **Environment variables** for container deployments
-- **Custom fetchers** via the trait — bring your own HSM, KMS client, or proprietary source
+- **`TpmFetch`** — detection-only in 1.0, full integration deferred to 1.x (feature `fetcher-tpm`)
+- **`KeychainFetch`** — macOS Keychain, Windows Credential Manager, Linux Secret Service via the `keyring` crate (feature `fetcher-keychain`)
+- **`FileFetch`** — file-on-disk with strict Unix permission checks (`0o600`) (feature `fetcher-file`)
+- **`EnvFetch`** — process environment variable, error messages never log the value (feature `fetcher-env`)
+- **Custom fetchers** via the `KeyFetch` trait — bring your own HSM, KMS client, or proprietary source
 
 ### Fragment strategies (all four shipped in 0.5.0)
 
@@ -174,7 +172,7 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ```toml
 [dependencies]
-key-vault = "0.6"
+key-vault = "0.7"
 ```
 
 ```rust
@@ -234,10 +232,11 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
 
 ## Documentation
 
+- **[docs/API.md](docs/API.md)** — Full public-API reference (every type, function, and method with examples)
 - **[docs/SECURITY.md](docs/SECURITY.md)** — Comprehensive 9-layer security architecture
 - **[docs/TRANSFORMATION.md](docs/TRANSFORMATION.md)** — Visual walkthrough of key transformation
-- **[.dev/ROADMAP.md](.dev/ROADMAP.md)** — Production roadmap to 1.0
-- **[.dev/DIRECTIVES.md](.dev/DIRECTIVES.md)** — Engineering directives
+- **[docs/release/](docs/release/)** — Per-version release notes
+- **[CHANGELOG.md](CHANGELOG.md)** — Full change log (Keep a Changelog format)
 
 ---
 

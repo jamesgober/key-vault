@@ -72,6 +72,14 @@ mod vault;
 pub use crate::codex::{Codex, DynamicCodex, IdentityCodex, StaticCodex};
 pub use crate::decoy::{DecoyStrategy, KeyDerivedDecoy, RandomDecoy, SelfReferenceDecoy};
 pub use crate::error::{Error, Result};
+#[cfg(feature = "fetcher-env")]
+pub use crate::fetcher::EnvFetch;
+#[cfg(feature = "fetcher-file")]
+pub use crate::fetcher::FileFetch;
+#[cfg(feature = "fetcher-keychain")]
+pub use crate::fetcher::KeychainFetch;
+#[cfg(feature = "fetcher-tpm")]
+pub use crate::fetcher::TpmFetch;
 pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};
 pub use crate::fragment::{
     FragmentStrategy, Fragments, InterleavedFragmenter, LayeredFragmenter, RandomFragmenter,

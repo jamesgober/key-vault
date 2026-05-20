@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "key-vault"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "blake3",

@@ -27,6 +27,24 @@ use core::fmt;
 
 use crate::Result;
 
+#[cfg(feature = "fetcher-env")]
+mod env;
+#[cfg(feature = "fetcher-file")]
+mod file;
+#[cfg(feature = "fetcher-keychain")]
+mod keychain;
+#[cfg(feature = "fetcher-tpm")]
+mod tpm;
+
+#[cfg(feature = "fetcher-env")]
+pub use self::env::EnvFetch;
+#[cfg(feature = "fetcher-file")]
+pub use self::file::FileFetch;
+#[cfg(feature = "fetcher-keychain")]
+pub use self::keychain::KeychainFetch;
+#[cfg(feature = "fetcher-tpm")]
+pub use self::tpm::TpmFetch;
+
 /// Information given to a [`KeyFetch`] implementation when it is asked to
 /// produce a key.
 ///

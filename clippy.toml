@@ -47,4 +47,10 @@ doc-valid-idents = [
     "HiveDB",
     "CSPRNG",
     "OSes",
+    # OS-level disk encryption + credential stores
+    "FileVault",
+    "BitLocker",
+    "KWallet",
+    "TrustZone",
+    "IntelSGX",
 ]

@@ -19,6 +19,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.0] - 2026-05-20
+
+### Added
+
+- **Layer 1 — Built-in `KeyFetch` implementations.** Four fetchers,
+  each gated behind its own Cargo feature:
+  - `EnvFetch` (`fetcher-env`) — read key bytes from a process
+    environment variable. Error messages include the variable name but
+    never the value.
+  - `FileFetch` (`fetcher-file`) — read key bytes from a file on disk.
+    Strict Unix permission checking (`0o600` or tighter) by default;
+    relaxable via `FileFetch::allow_loose_perms()`.
+  - `KeychainFetch` (`fetcher-keychain`) — read from the OS native
+    credential store via the `keyring` crate (macOS Keychain, Windows
+    Credential Manager, Linux Secret Service / KWallet). Error messages
+    redact `keyring` internals.
+  - `TpmFetch` (`fetcher-tpm`) — **detection-only in 1.0**. Returns a
+    documented `Error::Acquisition` so consumers can wire it into
+    composite fetcher chains and inherit the 1.x upgrade.
+- Crate-root re-exports for all four fetchers (feature-gated).
+- Documentation: each fetcher's module ships its own threat-profile
+  notes.
+
+### Changed
+
+- `clippy.toml` `doc-valid-idents` whitelist extended with `FileVault`,
+  `BitLocker`, `KWallet`, `TrustZone`, `IntelSGX`.
+
+### Security
+
+- **No fetcher writes key material to its `Error` variants.** All four
+  redact the source value: `EnvFetch` prints the variable name only;
+  `FileFetch` prints the path and the I/O error kind only;
+  `KeychainFetch` prints the entry locator and a discriminant-only
+  rendering of the `keyring` error; `TpmFetch` carries no input at all.
+- **`FileFetch` Unix permission gate.** Default rejects files readable
+  by group or world. Opting out requires an explicit
+  `.allow_loose_perms()` call documented as "not recommended outside
+  tests."
+
+[0.7.0]: https://github.com/jamesgober/key-vault/compare/v0.6.0...v0.7.0
+
+---
+
 ## [0.6.0] - 2026-05-20
 
 ### Added
@@ -281,7 +325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.7.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---
