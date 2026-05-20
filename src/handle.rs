@@ -19,6 +19,8 @@ use core::fmt;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use subtle::{Choice, ConstantTimeEq};
+
 /// Process-wide handle identifier.
 ///
 /// `KeyId` is a [`NonZeroU64`] so that `Option<KeyId>` is the same size as
@@ -99,9 +101,41 @@ impl fmt::Debug for KeyId {
 /// let rendered = format!("{h:?}");
 /// assert!(rendered.contains("redacted"));
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// # Equality
+///
+/// `KeyHandle` implements both `PartialEq` and
+/// [`subtle::ConstantTimeEq`]. The latter is the equality check the vault
+/// uses internally: it compares both inner identifiers in constant time
+/// regardless of input values, eliminating timing side-channels even
+/// though the underlying ids are not themselves secret.
+#[derive(Clone, Copy, Eq)]
 pub struct KeyHandle {
     id: KeyId,
+}
+
+impl ConstantTimeEq for KeyHandle {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        // Compare the raw NonZeroU64 values byte-equivalently in constant
+        // time. `subtle` provides ConstantTimeEq for `u64`, so we feed it
+        // the underlying numeric representation.
+        self.id.0.get().ct_eq(&other.id.0.get())
+    }
+}
+
+impl PartialEq for KeyHandle {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.ct_eq(other))
+    }
+}
+
+// `Hash` must be consistent with `PartialEq`: equal handles must hash equal.
+// We derive `Eq` and implement `PartialEq` through `ConstantTimeEq` (still on
+// the same inner id), so hashing the id satisfies the invariant.
+impl core::hash::Hash for KeyHandle {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id.0.get().hash(state);
+    }
 }
 
 impl KeyHandle {
@@ -204,5 +238,25 @@ mod tests {
         let h1 = KeyHandle::from_id(id);
         let h2 = KeyHandle::from_id(id);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_partial_eq() {
+        use core::hash::BuildHasher;
+        use std::collections::hash_map::RandomState;
+
+        use subtle::ConstantTimeEq;
+
+        let id = KeyId::next();
+        let same_a = KeyHandle::from_id(id);
+        let same_b = KeyHandle::from_id(id);
+        let different = KeyHandle::allocate();
+
+        assert!(bool::from(same_a.ct_eq(&same_b)));
+        assert!(!bool::from(same_a.ct_eq(&different)));
+
+        // Hash invariant: equal handles must hash equal (Eq + Hash).
+        let s = RandomState::new();
+        assert_eq!(s.hash_one(same_a), s.hash_one(same_b));
     }
 }

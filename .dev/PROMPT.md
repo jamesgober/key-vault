@@ -80,8 +80,9 @@ This crate is foundational for:
 
 ## Status
 
-**Version:** `0.1.0` - scaffolded with 9-layer docs, no implementation yet.
+**Version:** `0.3.0` — Layers **2 (mlock)**, **3 (StandardFragmenter)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. BLAKE3 normalization wired through end-to-end. `KeyVault::fragment` / `KeyVault::defragment` exposed on the public API. Decoy strategies (Layer 4) arrive next in 0.4.0.
 **Target:** `1.0.0` stable. Effort estimate: 4-5 weeks focused work.
+**MSRV:** Rust 1.85 (edition 2024).
 **Priority:** MAXIMUM. Premium quality on all deliverables.
 
 ## Skill areas

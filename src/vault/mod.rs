@@ -1,9 +1,11 @@
 //! The vault itself.
 //!
-//! In this phase [`KeyVault`] is a skeleton: it holds a configuration and
-//! exposes the builder API, but it does not yet store keys — fragmentation,
-//! mlock, and zeroize land in Phase 0.3. The shape of the public API is
-//! finalized here so that downstream crates can begin compiling against it.
+//! In this phase [`KeyVault`] owns the configured fragmenter and the
+//! normalization toggle, and exposes `fragment` / `defragment` shortcuts so
+//! downstream crates can exercise the Layer 2 + Layer 3 + Layer 7 stack
+//! end-to-end. Key registration, naming, rotation, and recovery still arrive
+//! in Phase 0.9 — today the vault is a stateless helper around the
+//! fragmenter.
 //!
 //! ```
 //! use key_vault::{KeyVault, KeyVaultBuilder};
@@ -17,12 +19,16 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
+use crate::Result;
+use crate::fetcher::RawKey;
+use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
+use crate::normalize::blake3_normalize;
+
 /// Vault configuration.
 ///
 /// Concrete fields are added in later phases as each layer comes online —
-/// fragment strategy in 0.3/0.5, decoy in 0.4, codex in 0.6, monitor in 0.8.
-/// Today this struct exists so that `KeyVaultBuilder::build` has somewhere to
-/// store its decisions.
+/// decoy strategy in 0.4, additional fragment strategies in 0.5, codex in
+/// 0.6, monitor in 0.8.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct VaultConfig {
@@ -44,15 +50,15 @@ impl VaultConfig {
 /// In-memory key vault.
 ///
 /// The vault is the entry point for everything `key-vault` does. Application
-/// code constructs one via [`KeyVaultBuilder`], registers keys against it, and
-/// receives [`KeyHandle`](crate::KeyHandle)s in return. The vault itself is
-/// cheap to clone (it is `Arc`-backed internally) and safe to share across
-/// threads.
+/// code constructs one via [`KeyVaultBuilder`], hands it [`RawKey`] values
+/// to be fragmented, and (in later phases) receives
+/// [`KeyHandle`](crate::KeyHandle)s in return. The vault itself is cheap to
+/// clone (it is `Arc`-backed internally) and safe to share across threads.
 ///
-/// Key registration, access, rotation, and recovery are introduced in later
-/// phases. This skeleton exposes only the public shape — construction,
-/// cloning, and the lock-out indicator — so that downstream crates can wire
-/// against it now.
+/// In Phase 0.3 the vault exposes [`KeyVault::fragment`] and
+/// [`KeyVault::defragment`] convenience methods that route through the
+/// configured normalizer and [`StandardFragmenter`]. The full named-key
+/// registry arrives in Phase 0.9.
 #[derive(Clone)]
 pub struct KeyVault {
     inner: Arc<VaultInner>,
@@ -60,6 +66,7 @@ pub struct KeyVault {
 
 struct VaultInner {
     config: VaultConfig,
+    fragmenter: StandardFragmenter,
     /// Set to `true` when a [`SecurityMonitor`](crate::SecurityMonitor)
     /// threshold breach has put the vault into lock-out state. Lock-out is
     /// not yet driven by the monitor — that arrives in Phase 0.8.
@@ -84,6 +91,38 @@ impl KeyVault {
     pub fn config(&self) -> &VaultConfig {
         &self.inner.config
     }
+
+    /// Fragment a raw key through the configured normalizer and fragmenter.
+    ///
+    /// The returned [`Fragments`] is opaque; pass it back to
+    /// [`KeyVault::defragment`] to recover the (normalized) bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the underlying [`FragmentStrategy`] surfaces — in
+    /// practice an [`Error::Fragment`](crate::Error::Fragment) for a
+    /// zero-length input.
+    pub fn fragment(&self, key: &RawKey) -> Result<Fragments> {
+        if self.inner.config.key_normalization {
+            let normalized = blake3_normalize(key);
+            self.inner.fragmenter.fragment(&normalized)
+        } else {
+            self.inner.fragmenter.fragment(key)
+        }
+    }
+
+    /// Reassemble fragments produced by [`KeyVault::fragment`].
+    ///
+    /// The output is the same bytes that the fragmenter saw — i.e. the
+    /// normalized key when normalization is on, the raw key otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Defragment`](crate::Error::Defragment) when the
+    /// supplied fragments do not match the configured fragmenter's layout.
+    pub fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
+        self.inner.fragmenter.defragment(fragments)
+    }
 }
 
 impl core::fmt::Debug for KeyVault {
@@ -103,14 +142,17 @@ impl core::fmt::Debug for KeyVault {
 #[derive(Debug, Default, Clone)]
 pub struct KeyVaultBuilder {
     config: VaultConfig,
+    fragmenter: StandardFragmenter,
 }
 
 impl KeyVaultBuilder {
-    /// Start a new builder with default configuration.
+    /// Start a new builder with default configuration and a default-range
+    /// [`StandardFragmenter`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             config: VaultConfig::new(),
+            fragmenter: StandardFragmenter::new(),
         }
     }
 
@@ -126,6 +168,16 @@ impl KeyVaultBuilder {
         self
     }
 
+    /// Customize the fragmenter chunk-size range.
+    ///
+    /// Defaults are documented on [`StandardFragmenter::new`]. `min` is
+    /// clamped to `>= 1` and `max` to `>= min`.
+    #[must_use]
+    pub fn with_chunk_range(mut self, min: usize, max: usize) -> Self {
+        self.fragmenter = StandardFragmenter::with_chunk_range(min, max);
+        self
+    }
+
     /// Finalize and produce a [`KeyVault`].
     ///
     /// Infallible in this phase — later phases may move this to a
@@ -135,6 +187,7 @@ impl KeyVaultBuilder {
         KeyVault {
             inner: Arc::new(VaultInner {
                 config: self.config,
+                fragmenter: self.fragmenter,
                 locked_out: AtomicBool::new(false),
             }),
         }
@@ -142,6 +195,7 @@ impl KeyVaultBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use alloc::format;
@@ -168,5 +222,76 @@ mod tests {
     fn debug_does_not_panic() {
         let v = KeyVaultBuilder::new().build();
         let _ = format!("{v:?}");
+    }
+
+    #[test]
+    fn fragment_defragment_roundtrip_with_normalization() {
+        let v = KeyVaultBuilder::new().build(); // normalization on
+        let raw = RawKey::new(b"hello world".to_vec());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        // With normalization on, the output is the BLAKE3 hash (32 bytes),
+        // not the original 11-byte input.
+        assert_eq!(recovered.len(), 32);
+        // It is deterministic — fragmenting the same input twice produces the
+        // same recovered bytes (the bytes themselves; layout still varies).
+        let frags2 = v.fragment(&raw).unwrap();
+        let recovered2 = v.defragment(&frags2).unwrap();
+        assert_eq!(recovered.as_bytes(), recovered2.as_bytes());
+    }
+
+    #[test]
+    fn fragment_defragment_roundtrip_without_normalization() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let raw = RawKey::new((0u8..40).collect());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn fragment_rejects_empty_key() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let err = v
+            .fragment(&RawKey::new(alloc::vec::Vec::new()))
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Fragment(_)));
+    }
+
+    #[test]
+    fn chunk_range_propagates_through_builder() {
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_chunk_range(4, 6)
+            .build();
+        let raw = RawKey::new((0u8..30).collect());
+        let frags = v.fragment(&raw).unwrap();
+
+        // After fragmentation, chunks have been Fisher-Yates shuffled, so the
+        // "remainder" chunk (which the size-sampling loop allows to fall below
+        // `min` when the total doesn't divide cleanly) can land at any index.
+        // We verify the post-shuffle invariants instead of indexing by order:
+        //   1. Every chunk fits in [1, max].
+        //   2. At most one chunk falls below `min` (the remainder slot).
+        //   3. Total bytes sum to the original length.
+        let chunks = frags.chunks();
+        let mut below_min = 0;
+        let mut total = 0usize;
+        for c in chunks {
+            assert!(
+                c.len() >= 1 && c.len() <= 6,
+                "chunk size {} not in [1,6]",
+                c.len()
+            );
+            if c.len() < 4 {
+                below_min += 1;
+            }
+            total += c.len();
+        }
+        assert!(
+            below_min <= 1,
+            "more than one chunk below min size: {below_min}"
+        );
+        assert_eq!(total, 30);
     }
 }

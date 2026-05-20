@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -115,6 +115,15 @@ keyring = { version = "3", optional = true }
 
 # Optional - tracing integration for monitor
 tracing = { version = "0.1", optional = true }
+
+# Unix syscall surface — mlock(2) / munlock(2) for memory page locking.
+# Target-gated so Windows builds don't pick this up.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows syscall surface — VirtualLock / VirtualUnlock for memory page locking.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

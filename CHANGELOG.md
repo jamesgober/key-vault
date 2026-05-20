@@ -19,6 +19,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-05-20
+
+### Added
+
+- **Layer 2 — Memory page locking.** New crate-internal `LockedBytes`
+  wrapper around `Vec<u8>` that calls `mlock(2)` (Unix) / `VirtualLock`
+  (Windows) at construction and `munlock` / `VirtualUnlock` on drop.
+  Soft-fails when the OS declines the lock (e.g. `RLIMIT_MEMLOCK`); the
+  wrapper records the outcome and continues. Always zeroes its bytes
+  before unlocking.
+- **Layer 3 — `StandardFragmenter`.** First real `FragmentStrategy`
+  implementation: variable-size chunks (configurable range, default 1–8
+  bytes), Fisher-Yates permutation, per-chunk independent heap
+  allocations (each `LockedBytes`-locked), separate locked layout buffer.
+  Round-trip verified by 1000-iteration stress test.
+- **Layer 6 — `ConstantTimeEq` for `KeyHandle`.** Public equality on
+  handles now goes through `subtle::ConstantTimeEq`. `PartialEq` and
+  `Hash` are kept consistent: equal handles always hash equal.
+- **Layer 7 — Zero-on-drop.** `LockedBytes` overwrites its bytes with
+  `write_volatile` + a compiler fence before releasing the lock and
+  freeing the allocation. The temporary plaintext copy used to build the
+  layout buffer is also volatile-zeroed.
+- **BLAKE3 normalization wired through.** The previously-toggle-only
+  `KeyVaultBuilder::normalize_with_blake3` setting now actually applies a
+  BLAKE3 hash to the input key before fragmentation. Default remains on.
+- **`KeyVault::fragment` / `KeyVault::defragment`.** Convenience methods
+  routing through the configured normalizer and `StandardFragmenter`.
+  Downstream crates can now exercise the full Layer 2 + 3 + 7 stack from
+  the public API. (Named-key registration still arrives in 0.9.0.)
+- **`KeyVaultBuilder::with_chunk_range`** — propagates a custom chunk-size
+  range to the underlying fragmenter.
+- New module `src/memory` with `LockedBytes` + per-OS backends
+  (`unix.rs`, `windows.rs`).
+- New module `src/normalize` with `blake3_normalize` helper.
+- New integration test `tests/fragment_roundtrip.rs` covering the full
+  pipeline through the public API plus `Send + Sync` assertions on
+  `KeyVault`.
+
+### Changed
+
+- **CI: replaced `actions/cache@v4` with `Swatinem/rust-cache@v2`.**
+  Removes the Node.js 20 deprecation warning and gives the Rust-aware
+  caching policy (sccache-friendly, target-dir aware).
+- Dropped the unused `actions/setup-node@v5` step from CI.
+- `Fragments` gained real internal storage (a `Vec<LockedBytes>` for
+  chunks plus a separate `LockedBytes` layout buffer); `Debug` continues
+  to redact contents and now uses `finish_non_exhaustive` to document
+  that the layout field is intentionally hidden.
+- `KeyHandle` no longer derives `PartialEq` and `Hash` — both are
+  implemented manually so equality routes through `ConstantTimeEq` while
+  preserving the `Hash`/`Eq` consistency invariant.
+
+### Security
+
+- **Layer 2** is now actually in force for every fragment and layout
+  buffer; pages are pinned in RAM unless the OS refuses.
+- **Layer 6** equality on handles is now constant-time.
+- **Layer 7** zero-on-drop applies to every fragment, every layout
+  buffer, and intermediate plaintext copies created during
+  fragmentation.
+
+[0.3.0]: https://github.com/jamesgober/key-vault/compare/v0.2.0...v0.3.0
+
+---
+
 ## [0.2.0] - 2026-05-20
 
 ### Added
@@ -61,7 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.3.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---
