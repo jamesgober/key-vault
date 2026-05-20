@@ -13,6 +13,16 @@ use alloc::borrow::Cow;
 use alloc::string::String;
 use core::time::Duration;
 
+mod composite;
+#[cfg(feature = "monitor-tracing")]
+mod log_monitor;
+mod no_monitor;
+
+pub use self::composite::CompositeMonitor;
+#[cfg(feature = "monitor-tracing")]
+pub use self::log_monitor::LogMonitor;
+pub use self::no_monitor::NoMonitor;
+
 /// Context passed when a decryption attempt fails — wrong key, tampered
 /// ciphertext, etc.
 #[non_exhaustive]
@@ -84,4 +94,20 @@ pub trait SecurityMonitor: Send + Sync {
 
     /// Called when a configured failure threshold is crossed.
     fn on_threshold_breach(&self, ctx: &ThresholdContext);
+}
+
+// Blanket forwarding impl so callers can pass a pre-wrapped
+// `Arc<dyn SecurityMonitor>` to APIs that accept `impl SecurityMonitor`.
+// Useful when the same monitor is referenced from multiple places and
+// the caller already holds it as a trait object.
+impl SecurityMonitor for alloc::sync::Arc<dyn SecurityMonitor> {
+    fn on_decryption_failure(&self, ctx: &FailureContext) {
+        (**self).on_decryption_failure(ctx);
+    }
+    fn on_anomalous_access(&self, ctx: &AccessContext) {
+        (**self).on_anomalous_access(ctx);
+    }
+    fn on_threshold_breach(&self, ctx: &ThresholdContext) {
+        (**self).on_threshold_breach(ctx);
+    }
 }

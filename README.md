@@ -69,7 +69,7 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.7.0 |
+| Component | Status as of 0.8.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
@@ -84,8 +84,8 @@ shipped code.
 | `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
 | `KeyVaultBuilder::with_chunk_range` / `with_decoy` / `with_codex` | shipped |
 | **Layer 1 — built-in fetchers** (`EnvFetch`, `FileFetch`, `KeychainFetch`, `TpmFetch` detection) | **shipped** |
-| Layer 8 — Monitor implementations | planned for 0.8.0 |
-| Layer 9 — Audit logging | planned for 0.8.0 |
+| **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | **shipped** |
+| Layer 9 — Dedicated audit logging surface | partial — `LogMonitor` covers failure/anomaly events; per-access audit event deferred |
 | Multi-key vaults, rotation, master recovery | planned for 0.9.0 |
 | Criterion benchmark suite | planned for 0.10.0 |
 
@@ -141,12 +141,12 @@ per-strategy threat-model comparison.
 All codex tables live in `LockedBytes` (mlock'd, zeroed on drop).
 Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
-### Security monitoring (Layer 8, trait shipped)
+### Security monitoring (Layer 8, shipped in 0.8.0)
 
-- **Failed decryption detection** — N failures in M seconds triggers configurable response — 0.8.0
-- **Anomalous access patterns** — detect sustained data exfiltration — 0.8.0
-- **Threshold lockout** — lock vault after threshold breach — 0.8.0
-- **Pluggable sinks** — log, metrics, webhook, custom — 0.8.0
+- **Failed decryption detection** — `KeyVault::report_failure(name, note)` forwards to the monitor with structured context — **shipped**
+- **Anomalous access patterns** — `KeyVault::report_anomalous_access(name, note)` — **shipped**
+- **Threshold lockout** — sliding-window per-key counter triggers lockout (configurable via `KeyVaultBuilder::with_failure_threshold(max, window)`); `KeyVault::fragment` / `defragment` return `Error::LockedOut` when locked; operators reset via `KeyVault::clear_lockout` — **shipped**
+- **Pluggable sinks** — `NoMonitor`, `CompositeMonitor`, `LogMonitor` (via `tracing`) shipped; webhook + metrics sinks deferred to post-1.0 due to HTTP/metrics-lib dep weight
 
 ### Operational features
 
@@ -172,7 +172,7 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ```toml
 [dependencies]
-key-vault = "0.7"
+key-vault = "0.8"
 ```
 
 ```rust

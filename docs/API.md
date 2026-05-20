@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 0.7.0.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 0.8.0.</i>
     <br>
     <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -35,7 +35,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-key-vault = "0.7"
+key-vault = "0.8"
 ```
 
 ### Install via terminal
@@ -400,10 +400,19 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 
 - `fragment(&self, key: &RawKey) -> Result<Fragments>` — pipeline:
   optional BLAKE3 normalize → optional codex encode → fragmenter.fragment.
+  Returns `Error::LockedOut` when the vault is in lock-out state.
 - `defragment(&self, fragments: &Fragments) -> Result<RawKey>` —
-  inverse: fragmenter.defragment → optional codex decode.
-- `is_locked_out(&self) -> bool` — `true` if a `SecurityMonitor`
-  threshold breach has put the vault in lock-out state (0.8+).
+  inverse: fragmenter.defragment → optional codex decode. Returns
+  `Error::LockedOut` when the vault is in lock-out state.
+- `is_locked_out(&self) -> bool` — `true` if a threshold breach has
+  put the vault in lock-out state.
+- `clear_lockout(&self)` — operator escape hatch. Resets the lockout
+  flag and clears the failure tracker.
+- `report_failure(&self, key_name: &str, note: Option<&'static str>)`
+  — caller-driven failure reporting. Forwards to the configured
+  monitor and feeds the threshold detector.
+- `report_anomalous_access(&self, key_name: &str, note: Option<&'static str>)`
+  — caller-driven anomaly reporting (no state change).
 - `config(&self) -> &VaultConfig` — snapshot of the configuration.
 
 **Example:**
@@ -450,6 +459,10 @@ Fluent builder for [`KeyVault`](#keyvault).
   attach a Layer-4 decoy strategy.
 - `with_codex<C: Codex + 'static>(self, codex: C) -> Self` — attach a
   Layer-5 codex.
+- `with_monitor<M: SecurityMonitor + 'static>(self, monitor: M) -> Self`
+  — attach a Layer-8 monitor.
+- `with_failure_threshold(self, max: u32, window: Duration) -> Self` —
+  configure the threshold detector. `max = 0` disables lockout.
 - `build(self) -> KeyVault` — finalize. Infallible.
 
 **Example:**
@@ -480,6 +493,10 @@ Source: `src/vault/mod.rs`
 **Fields:**
 
 - `pub key_normalization: bool` — whether BLAKE3 normalization is on.
+- `pub max_failures_before_lockout: u32` — threshold count. `0` =
+  disabled (default).
+- `pub failure_window: Duration` — sliding-window size for the
+  failure counter. Default: 60 seconds.
 
 <hr>
 
@@ -1104,6 +1121,72 @@ Built-in implementations (`NoMonitor`, `LogMonitor`, `MetricsMonitor`,
 
 <hr>
 
+### `NoMonitor`
+
+Source: `src/monitor/no_monitor.rs`
+
+Inert default. Discards every event. Always available.
+
+```rust
+use key_vault::{KeyVaultBuilder, NoMonitor};
+let _vault = KeyVaultBuilder::new().with_monitor(NoMonitor).build();
+```
+
+<hr>
+
+### `CompositeMonitor`
+
+Source: `src/monitor/composite.rs`
+
+Fan-out across `Vec<Arc<dyn SecurityMonitor>>`. Inner monitors are
+called in registration order; an empty list yields a no-op monitor.
+
+**Constructors:**
+
+- `CompositeMonitor::new(inner: Vec<Arc<dyn SecurityMonitor>>) -> Self`
+
+**Read accessors:**
+
+- `len(&self) -> usize`
+- `is_empty(&self) -> bool`
+
+```rust
+use std::sync::Arc;
+use key_vault::{CompositeMonitor, NoMonitor, SecurityMonitor};
+
+let composite = CompositeMonitor::new(vec![
+    Arc::new(NoMonitor) as Arc<dyn SecurityMonitor>,
+    Arc::new(NoMonitor) as Arc<dyn SecurityMonitor>,
+]);
+assert_eq!(composite.len(), 2);
+```
+
+<hr>
+
+### `LogMonitor`
+
+Source: `src/monitor/log_monitor.rs` · Feature: `monitor-tracing`
+
+Emits structured `tracing` events. `on_decryption_failure` and
+`on_anomalous_access` log at `warn!`; `on_threshold_breach` logs at
+`error!`. All events target `key_vault::monitor`. Fields are
+structured (`key_name`, `consecutive_failures`, `window_elapsed_ms`,
+etc.) for easy filtering.
+
+**Constructors:**
+
+- `LogMonitor::new() -> Self`
+- `LogMonitor::default()` — same.
+
+Stateless; one instance can be shared across all vaults.
+
+```rust
+use key_vault::{KeyVaultBuilder, LogMonitor};
+let _vault = KeyVaultBuilder::new().with_monitor(LogMonitor::new()).build();
+```
+
+<hr>
+
 ### `FailureContext`
 
 Source: `src/monitor/mod.rs`
@@ -1372,11 +1455,15 @@ comprehensive per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 0.7.0 (yet)
+### What's not in 0.8.0 (yet)
 
-- **Layer 8 monitor implementations** (`NoMonitor`, `LogMonitor`,
-  `MetricsMonitor`, `WebhookMonitor`, `CompositeMonitor`) — planned for
-  0.8.0. Custom `SecurityMonitor` impls work today.
+- **`MetricsMonitor`** (metrics-lib integration) and **`WebhookMonitor`**
+  (HTTP POST to alert endpoint) — deferred to post-1.0; both require
+  external dependencies. Build a custom `SecurityMonitor` impl in the
+  meantime.
+- **Dedicated `AuditEvent` surface** (Layer 9) — `LogMonitor` carries
+  failure/anomaly/breach events today; per-access audit hooks land
+  with the named-key registry in 0.9.
 - **Layer 9 audit logging** — planned for 0.8.0.
 - **Multi-key vaults, key rotation, master key recovery** — planned for
   0.9.0. Today's `KeyVault::fragment` / `defragment` operate per-call

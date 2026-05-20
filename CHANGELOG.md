@@ -19,6 +19,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-05-20
+
+### Added
+
+- **Layer 8 — Monitor implementations.** Three new `SecurityMonitor`
+  impls covering the common observability surface:
+  - `NoMonitor` — the inert default (always available).
+  - `CompositeMonitor` — fan-out across `Vec<Arc<dyn SecurityMonitor>>`.
+  - `LogMonitor` — emits structured `tracing` events at warn/error
+    levels (gated behind the `monitor-tracing` Cargo feature).
+- **Threshold-driven lockout.** `VaultConfig` gained
+  `max_failures_before_lockout` and `failure_window` fields.
+  `KeyVaultBuilder::with_failure_threshold(max, window)` configures
+  per-key sliding-window failure tracking. Lockout disabled by default
+  (`max = 0`).
+- **`KeyVault::report_failure(key_name, note)`** — caller-driven
+  failure reporting. Forwards to the configured monitor and feeds the
+  threshold detector. When the threshold is crossed, the vault
+  transitions to lock-out state and `on_threshold_breach` fires.
+- **`KeyVault::report_anomalous_access(key_name, note)`** — caller-
+  driven anomaly reporting. Forwards to the configured monitor without
+  affecting vault state.
+- **`KeyVault::clear_lockout()`** — operator escape hatch. Resets the
+  lockout flag and clears the failure tracker.
+- **`KeyVaultBuilder::with_monitor(M)`** — attach a `SecurityMonitor`
+  implementation. Replaces any previously-configured monitor.
+- Blanket `impl SecurityMonitor for Arc<dyn SecurityMonitor>` so
+  pre-wrapped monitors can be passed to APIs that accept
+  `impl SecurityMonitor`.
+- New crate-root re-exports: `NoMonitor`, `CompositeMonitor`,
+  `LogMonitor` (latter feature-gated).
+
+### Changed
+
+- `KeyVault::fragment` / `defragment` now return
+  `Error::LockedOut` when the vault is in lock-out state. They were
+  previously infallible w.r.t. the lockout flag.
+- `VaultConfig::Default` is now manually implemented (was derived) to
+  account for the new threshold fields.
+- `KeyVaultBuilder::Default` is now manually implemented.
+
+### Security
+
+- **Threshold-driven lockout** turns the failure-tracking signal into
+  enforcement: a vault that has crossed the threshold refuses to
+  fragment or defragment until an operator explicitly calls
+  `clear_lockout`. Prevents an attacker who can poke the API into
+  burning through brute-force attempts.
+- **No secrets in monitor events.** `FailureContext`,
+  `AccessContext`, and `ThresholdContext` are sanitized by trait
+  contract; `LogMonitor` emits only key names, counters, and the
+  caller-supplied note. The note field is `Cow<'static, str>` — caller
+  responsibility to keep it sanitized.
+
+[0.8.0]: https://github.com/jamesgober/key-vault/compare/v0.7.0...v0.8.0
+
+---
+
 ## [0.7.0] - 2026-05-20
 
 ### Added
@@ -325,7 +383,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.8.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---

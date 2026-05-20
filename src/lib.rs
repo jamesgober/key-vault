@@ -87,7 +87,11 @@ pub use crate::fragment::{
 };
 pub use crate::handle::{KeyHandle, KeyId};
 pub use crate::metadata::{AlgorithmHint, KeyMetadata};
-pub use crate::monitor::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};
+#[cfg(feature = "monitor-tracing")]
+pub use crate::monitor::LogMonitor;
+pub use crate::monitor::{
+    AccessContext, CompositeMonitor, FailureContext, NoMonitor, SecurityMonitor, ThresholdContext,
+};
 pub use crate::vault::{KeyVault, KeyVaultBuilder, VaultConfig};
 
 /// Crate version string, populated by Cargo at build time.
