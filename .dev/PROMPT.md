@@ -80,7 +80,7 @@ This crate is foundational for:
 
 ## Status
 
-**Version:** `0.3.0` — Layers **2 (mlock)**, **3 (StandardFragmenter)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. BLAKE3 normalization wired through end-to-end. `KeyVault::fragment` / `KeyVault::defragment` exposed on the public API. Decoy strategies (Layer 4) arrive next in 0.4.0.
+**Version:** `0.4.0` — Layers **2 (mlock)**, **3 (StandardFragmenter)**, **4 (decoy: Random / SelfReference / KeyDerived)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. `KeyVaultBuilder::with_decoy` wires any `DecoyStrategy` into the fragmenter; decoy chunks are interleaved with real ones and skipped at defragment via a `u32::MAX` sentinel. Additional fragment strategies (Interleaved / Random / Layered) and the `frag_len` / `frag_symbols` configuration arrive next in 0.5.0.
 **Target:** `1.0.0` stable. Effort estimate: 4-5 weeks focused work.
 **MSRV:** Rust 1.85 (edition 2024).
 **Priority:** MAXIMUM. Premium quality on all deliverables.

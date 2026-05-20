@@ -20,6 +20,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::Ordering;
 
 use crate::Result;
+use crate::decoy::DecoyStrategy;
 use crate::fetcher::RawKey;
 use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
 use crate::normalize::blake3_normalize;
@@ -171,10 +172,34 @@ impl KeyVaultBuilder {
     /// Customize the fragmenter chunk-size range.
     ///
     /// Defaults are documented on [`StandardFragmenter::new`]. `min` is
-    /// clamped to `>= 1` and `max` to `>= min`.
+    /// clamped to `>= 1` and `max` to `>= min`. Calling this replaces any
+    /// previously-configured chunk range and resets the decoy strategy to
+    /// `None`; configure decoy *after* this call.
     #[must_use]
     pub fn with_chunk_range(mut self, min: usize, max: usize) -> Self {
         self.fragmenter = StandardFragmenter::with_chunk_range(min, max);
+        self
+    }
+
+    /// Attach a Layer-4 decoy strategy to the underlying fragmenter.
+    ///
+    /// When set, every `KeyVault::fragment` call also produces decoy chunks
+    /// from the strategy. Decoys are interleaved with real chunks via the
+    /// same Fisher-Yates shuffle and are skipped by `defragment`. See
+    /// [`StandardFragmenter::with_decoy`] for details on chunk-count and
+    /// size selection.
+    ///
+    /// Use [`SelfReferenceDecoy`](crate::SelfReferenceDecoy) for the
+    /// strongest statistical indistinguishability (recommended default);
+    /// [`KeyDerivedDecoy`](crate::KeyDerivedDecoy) for BLAKE3-XOF–derived
+    /// CSPRNG-like output;
+    /// [`RandomDecoy`](crate::RandomDecoy) for raw CSPRNG output.
+    #[must_use]
+    pub fn with_decoy<D>(mut self, decoy: D) -> Self
+    where
+        D: DecoyStrategy + 'static,
+    {
+        self.fragmenter = self.fragmenter.with_decoy(decoy);
         self
     }
 
@@ -293,5 +318,75 @@ mod tests {
             "more than one chunk below min size: {below_min}"
         );
         assert_eq!(total, 30);
+    }
+
+    #[test]
+    fn fragment_with_random_decoy_roundtrips() {
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_decoy(crate::RandomDecoy)
+            .build();
+        let raw = RawKey::new((0u8..32).collect());
+        let frags = v.fragment(&raw).unwrap();
+        // Chunk count is real + decoy (roughly 2x the real count).
+        // Defragment must skip the decoys and return the original bytes.
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn fragment_with_self_reference_decoy_roundtrips() {
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_decoy(crate::SelfReferenceDecoy)
+            .build();
+        let raw = RawKey::new(b"some user-supplied key material".to_vec());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn fragment_with_key_derived_decoy_roundtrips() {
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_decoy(crate::KeyDerivedDecoy)
+            .build();
+        let raw = RawKey::new((0u8..64).collect());
+        let frags = v.fragment(&raw).unwrap();
+        let recovered = v.defragment(&frags).unwrap();
+        assert_eq!(recovered.as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn decoy_increases_chunk_count_relative_to_no_decoy() {
+        let no_decoy = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_chunk_range(2, 4)
+            .build();
+        let with_decoy = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_chunk_range(2, 4)
+            .with_decoy(crate::SelfReferenceDecoy)
+            .build();
+        let raw = RawKey::new((0u8..32).collect());
+
+        // The total chunk count is randomized per fragmentation, so average
+        // over a few runs to get a stable comparison. The decoy-enabled
+        // vault should average ~2x the chunks.
+        let mut no_decoy_total = 0usize;
+        let mut decoy_total = 0usize;
+        for _ in 0..8 {
+            no_decoy_total += no_decoy.fragment(&raw).unwrap().chunk_count();
+            decoy_total += with_decoy.fragment(&raw).unwrap().chunk_count();
+        }
+        // The decoy-enabled vault adds one decoy chunk per real chunk, so
+        // its total chunk count should be exactly twice the no-decoy count
+        // (modulo per-call sampling that affects the real-chunk count
+        // identically). Allow some slack for the random sampling variance.
+        assert!(
+            decoy_total > no_decoy_total,
+            "decoy vault produced {decoy_total} chunks vs no-decoy {no_decoy_total}"
+        );
     }
 }

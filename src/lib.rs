@@ -70,7 +70,7 @@ pub mod tee;
 mod vault;
 
 pub use crate::codex::{Codex, IdentityCodex};
-pub use crate::decoy::DecoyStrategy;
+pub use crate::decoy::{DecoyStrategy, KeyDerivedDecoy, RandomDecoy, SelfReferenceDecoy};
 pub use crate::error::{Error, Result};
 pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};
 pub use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};

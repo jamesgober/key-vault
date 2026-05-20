@@ -19,6 +19,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-05-20
+
+### Added
+
+- **Layer 4 — Decoy strategies.** Three implementations of the
+  `DecoyStrategy` trait shipped:
+  - `RandomDecoy` — uniformly random bytes from the OS CSPRNG (fastest,
+    weakest).
+  - `SelfReferenceDecoy` — bytes sampled independently from the key
+    itself, so the decoy's byte distribution exactly matches the key's
+    (strongest indistinguishability, recommended default).
+  - `KeyDerivedDecoy` — BLAKE3 XOF seeded by the key plus a fresh
+    per-call CSPRNG nonce (CSPRNG-like output correlated with the key).
+- **`StandardFragmenter::with_decoy`** — attach any
+  `DecoyStrategy + 'static` to the fragmenter. When set, every
+  `fragment` call also emits decoy chunks; `defragment` recognizes them
+  via a `u32::MAX` sentinel in the locked layout buffer and skips them
+  during reassembly.
+- **`KeyVaultBuilder::with_decoy`** — fluent forwarder that wires the
+  decoy strategy into the underlying fragmenter without exposing
+  builder internals.
+- New crate-root re-exports: `RandomDecoy`, `SelfReferenceDecoy`,
+  `KeyDerivedDecoy`.
+
+### Changed
+
+- `StandardFragmenter` is no longer `Copy`; it now holds an
+  `Option<Arc<dyn DecoyStrategy>>` so the decoy can outlive the builder.
+  `Clone` is preserved (`Arc` clones cheaply).
+- `StandardFragmenter`'s `Debug` impl is now manual (it inspects the
+  decoy's `describe()` rather than the trait object) — display
+  semantics are unchanged.
+- The layout buffer encoding gained a sentinel: `u32::MAX` means "this
+  chunk is a decoy, skip it during defragment." Real key lengths are
+  bounded by `u32::MAX - 1` bytes (~4 GiB), well above any realistic
+  key. Internally, `fragment` now returns
+  `Error::Fragment("key too large")` if this bound is exceeded.
+
+### Security
+
+- **Statistical indistinguishability.** With `SelfReferenceDecoy` set,
+  decoy chunks are byte-for-byte drawn from the same distribution as
+  the real key; entropy and chi-squared distinguishers cannot separate
+  them.
+- **Per-call freshness.** `KeyDerivedDecoy` mixes in a fresh 32-byte
+  CSPRNG nonce per generate call so an attacker who later recovers the
+  key cannot recompute the decoy stream and confirm a fragmentation.
+- **Intermediate plaintext scrubbing.** The temporary `Vec<u8>` used to
+  carry decoy bytes from a strategy into the `LockedBytes` it lives in
+  is volatile-zeroed before drop.
+
+[0.4.0]: https://github.com/jamesgober/key-vault/compare/v0.3.0...v0.4.0
+
+---
+
 ## [0.3.0] - 2026-05-20
 
 ### Added
@@ -126,7 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.4.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---

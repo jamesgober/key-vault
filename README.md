@@ -69,21 +69,23 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.3.0 |
+| Component | Status as of 0.4.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
-| **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | **shipped** |
-| **Layer 3 — `StandardFragmenter`** (variable chunks, shuffle, non-contiguous allocations) | **shipped** |
+| **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | shipped |
+| **Layer 3 — `StandardFragmenter`** (variable chunks, shuffle, non-contiguous allocations) | shipped |
+| **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | **shipped** |
 | Layer 5 — `IdentityCodex` + user-closure `FnCodex` | shipped |
-| **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | **shipped** |
-| **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext) | **shipped** |
-| BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | **shipped** |
+| **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | shipped |
+| **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer) | shipped |
+| BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | shipped |
 | TEE detection (`detect_tee_capabilities`) | shipped (real x86_64 + Apple SE + AWS Nitro probes) |
-| `KeyVault::fragment` / `KeyVault::defragment` convenience methods | **shipped** |
-| `KeyVaultBuilder::with_chunk_range` | **shipped** |
+| `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped |
+| `KeyVaultBuilder::with_chunk_range` | shipped |
+| **`KeyVaultBuilder::with_decoy` / `StandardFragmenter::with_decoy`** | **shipped** |
 | Layer 3 — Interleaved/Random/Layered fragmenters | planned for 0.5.0 |
-| Layer 4 — Decoy strategies | planned for 0.4.0 |
+| `frag_len` configuration + `frag_symbols` whitelist | planned for 0.5.0 |
 | Layer 5 — `StaticCodex` / `DynamicCodex` | planned for 0.6.0 |
 | Layer 1 — built-in fetchers (Keychain, File, Env, TPM) | planned for 0.7.0 |
 | Layer 8 — Monitor implementations | planned for 0.8.0 |
@@ -127,9 +129,9 @@ The `KeyFetch` trait is in place today. Built-in implementations arrive in 0.7.0
 
 ### Decoy strategies (1.0 design, `DecoyStrategy` trait shipped)
 
-- **Random** — raw RNG bytes (fastest, weakest) — 0.4.0
-- **Self-Reference** — real key bytes used as filler (strongest, default) — 0.4.0
-- **Key-Derived** — hash-derived bytes that match key entropy profile — 0.4.0
+- **Random** — raw RNG bytes (fastest, weakest) — **shipped in 0.4.0**
+- **Self-Reference** — real key bytes used as filler (strongest, recommended default) — **shipped in 0.4.0**
+- **Key-Derived** — BLAKE3-XOF bytes seeded by key + per-call nonce — **shipped in 0.4.0**
 
 ### Codex layer (Layer 5)
 
@@ -169,21 +171,23 @@ The `KeyFetch` trait is in place today. Built-in implementations arrive in 0.7.0
 
 ```toml
 [dependencies]
-key-vault = "0.3"
+key-vault = "0.4"
 ```
 
 ```rust
-use key_vault::{KeyVaultBuilder, RawKey};
+use key_vault::{KeyVaultBuilder, RawKey, SelfReferenceDecoy};
 use key_vault::tee::detect_tee_capabilities;
 
-// Build a vault with the default Layer 2 + 3 + 6 + 7 stack
-// (mlock / VirtualLock + StandardFragmenter + ConstantTimeEq + zero-on-drop).
+// Build a vault with the full default stack: Layer 2 (mlock/VirtualLock)
+// + Layer 3 (StandardFragmenter) + Layer 4 (SelfReferenceDecoy — the
+// strongest decoy) + Layer 6 (ConstantTimeEq) + Layer 7 (zero-on-drop).
 let vault = KeyVaultBuilder::new()
     .normalize_with_blake3(true) // default
+    .with_decoy(SelfReferenceDecoy)
     .build();
 
 // Hand the vault some key material and get back an opaque, scattered,
-// mlock'd, zeroed-on-drop representation.
+// mlock'd, zeroed-on-drop representation with decoy chunks mixed in.
 let raw = RawKey::new(b"my application key".to_vec());
 let frags = vault.fragment(&raw).expect("fragment");
 
