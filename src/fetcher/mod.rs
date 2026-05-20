@@ -139,6 +139,27 @@ impl fmt::Debug for RawKey {
     }
 }
 
+impl Drop for RawKey {
+    fn drop(&mut self) {
+        // Volatile-zero every byte before the underlying Vec frees its
+        // allocation. Without the volatile + fence pair the compiler is
+        // free to elide the writes since the buffer is about to drop.
+        if !self.bytes.is_empty() {
+            // SAFETY: `self.bytes.as_mut_ptr()` is the start of a valid
+            // `self.bytes.len()`-byte allocation we own. Writes are
+            // within the buffer's bounds and only touch initialized
+            // bytes.
+            unsafe {
+                let ptr = self.bytes.as_mut_ptr();
+                for i in 0..self.bytes.len() {
+                    core::ptr::write_volatile(ptr.add(i), 0u8);
+                }
+            }
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// Pluggable source of key material.
 ///
 /// Implementors describe themselves through [`KeyFetch::describe`]; that name

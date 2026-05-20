@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 0.8.0.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 0.9.0.</i>
     <br>
     <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -35,7 +35,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-key-vault = "0.8"
+key-vault = "0.9"
 ```
 
 ### Install via terminal
@@ -318,6 +318,12 @@ outside the crate. `Debug` redacts contents.
 
 `Debug` prints `RawKey { len, bytes: "<redacted>" }`.
 
+**`Drop`** (0.9+) volatile-zeroes the internal `Vec<u8>` before the
+underlying allocation is freed. `write_volatile` per byte + a `SeqCst`
+compiler fence; same pattern as `LockedBytes`. The drop guarantee
+applies to every `RawKey`, including the temporary buffers returned
+by `KeyVault::defragment` and the ones handed to `with_key` closures.
+
 **Example:**
 
 ```rust
@@ -396,7 +402,39 @@ Source: `src/vault/mod.rs`
 The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 [`KeyVaultBuilder`](#keyvaultbuilder).
 
-**Public methods:**
+**Named-key registry (0.9+):**
+
+- `register(name: impl Into<String>, key: RawKey) -> Result<KeyHandle>`
+  — fragment a key and insert it under `name`. Returns the opaque
+  handle. Errors on duplicate name (`Error::InvalidConfig`) or
+  when the vault is locked out.
+- `unregister(handle: KeyHandle) -> Result<()>` — remove. The
+  underlying `Fragments` (and its `LockedBytes` chunks) drop and
+  zeroize when the last `Arc` reference goes away.
+- `with_key<F, T>(handle, f: F) -> Result<T>` where
+  `F: FnOnce(&[u8]) -> T` — scoped byte access. The slice handed to
+  `f` is valid only during the call; the temporary `RawKey` zeroes
+  on drop.
+- `rotate(handle, new_key: RawKey) -> Result<()>` — atomic swap via
+  `ArcSwap::rcu`. Concurrent readers see either the old or the new
+  fragmentation, never a torn read.
+- `contains(handle: KeyHandle) -> bool`
+- `metadata(handle: KeyHandle) -> Option<KeyMetadata>` — non-secret
+  per-key metadata.
+- `handle_for_name(name: &str) -> Option<KeyHandle>` — lookup.
+- `key_count() -> usize` — number of registered keys.
+
+**Master-key emergency unlock (0.9+):**
+
+- `unlock_with_master(attempt: &[u8]) -> Result<()>` — verify the
+  caller's bytes against the stored BLAKE3 digest in constant time
+  (via `subtle::ConstantTimeEq`). On match, clears the lockout flag
+  and failure tracker. On mismatch, reports the failure under the
+  reserved name `"<master>"` and returns `Error::Acquisition`.
+- `has_master_key() -> bool` — whether a master credential was
+  registered at build time.
+
+**One-shot fragment / defragment:**
 
 - `fragment(&self, key: &RawKey) -> Result<Fragments>` — pipeline:
   optional BLAKE3 normalize → optional codex encode → fragmenter.fragment.
@@ -404,6 +442,9 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 - `defragment(&self, fragments: &Fragments) -> Result<RawKey>` —
   inverse: fragmenter.defragment → optional codex decode. Returns
   `Error::LockedOut` when the vault is in lock-out state.
+
+**Lockout + monitor controls:**
+
 - `is_locked_out(&self) -> bool` — `true` if a threshold breach has
   put the vault in lock-out state.
 - `clear_lockout(&self)` — operator escape hatch. Resets the lockout
@@ -463,6 +504,10 @@ Fluent builder for [`KeyVault`](#keyvault).
   — attach a Layer-8 monitor.
 - `with_failure_threshold(self, max: u32, window: Duration) -> Self` —
   configure the threshold detector. `max = 0` disables lockout.
+- `with_master_key(self, master: RawKey) -> Self` — register a
+  master-key credential at build time. Stores the BLAKE3 digest of
+  `master`; plaintext drops + zeroes immediately. Used by
+  `KeyVault::unlock_with_master` for emergency unlock.
 - `build(self) -> KeyVault` — finalize. Infallible.
 
 **Example:**
@@ -1455,15 +1500,18 @@ comprehensive per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 0.8.0 (yet)
+### What's not in 0.9.0 (yet)
 
 - **`MetricsMonitor`** (metrics-lib integration) and **`WebhookMonitor`**
   (HTTP POST to alert endpoint) — deferred to post-1.0; both require
   external dependencies. Build a custom `SecurityMonitor` impl in the
   meantime.
 - **Dedicated `AuditEvent` surface** (Layer 9) — `LogMonitor` carries
-  failure/anomaly/breach events today; per-access audit hooks land
-  with the named-key registry in 0.9.
+  failure/anomaly/breach events today; per-access audit hook deferred.
+- **Master-key-as-KEK** — the master is an emergency-unlock
+  credential only. Sealing other keys with the master needs a
+  key-derivation scheme; deferred to post-1.0.
+- **Criterion benchmark suite** — planned for 0.10.0.
 - **Layer 9 audit logging** — planned for 0.8.0.
 - **Multi-key vaults, key rotation, master key recovery** — planned for
   0.9.0. Today's `KeyVault::fragment` / `defragment` operate per-call

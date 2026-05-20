@@ -19,6 +19,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-05-20
+
+### Added
+
+- **Named-key registry.** The vault now stores keys by name and hands
+  back opaque `KeyHandle`s. New API:
+  - `KeyVault::register(name, RawKey) -> Result<KeyHandle>` —
+    duplicate names rejected with `Error::InvalidConfig`.
+  - `KeyVault::unregister(handle) -> Result<()>`.
+  - `KeyVault::with_key(handle, |bytes| { ... }) -> Result<T>` —
+    scoped access. The byte slice handed to the closure is valid only
+    for the call; the temporary `RawKey` zeroes its buffer when the
+    closure returns.
+  - `KeyVault::rotate(handle, new_key) -> Result<()>` — atomic swap
+    via `ArcSwap::rcu`. Concurrent `with_key` readers see either the
+    old or the new fragmentation, never a torn read.
+  - `KeyVault::contains(handle) -> bool`,
+    `KeyVault::metadata(handle) -> Option<KeyMetadata>`,
+    `KeyVault::handle_for_name(name) -> Option<KeyHandle>`,
+    `KeyVault::key_count() -> usize`.
+- **Master-key emergency unlock.**
+  `KeyVaultBuilder::with_master_key(RawKey)` stores the BLAKE3 digest
+  of the supplied bytes (plaintext drops + zeroes immediately).
+  `KeyVault::unlock_with_master(&[u8])` verifies the digest in
+  constant time via `subtle::ConstantTimeEq` and clears the lockout
+  flag on success. Mismatched attempts feed the failure tracker
+  under the reserved name `"<master>"`.
+- **`KeyVault::has_master_key()`** — `true` if a master credential
+  was registered at build time.
+- **`RawKey: Drop`** — volatile-zeroes the internal `Vec<u8>` before
+  freeing. Any temporary `RawKey` (including the buffers handed back
+  from `KeyVault::defragment` and the bytes flowing through
+  `with_key`) now scrubs its allocation on drop.
+- New integration test suite [`tests/registry_concurrent.rs`](../../tests/registry_concurrent.rs)
+  exercising concurrent `with_key` + `rotate` (4 reader threads × 200
+  reads each interleaved with 20 rotations) and concurrent
+  `unregister` / `with_key`.
+
+### Changed
+
+- `KeyVault::fragment` / `defragment` are still available for ad-hoc
+  one-shot use; the new registry API is recommended for production
+  deployments where keys are long-lived.
+- `KeyEntry` (crate-private) wraps `Fragments` in an `Arc` so the
+  registry's `HashMap` can be cloned during `ArcSwap::rcu` updates
+  without duplicating the actual `LockedBytes` chunks.
+
+### Security
+
+- **Zero-on-drop coverage extended.** `RawKey` now zeroes its buffer
+  on drop, closing the previously-acknowledged gap where the
+  temporary defragmented buffer in `with_key`-style scoped access
+  paths could linger.
+- **Master-key digest, not plaintext.** The vault never holds the
+  master credential's bytes after registration — only the
+  BLAKE3 digest. Comparison uses `subtle::ConstantTimeEq` so timing
+  cannot reveal whether an attempt was close.
+- **Atomic rotation.** `ArcSwap::rcu` guarantees readers observe
+  either the pre-rotation or the post-rotation `Fragments`, never a
+  half-updated state.
+
+[0.9.0]: https://github.com/jamesgober/key-vault/compare/v0.8.0...v0.9.0
+
+---
+
 ## [0.8.0] - 2026-05-20
 
 ### Added
@@ -383,7 +448,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.9.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---

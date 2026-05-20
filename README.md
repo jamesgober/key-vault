@@ -69,7 +69,7 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.8.0 |
+| Component | Status as of 0.9.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
@@ -86,7 +86,7 @@ shipped code.
 | **Layer 1 — built-in fetchers** (`EnvFetch`, `FileFetch`, `KeychainFetch`, `TpmFetch` detection) | **shipped** |
 | **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | **shipped** |
 | Layer 9 — Dedicated audit logging surface | partial — `LogMonitor` covers failure/anomaly events; per-access audit event deferred |
-| Multi-key vaults, rotation, master recovery | planned for 0.9.0 |
+| **Multi-key vaults, rotation, master-key recovery** (`register` / `with_key` / `rotate` / `unlock_with_master`) | **shipped** |
 | Criterion benchmark suite | planned for 0.10.0 |
 
 Each phase's exit criteria, scope, and timeline are tracked in
@@ -150,9 +150,9 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ### Operational features
 
-- **Master key recovery** — fallback path for hardware failure — 0.9.0
-- **Key rotation** — atomic swap to new key without dropping access — 0.9.0
-- **Multiple keys per vault** — named keys with independent lifecycles — 0.9.0
+- **Master-key emergency unlock** — `unlock_with_master(bytes)` clears a threshold-driven lockout (BLAKE3-digest stored, constant-time compare) — **shipped in 0.9.0**
+- **Key rotation** — `KeyVault::rotate(handle, new_key)` atomic swap via `ArcSwap::rcu`, safe under concurrent readers — **shipped in 0.9.0**
+- **Multiple keys per vault** — named-key registry with `register` / `with_key` / `unregister` / `handle_for_name` / `metadata` — **shipped in 0.9.0**
 - **TEE detection** — check for Intel SGX, Intel TDX, AMD SEV, AMD SEV-SNP, ARM TrustZone, Apple Secure Enclave, AWS Nitro — **shipped**
 - **Key normalization** — BLAKE3 hash input to neutralize format-based pattern leaks — **shipped in 0.3.0**
 
@@ -172,7 +172,7 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ```toml
 [dependencies]
-key-vault = "0.8"
+key-vault = "0.9"
 ```
 
 ```rust

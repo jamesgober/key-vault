@@ -24,7 +24,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use arc_swap::ArcSwap;
+use subtle::ConstantTimeEq;
 
 use crate::Result;
 use crate::codex::Codex;
@@ -32,6 +35,8 @@ use crate::decoy::DecoyStrategy;
 use crate::error::Error;
 use crate::fetcher::RawKey;
 use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
+use crate::handle::{KeyHandle, KeyId};
+use crate::metadata::KeyMetadata;
 use crate::monitor::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};
 use crate::normalize::blake3_normalize;
 
@@ -101,6 +106,29 @@ pub struct KeyVault {
     inner: Arc<VaultInner>,
 }
 
+/// Entry in the vault's named-key registry. Holds the fragmented
+/// representation of a key, its name (for audit / threshold tracking),
+/// and non-secret metadata.
+///
+/// Crate-internal. Outside callers see only [`KeyHandle`] which indexes
+/// into this map.
+///
+/// `Clone` is required so the registry's `HashMap` can be cloned during
+/// `ArcSwap::rcu` updates. Cloning an entry copies the name and
+/// metadata (cheap) and bumps the `Arc<Fragments>` refcount — the
+/// underlying `Fragments` storage (`LockedBytes` chunks) is not
+/// duplicated.
+#[derive(Clone)]
+struct KeyEntry {
+    name: String,
+    /// `Fragments` is not `Clone`, so the registry stores `Arc<Fragments>`.
+    /// Rotation produces a new `Arc<Fragments>` and atomically swaps the
+    /// old one out via [`ArcSwap`]; concurrent readers see either the old
+    /// or the new value (never a torn read).
+    fragments: Arc<Fragments>,
+    metadata: KeyMetadata,
+}
+
 struct VaultInner {
     config: VaultConfig,
     fragmenter: StandardFragmenter,
@@ -111,6 +139,10 @@ struct VaultInner {
     /// Layer-8 security monitor. Defaults to a no-op
     /// [`NoMonitor`](crate::NoMonitor) when no monitor is configured.
     monitor: Arc<dyn SecurityMonitor>,
+    /// Named-key registry. Lock-free reads via [`ArcSwap`]; writes
+    /// (register, unregister, rotate) build a new `HashMap` and swap
+    /// it in atomically.
+    keys: ArcSwap<HashMap<KeyId, KeyEntry>>,
     /// Per-key sliding-window failure tracker. Populated by
     /// [`KeyVault::report_failure`]; consulted by the threshold-detection
     /// logic to decide whether to trigger lockout.
@@ -119,6 +151,11 @@ struct VaultInner {
     /// `fragment` / `defragment` refuse to operate while this is set;
     /// `Error::LockedOut` is returned instead.
     locked_out: AtomicBool,
+    /// Optional master-key credential. Stored as the BLAKE3 hash of the
+    /// supplied master bytes — the plaintext is dropped (and zeroed via
+    /// `RawKey::Drop`) immediately after registration. Used by
+    /// [`KeyVault::unlock_with_master`] as an emergency unlock.
+    master_hash: Option<[u8; 32]>,
 }
 
 impl KeyVault {
@@ -299,6 +336,285 @@ impl KeyVault {
             Ok(encoded)
         }
     }
+
+    // ----- Named-key registry (Phase 0.9) -----
+
+    /// Register a key under a name and return an opaque [`KeyHandle`].
+    ///
+    /// The key bytes are run through the configured normalizer + codex
+    /// pipeline, fragmented, and inserted into the named registry. The
+    /// returned handle is the only way to refer to the key from outside
+    /// the crate; the underlying numeric id is not exposed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::LockedOut`](crate::Error::LockedOut) if the vault is
+    ///   currently locked out (threshold-driven).
+    /// - [`Error::InvalidConfig`](crate::Error::InvalidConfig) if a key
+    ///   with the same name is already registered.
+    /// - Whatever the configured fragmenter surfaces (typically
+    ///   [`Error::Fragment`](crate::Error::Fragment) for empty input).
+    // Intentionally take `key` by value: the function consumes the
+    // caller's `RawKey` so its `Drop` impl zeroes the original buffer
+    // as soon as we've fragmented (and copied) the bytes into
+    // mlock'd storage.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn register(&self, name: impl Into<String>, key: RawKey) -> Result<KeyHandle> {
+        if self.is_locked_out() {
+            return Err(Error::LockedOut);
+        }
+        let name: String = name.into();
+
+        // Reject duplicate names early so callers get a clear error
+        // before paying the fragmentation cost.
+        let snapshot = self.inner.keys.load();
+        if snapshot.values().any(|e| e.name == name) {
+            return Err(Error::InvalidConfig(format!(
+                "key name {name:?} is already registered"
+            )));
+        }
+        drop(snapshot);
+
+        let key_len = key.len();
+        let fragments = self.fragment(&key)?;
+        let handle = KeyHandle::allocate();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let metadata = KeyMetadata::new(now, key_len, None);
+
+        let entry = KeyEntry {
+            name,
+            fragments: Arc::new(fragments),
+            metadata,
+        };
+
+        // Atomic insert: build a new map containing the entry and swap.
+        let _previous = self.inner.keys.rcu(|current| {
+            let mut new_map = (**current).clone();
+            let _ = new_map.insert(
+                handle.id(),
+                KeyEntry {
+                    name: entry.name.clone(),
+                    fragments: Arc::clone(&entry.fragments),
+                    metadata: entry.metadata.clone(),
+                },
+            );
+            new_map
+        });
+        Ok(handle)
+    }
+
+    /// Remove a registered key from the registry. The key's `Fragments`
+    /// (and their `LockedBytes` chunks) drop and zeroize when the last
+    /// reference goes away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::KeyNotFound`](crate::Error::KeyNotFound) if no
+    /// key is registered under the given handle.
+    pub fn unregister(&self, handle: KeyHandle) -> Result<()> {
+        let mut removed = false;
+        let _previous = self.inner.keys.rcu(|current| {
+            let mut new_map = (**current).clone();
+            removed = new_map.remove(&handle.id()).is_some();
+            new_map
+        });
+        if removed {
+            Ok(())
+        } else {
+            Err(Error::KeyNotFound)
+        }
+    }
+
+    /// Briefly access the recovered key material inside a callback.
+    ///
+    /// The vault defragments the named key into a temporary [`RawKey`],
+    /// applies the codex decode if configured, and passes the bytes to
+    /// the user-supplied closure. When the closure returns, the
+    /// `RawKey` drops and its bytes are volatile-zeroed.
+    ///
+    /// **The byte slice handed to the closure does not outlive the
+    /// call.** Do not stash it in a longer-lived structure; do your
+    /// cryptographic operation, return, and let the vault scrub the
+    /// buffer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::LockedOut`](crate::Error::LockedOut) if the vault is
+    ///   currently locked out.
+    /// - [`Error::KeyNotFound`](crate::Error::KeyNotFound) if no key is
+    ///   registered under the given handle.
+    /// - [`Error::Defragment`](crate::Error::Defragment) on internal
+    ///   inconsistency.
+    pub fn with_key<F, T>(&self, handle: KeyHandle, f: F) -> Result<T>
+    where
+        F: FnOnce(&[u8]) -> T,
+    {
+        if self.is_locked_out() {
+            return Err(Error::LockedOut);
+        }
+        let snapshot = self.inner.keys.load();
+        let entry = snapshot.get(&handle.id()).ok_or(Error::KeyNotFound)?;
+        let fragments = Arc::clone(&entry.fragments);
+        // Drop the snapshot so we don't hold the Arc across the
+        // potentially-slow defragment + user-callback path.
+        drop(snapshot);
+
+        let encoded = self.inner.fragmenter.defragment(&fragments)?;
+        let raw = if let Some(codex) = &self.inner.codex {
+            codex_apply(codex.as_ref(), &encoded)
+        } else {
+            encoded
+        };
+        // `raw` zeroes its bytes on drop at the end of this scope.
+        let result = f(raw.as_bytes());
+        Ok(result)
+    }
+
+    /// Rotate a registered key to new material.
+    ///
+    /// The new key is fragmented and atomically swapped into the
+    /// registry slot. Concurrent [`KeyVault::with_key`] callers see
+    /// either the old or the new fragmentation (never a torn read);
+    /// the old `Fragments` drops once all in-flight readers release
+    /// their `Arc` clones.
+    ///
+    /// The metadata is updated to record the new key length and a fresh
+    /// registration timestamp.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::LockedOut`](crate::Error::LockedOut)
+    /// - [`Error::KeyNotFound`](crate::Error::KeyNotFound)
+    /// - Fragmenter errors for the new key.
+    // Take `new_key` by value so its `Drop` zeroes the original buffer
+    // after we've fragmented and copied the bytes into mlock'd storage.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn rotate(&self, handle: KeyHandle, new_key: RawKey) -> Result<()> {
+        if self.is_locked_out() {
+            return Err(Error::LockedOut);
+        }
+
+        // Verify the key exists first so we don't pay the fragmentation
+        // cost on a missing handle.
+        {
+            let snapshot = self.inner.keys.load();
+            if !snapshot.contains_key(&handle.id()) {
+                return Err(Error::KeyNotFound);
+            }
+        }
+
+        let new_len = new_key.len();
+        let new_fragments = Arc::new(self.fragment(&new_key)?);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let new_metadata = KeyMetadata::new(now, new_len, None);
+
+        let mut found = false;
+        let _previous = self.inner.keys.rcu(|current| {
+            let mut new_map = (**current).clone();
+            if let Some(entry) = new_map.get_mut(&handle.id()) {
+                entry.fragments = Arc::clone(&new_fragments);
+                entry.metadata = new_metadata.clone();
+                found = true;
+            }
+            new_map
+        });
+        if found {
+            Ok(())
+        } else {
+            // Race: handle was unregistered between the check and the
+            // RCU update. Treat as not-found so the caller can react.
+            Err(Error::KeyNotFound)
+        }
+    }
+
+    /// `true` if a key is registered under the given handle.
+    #[must_use]
+    pub fn contains(&self, handle: KeyHandle) -> bool {
+        self.inner.keys.load().contains_key(&handle.id())
+    }
+
+    /// Clone the [`KeyMetadata`] for the given handle.
+    ///
+    /// Returns `None` if the handle is not registered. Metadata is a
+    /// non-secret descriptor (length, registration time, algorithm
+    /// hint) — safe to log and pass around.
+    #[must_use]
+    pub fn metadata(&self, handle: KeyHandle) -> Option<KeyMetadata> {
+        self.inner
+            .keys
+            .load()
+            .get(&handle.id())
+            .map(|e| e.metadata.clone())
+    }
+
+    /// Find the handle registered under `name`, if any.
+    #[must_use]
+    pub fn handle_for_name(&self, name: &str) -> Option<KeyHandle> {
+        self.inner
+            .keys
+            .load()
+            .iter()
+            .find_map(|(id, entry)| (entry.name == name).then(|| KeyHandle::from_id(*id)))
+    }
+
+    /// Number of keys currently registered.
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        self.inner.keys.load().len()
+    }
+
+    // ----- Master-key emergency unlock (Phase 0.9) -----
+
+    /// Attempt to clear the lockout flag using a master credential.
+    ///
+    /// If the vault has a master key registered (via
+    /// [`KeyVaultBuilder::with_master_key`]) and the supplied bytes
+    /// match the stored BLAKE3 digest in constant time, the lockout is
+    /// cleared and the failure tracker is reset.
+    ///
+    /// On mismatch, the failure is reported to the monitor under the
+    /// reserved key name `"<master>"` and the lockout (if any) remains
+    /// in place. The function never reveals whether the digest matched
+    /// through timing — comparison goes through
+    /// [`subtle::ConstantTimeEq`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidConfig`](crate::Error::InvalidConfig) if no
+    ///   master credential is registered.
+    /// - [`Error::Acquisition`](crate::Error::Acquisition) with source
+    ///   `"master"` on mismatch.
+    pub fn unlock_with_master(&self, attempt: &[u8]) -> Result<()> {
+        let stored = self.inner.master_hash.ok_or_else(|| {
+            Error::InvalidConfig(
+                "vault has no master key registered; pass with_master_key at build time"
+                    .to_string(),
+            )
+        })?;
+        let attempt_hash = blake3::hash(attempt);
+        if bool::from(stored.as_slice().ct_eq(attempt_hash.as_bytes())) {
+            self.clear_lockout();
+            Ok(())
+        } else {
+            // Record as a failure on a reserved name so threshold rules
+            // apply to repeated master-unlock attempts too.
+            self.report_failure("<master>", Some("invalid master credential"));
+            Err(Error::Acquisition {
+                source: Cow::Borrowed("master"),
+                reason: "master credential did not match".to_string(),
+            })
+        }
+    }
+
+    /// `true` if a master credential was registered at build time.
+    #[must_use]
+    pub fn has_master_key(&self) -> bool {
+        self.inner.master_hash.is_some()
+    }
 }
 
 /// Apply a codex's transformation to every byte of a key.
@@ -331,6 +647,10 @@ pub struct KeyVaultBuilder {
     fragmenter: StandardFragmenter,
     codex: Option<Arc<dyn Codex>>,
     monitor: Option<Arc<dyn SecurityMonitor>>,
+    /// Hash of the master credential, if one was registered. We hold
+    /// the hash (not the plaintext) so the master bytes don't linger
+    /// in the builder's state.
+    master_hash: Option<[u8; 32]>,
 }
 
 impl Default for KeyVaultBuilder {
@@ -346,6 +666,7 @@ impl core::fmt::Debug for KeyVaultBuilder {
             .field("fragmenter", &self.fragmenter)
             .field("codex", &self.codex.as_ref().map(|_| "<set>"))
             .field("monitor", &self.monitor.as_ref().map(|_| "<set>"))
+            .field("master_key", &self.master_hash.as_ref().map(|_| "<set>"))
             .finish()
     }
 }
@@ -360,6 +681,7 @@ impl KeyVaultBuilder {
             fragmenter: StandardFragmenter::new(),
             codex: None,
             monitor: None,
+            master_hash: None,
         }
     }
 
@@ -484,6 +806,28 @@ impl KeyVaultBuilder {
         self
     }
 
+    /// Register a master credential for emergency unlock.
+    ///
+    /// The vault stores the **BLAKE3 hash** of the supplied bytes; the
+    /// plaintext is dropped immediately (and zeroed via
+    /// `RawKey::Drop`). Use [`KeyVault::unlock_with_master`] later to
+    /// clear a threshold-driven lockout.
+    ///
+    /// Calling this twice replaces the previously-stored hash. Pass an
+    /// empty key (zero-length) to register a meaningless "match
+    /// anything" credential — strongly discouraged; the function does
+    /// not reject it for symmetry with the rest of the builder API.
+    #[must_use]
+    pub fn with_master_key(mut self, master: RawKey) -> Self {
+        let hash = blake3::hash(master.as_bytes());
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(hash.as_bytes());
+        self.master_hash = Some(bytes);
+        // `master` drops here; its `Drop` impl zeroes the internal Vec.
+        drop(master);
+        self
+    }
+
     /// Finalize and produce a [`KeyVault`].
     ///
     /// Infallible in this phase — later phases may move this to a
@@ -499,8 +843,10 @@ impl KeyVaultBuilder {
                 fragmenter: self.fragmenter,
                 codex: self.codex,
                 monitor,
+                keys: ArcSwap::from_pointee(HashMap::new()),
                 failure_tracker: Mutex::new(HashMap::new()),
                 locked_out: AtomicBool::new(false),
+                master_hash: self.master_hash,
             }),
         }
     }
@@ -918,6 +1264,166 @@ mod tests {
         v.report_failure("alpha", None);
         // alpha now has 2 — triggers lockout.
         assert!(v.is_locked_out());
+    }
+
+    // ----- Phase 0.9: registry + rotation + master-key tests -----
+
+    #[test]
+    fn register_returns_handle_and_increments_count() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        assert_eq!(v.key_count(), 0);
+        let h = v
+            .register("primary", RawKey::new(alloc::vec![1u8; 32]))
+            .unwrap();
+        assert_eq!(v.key_count(), 1);
+        assert!(v.contains(h));
+    }
+
+    #[test]
+    fn register_rejects_duplicate_name() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let _ = v
+            .register("primary", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+        let err = v
+            .register("primary", RawKey::new(alloc::vec![2u8; 16]))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn unregister_removes_key() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v
+            .register("primary", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+        assert!(v.contains(h));
+        v.unregister(h).unwrap();
+        assert!(!v.contains(h));
+        assert_eq!(v.key_count(), 0);
+    }
+
+    #[test]
+    fn unregister_unknown_handle_errors() {
+        let v = KeyVaultBuilder::new().build();
+        let h = KeyHandle::__for_test();
+        let err = v.unregister(h).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+
+    #[test]
+    fn with_key_round_trips_bytes() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let original = alloc::vec![0xa5u8; 32];
+        let h = v.register("data", RawKey::new(original.clone())).unwrap();
+        let observed = v.with_key(h, <[u8]>::to_vec).unwrap();
+        assert_eq!(observed, original);
+    }
+
+    #[test]
+    fn with_key_normalization_changes_output_length() {
+        let v = KeyVaultBuilder::new().build(); // normalization ON
+        let h = v
+            .register("data", RawKey::new(alloc::vec![0xa5; 17]))
+            .unwrap();
+        let observed_len = v.with_key(h, <[u8]>::len).unwrap();
+        // BLAKE3 normalization → 32-byte output regardless of input.
+        assert_eq!(observed_len, 32);
+    }
+
+    #[test]
+    fn with_key_unknown_handle_errors() {
+        let v = KeyVaultBuilder::new().build();
+        let h = KeyHandle::__for_test();
+        let err = v.with_key(h, |_| ()).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+
+    #[test]
+    fn rotate_swaps_key_bytes() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v
+            .register("data", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+
+        v.rotate(h, RawKey::new(alloc::vec![2u8; 16])).unwrap();
+        let observed = v.with_key(h, <[u8]>::to_vec).unwrap();
+        assert_eq!(observed, alloc::vec![2u8; 16]);
+    }
+
+    #[test]
+    fn rotate_unknown_handle_errors() {
+        let v = KeyVaultBuilder::new().build();
+        let h = KeyHandle::__for_test();
+        let err = v.rotate(h, RawKey::new(alloc::vec![0u8; 16])).unwrap_err();
+        assert!(matches!(err, Error::KeyNotFound));
+    }
+
+    #[test]
+    fn handle_for_name_finds_registered_key() {
+        let v = KeyVaultBuilder::new().build();
+        let h = v
+            .register("primary", RawKey::new(alloc::vec![0u8; 16]))
+            .unwrap();
+        assert_eq!(v.handle_for_name("primary"), Some(h));
+        assert_eq!(v.handle_for_name("missing"), None);
+    }
+
+    #[test]
+    fn metadata_records_registration_length() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v
+            .register("data", RawKey::new(alloc::vec![0u8; 42]))
+            .unwrap();
+        let meta = v.metadata(h).expect("metadata");
+        assert_eq!(meta.length(), 42);
+    }
+
+    #[test]
+    fn registered_key_refuses_access_when_locked_out() {
+        let v = KeyVaultBuilder::new()
+            .with_failure_threshold(1, Duration::from_secs(30))
+            .build();
+        let h = v
+            .register("data", RawKey::new(alloc::vec![0xa5; 16]))
+            .unwrap();
+        v.report_failure("data", None);
+        assert!(v.is_locked_out());
+
+        let err = v.with_key(h, |_| ()).unwrap_err();
+        assert!(matches!(err, Error::LockedOut));
+        let err = v.rotate(h, RawKey::new(alloc::vec![0u8; 16])).unwrap_err();
+        assert!(matches!(err, Error::LockedOut));
+    }
+
+    #[test]
+    fn master_key_unlock_clears_lockout_on_match() {
+        let master_bytes = b"correct horse battery staple".to_vec();
+        let v = KeyVaultBuilder::new()
+            .with_master_key(RawKey::new(master_bytes.clone()))
+            .with_failure_threshold(1, Duration::from_secs(30))
+            .build();
+        assert!(v.has_master_key());
+
+        v.report_failure("k", None);
+        assert!(v.is_locked_out());
+
+        // Wrong master → still locked.
+        let err = v.unlock_with_master(b"wrong").unwrap_err();
+        assert!(matches!(err, Error::Acquisition { .. }));
+        assert!(v.is_locked_out());
+
+        // Correct master → unlocked.
+        v.unlock_with_master(&master_bytes).unwrap();
+        assert!(!v.is_locked_out());
+    }
+
+    #[test]
+    fn master_key_unlock_without_registered_master_errors() {
+        let v = KeyVaultBuilder::new().build();
+        assert!(!v.has_master_key());
+        let err = v.unlock_with_master(b"anything").unwrap_err();
+        assert!(matches!(err, Error::InvalidConfig(_)));
     }
 
     #[test]
