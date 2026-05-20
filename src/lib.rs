@@ -73,7 +73,10 @@ pub use crate::codex::{Codex, IdentityCodex};
 pub use crate::decoy::{DecoyStrategy, KeyDerivedDecoy, RandomDecoy, SelfReferenceDecoy};
 pub use crate::error::{Error, Result};
 pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};
-pub use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
+pub use crate::fragment::{
+    FragmentStrategy, Fragments, InterleavedFragmenter, LayeredFragmenter, RandomFragmenter,
+    StandardFragmenter,
+};
 pub use crate::handle::{KeyHandle, KeyId};
 pub use crate::metadata::{AlgorithmHint, KeyMetadata};
 pub use crate::monitor::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};

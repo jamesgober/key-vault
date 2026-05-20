@@ -69,28 +69,27 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.4.0 |
+| Component | Status as of 0.5.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
 | **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | shipped |
-| **Layer 3 — `StandardFragmenter`** (variable chunks, shuffle, non-contiguous allocations) | shipped |
-| **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | **shipped** |
+| **Layer 3 — All four fragment strategies**: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter` | **shipped** |
+| **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | shipped |
 | Layer 5 — `IdentityCodex` + user-closure `FnCodex` | shipped |
 | **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | shipped |
 | **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer) | shipped |
 | BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | shipped |
 | TEE detection (`detect_tee_capabilities`) | shipped (real x86_64 + Apple SE + AWS Nitro probes) |
-| `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped |
-| `KeyVaultBuilder::with_chunk_range` | shipped |
-| **`KeyVaultBuilder::with_decoy` / `StandardFragmenter::with_decoy`** | **shipped** |
-| Layer 3 — Interleaved/Random/Layered fragmenters | planned for 0.5.0 |
-| `frag_len` configuration + `frag_symbols` whitelist | planned for 0.5.0 |
+| `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
+| `KeyVaultBuilder::with_chunk_range` / `with_decoy` | shipped |
+| `frag_len` configuration + `frag_symbols` whitelist | planned for 0.6.0 |
 | Layer 5 — `StaticCodex` / `DynamicCodex` | planned for 0.6.0 |
 | Layer 1 — built-in fetchers (Keychain, File, Env, TPM) | planned for 0.7.0 |
 | Layer 8 — Monitor implementations | planned for 0.8.0 |
 | Layer 9 — Audit logging | planned for 0.8.0 |
 | Multi-key vaults, rotation, master recovery | planned for 0.9.0 |
+| Criterion benchmark suite | planned for 0.10.0 |
 
 Each phase's exit criteria, scope, and timeline are tracked in
 [.dev/ROADMAP.md](.dev/ROADMAP.md).
@@ -119,13 +118,16 @@ The `KeyFetch` trait is in place today. Built-in implementations arrive in 0.7.0
 - **Environment variables** for container deployments
 - **Custom fetchers** via the trait — bring your own HSM, KMS client, or proprietary source
 
-### Fragment strategies (1.0 design, `FragmentStrategy` trait shipped)
+### Fragment strategies (all four shipped in 0.5.0)
 
-- **Standard** — variable chunks + Fisher-Yates shuffle, each chunk in its own mlock'd allocation — **shipped in 0.3.0**
-- **Interleaved** — bytes interleaved with decoy at randomized strides — 0.5.0
-- **Random** — non-contiguous fragments at randomized offsets — 0.5.0
-- **Layered** — compose multiple strategies for stacked defense — 0.5.0
-- **Custom** — implement the `FragmentStrategy` trait (available today)
+- **Standard** — variable chunks + Fisher-Yates shuffle, each chunk in its own mlock'd allocation
+- **Random** — chunks of variable size whose bytes come from **non-contiguous** positions in the key (no chunk holds a contiguous key substring longer than 1)
+- **Interleaved** — single large pool, key bytes scattered at random positions, gaps filled with CSPRNG padding
+- **Layered** — routes each fragmentation to a uniformly-picked sub-strategy; strategy index encoded in the layout header so defragment dispatches correctly
+- **Custom** — implement the `FragmentStrategy` trait
+
+See [docs/SECURITY.md](docs/SECURITY.md#strategies-shipped-in-050) for the
+per-strategy threat-model comparison.
 
 ### Decoy strategies (1.0 design, `DecoyStrategy` trait shipped)
 
@@ -171,7 +173,7 @@ The `KeyFetch` trait is in place today. Built-in implementations arrive in 0.7.0
 
 ```toml
 [dependencies]
-key-vault = "0.4"
+key-vault = "0.5"
 ```
 
 ```rust

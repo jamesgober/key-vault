@@ -241,26 +241,46 @@ When `key-vault 1.0.0` ships, it commits to:
 
 ---
 
-## Phase 0.5.0 - Additional fragment strategies + LayeredFragmenter
+## Phase 0.5.0 - Additional fragment strategies + LayeredFragmenter (COMPLETE)
 
 **Goal:** Three more fragment strategies + composition.
 
-**Effort:** 4-5 days.
+**Effort:** 4-5 days. **Actual:** shipped 2026-05-20.
 
 ### Tasks
 
-- [ ] **`InterleavedFragmenter`** — bytes interleaved at random strides
-- [ ] **`RandomFragmenter`** — non-contiguous fragments at randomized offsets
-- [ ] **`LayeredFragmenter`** — composes multiple strategies
-- [ ] Tests for each
-- [ ] Cross-strategy benchmarks
-- [ ] Documentation: comparison of strategies and threat model coverage in docs/SECURITY.md
+- [x] **`InterleavedFragmenter`** — key bytes scattered in a single
+  large `LockedBytes` pool with CSPRNG padding
+- [x] **`RandomFragmenter`** — chunks hold bytes from non-contiguous
+  key positions
+- [x] **`LayeredFragmenter`** — composition by random routing among
+  sub-strategies, with strategy index prepended to layout
+- [x] Tests for each (unit + integration)
+- [x] Shared helpers refactored to `src/fragment/util.rs`
+- [x] `Fragments::into_parts()` for compositional strategies
+- [x] Documentation: strategy comparison + per-strategy threat focus in
+  `docs/SECURITY.md`
+- [ ] Cross-strategy criterion benchmarks — deferred to 0.10
+- [ ] `frag_len` output-length configuration — deferred to 0.6
+  (lands alongside the codex layer's per-byte tunables)
+- [ ] `frag_symbols` symbol whitelist — deferred to 0.6
 
 ### Exit criteria
 
-- [ ] 4 fragment strategies functional
-- [ ] Layered composition working with all 3 sub-strategies
-- [ ] docs/SECURITY.md updated with strategy comparison table
+- [x] 4 fragment strategies functional
+- [x] Layered composition working with all 3 sub-strategies (verified
+  by 20-round integration test)
+- [x] `docs/SECURITY.md` updated with strategy comparison table
+
+### Carry-over notes
+
+- `frag_len` and `frag_symbols` deferred to 0.6 — the codex phase is
+  the natural place for output-byte tunables since the codex itself
+  transforms byte values. Holding both off until then keeps the
+  configuration API coherent.
+- Criterion benchmarks deferred to 0.10 (the dedicated performance
+  phase). The 1000-iteration round-trip stress test and the 20-round
+  layered test exercise the hot paths in regular CI for now.
 
 ---
 

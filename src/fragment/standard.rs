@@ -17,6 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::util::{fisher_yates, sample_range, zero_buffer, zero_buffer_owned};
 use super::{FragmentStrategy, Fragments};
 use crate::Result;
 use crate::decoy::DecoyStrategy;
@@ -311,14 +312,6 @@ enum ChunkKind {
     Decoy(usize),
 }
 
-/// Volatile-zero an owned `Vec<u8>` of decoy bytes after it has been
-/// copied into a [`LockedBytes`]. Defeats dead-store elimination on the
-/// plaintext copy before the Vec's allocation is returned.
-fn zero_buffer_owned(mut buf: Vec<u8>) {
-    zero_buffer(&mut buf);
-    drop(buf);
-}
-
 /// Sample chunk sizes summing exactly to `total`, with each size in
 /// `[min, max]` except possibly the last (which absorbs any short
 /// remainder).
@@ -332,86 +325,17 @@ fn sample_chunk_sizes(total: usize, min: usize, max: usize) -> Result<Vec<usize>
     let mut remaining = total;
     while remaining > 0 {
         if remaining <= max {
-            // The remaining bytes fit in a single chunk that respects max.
-            // We can either take the whole remainder as one chunk, or split
-            // it into two when remaining > max + 1 — but we are in the
-            // `<= max` branch, so a single chunk is fine.
             sizes.push(remaining);
             remaining = 0;
         } else {
             let pick = sample_range(min, max)?;
-            // Ensure we leave at least `min` bytes for at least one more
-            // chunk; otherwise pick a size such that `remaining - pick >=
-            // min`.
             let pick = pick.min(remaining.saturating_sub(min));
-            // `pick` could now be < min; clamp.
             let pick = pick.max(min).min(max).min(remaining);
             sizes.push(pick);
             remaining -= pick;
         }
     }
     Ok(sizes)
-}
-
-/// Inclusive uniform sample from `[min, max]` using the OS CSPRNG.
-fn sample_range(min: usize, max: usize) -> Result<usize> {
-    debug_assert!(min <= max);
-    let span = max - min + 1;
-    let r = random_u64()?;
-    // Modulo bias is negligible at the small spans we use here. A 64-bit
-    // input mod a span <= 64 has bias on the order of 2^-58. We compute
-    // `r % span` in u64 space; the result is always < span and therefore
-    // fits in usize on every supported target.
-    let span_u64 = span as u64;
-    let reduced = r % span_u64;
-    // The reduction fits in usize because `reduced < span` and `span` is a
-    // usize by construction.
-    #[allow(clippy::cast_possible_truncation)]
-    let reduced_usize = reduced as usize;
-    Ok(min + reduced_usize)
-}
-
-fn random_u64() -> Result<u64> {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).map_err(|_| Error::Internal("OS RNG failed"))?;
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn fisher_yates<T>(slice: &mut [T]) -> Result<()> {
-    let len = slice.len();
-    if len < 2 {
-        return Ok(());
-    }
-    // Standard Fisher-Yates: walk from the last index down to 1, swapping
-    // each element with a uniformly-chosen earlier index (inclusive).
-    let mut i = len - 1;
-    while i > 0 {
-        let j_span = (i + 1) as u64;
-        let r = random_u64()?;
-        let reduced = r % j_span;
-        // `reduced < j_span` and `j_span = i + 1 <= len`, so it always fits
-        // in usize.
-        #[allow(clippy::cast_possible_truncation)]
-        let j = reduced as usize;
-        slice.swap(i, j);
-        i -= 1;
-    }
-    Ok(())
-}
-
-/// Volatile-zero a Vec<u8> we no longer need. Used for the intermediate
-/// `layout_bytes` Vec; the in-tree [`LockedBytes`] takes care of its own
-/// buffer.
-fn zero_buffer(buf: &mut [u8]) {
-    // SAFETY: `buf.as_mut_ptr()` is the start of a valid `buf.len()`-byte
-    // slice; we write within bounds and only once per element.
-    unsafe {
-        let ptr = buf.as_mut_ptr();
-        for i in 0..buf.len() {
-            core::ptr::write_volatile(ptr.add(i), 0u8);
-        }
-    }
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]

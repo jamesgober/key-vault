@@ -80,7 +80,7 @@ This crate is foundational for:
 
 ## Status
 
-**Version:** `0.4.0` — Layers **2 (mlock)**, **3 (StandardFragmenter)**, **4 (decoy: Random / SelfReference / KeyDerived)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. `KeyVaultBuilder::with_decoy` wires any `DecoyStrategy` into the fragmenter; decoy chunks are interleaved with real ones and skipped at defragment via a `u32::MAX` sentinel. Additional fragment strategies (Interleaved / Random / Layered) and the `frag_len` / `frag_symbols` configuration arrive next in 0.5.0.
+**Version:** `0.5.0` — Layers **2 (mlock)**, **3 (all four fragment strategies: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter`)**, **4 (decoy: Random / SelfReference / KeyDerived)**, **6 (constant-time `KeyHandle`)**, and **7 (zero-on-drop)** all functional. `LayeredFragmenter` composes by random routing among sub-strategies (strategy-index encoded in layout header). `docs/SECURITY.md` carries the per-strategy threat-model comparison. The codex layer (`StaticCodex` / `DynamicCodex`) and the deferred `frag_len` / `frag_symbols` configuration arrive next in 0.6.0.
 **Target:** `1.0.0` stable. Effort estimate: 4-5 weeks focused work.
 **MSRV:** Rust 1.85 (edition 2024).
 **Priority:** MAXIMUM. Premium quality on all deliverables.

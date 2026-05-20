@@ -19,6 +19,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-05-20
+
+### Added
+
+- **`RandomFragmenter`** — Layer-3 strategy that scatters bytes
+  **non-contiguously**. Each chunk holds bytes drawn from independently
+  chosen random positions of the original key, so no chunk ever contains
+  a contiguous run of key bytes longer than 1.
+- **`InterleavedFragmenter`** — Layer-3 strategy that places key bytes
+  at random positions inside a single large `LockedBytes` pool (default
+  4× key length), padding the gaps with CSPRNG bytes. Defeats byte-level
+  statistical analysis of the pool.
+- **`LayeredFragmenter`** — composition strategy that holds a `Vec<Arc<dyn FragmentStrategy>>`
+  and picks one uniformly at random per `fragment` call. The picked
+  sub-strategy's index is prepended (4 bytes LE) to the layout buffer so
+  `defragment` can dispatch correctly. Routing-based composition avoids
+  materializing the key between layers.
+- New crate-internal `src/fragment/util.rs` consolidating
+  `random_u64`, `sample_range`, `fisher_yates`, `zero_buffer`,
+  `zero_buffer_owned` — previously duplicated across fragmenters.
+- `Fragments::into_parts()` pub(crate) accessor — destructure the
+  inner `(Vec<LockedBytes>, LockedBytes, usize)` for compositional
+  strategies without copying chunk buffers.
+- `Fragments::chunk_count()` is now `pub` (was `pub(crate)`).
+- Integration test suite [`tests/fragment_strategies.rs`](../../tests/fragment_strategies.rs)
+  exercising all four strategies through the public `FragmentStrategy`
+  trait + `Send + Sync` assertions.
+
+### Changed
+
+- **`docs/SECURITY.md`** strategy-comparison section rewritten with a
+  per-strategy storage shape, layout encoding, threat focus, memory
+  overhead, and decoy compatibility table.
+- `StandardFragmenter` now imports its RNG/shuffle/zero helpers from
+  `fragment::util` instead of defining them locally.
+- Per-strategy unit tests use the shared helpers transitively (no test
+  changes).
+
+### Security
+
+- **Routing-based composition** (`LayeredFragmenter`) adds an additional
+  `log2(N)` bits of uncertainty against an attacker who has the chunks
+  and the layout buffer but does not know which sub-strategy was used.
+- **`RandomFragmenter`** explicitly defeats contiguous-format
+  recognition (DER envelopes, PEM markers, ASCII-armored data) by
+  ensuring no chunk contains a contiguous run of key bytes longer than 1.
+
+[0.5.0]: https://github.com/jamesgober/key-vault/compare/v0.4.0...v0.5.0
+
+---
+
 ## [0.4.0] - 2026-05-20
 
 ### Added
@@ -181,7 +232,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`x86_64`, `TrustZone`, `IntelTDX`, `ChaCha20`, `VirtualLock`, etc.) so the
   pedantic `doc_markdown` lint focuses on real backtick misses.
 
-[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/key-vault/compare/v0.5.0...HEAD
 [0.2.0]: https://github.com/jamesgober/key-vault/compare/v0.1.0...v0.2.0
 
 ---

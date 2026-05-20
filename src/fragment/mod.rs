@@ -19,8 +19,15 @@ use crate::Result;
 use crate::fetcher::RawKey;
 use crate::memory::LockedBytes;
 
+mod interleaved;
+mod layered;
+mod random;
 mod standard;
+pub(crate) mod util;
 
+pub use self::interleaved::InterleavedFragmenter;
+pub use self::layered::LayeredFragmenter;
+pub use self::random::RandomFragmenter;
 pub use self::standard::StandardFragmenter;
 
 /// Opaque container for the fragmented representation of a key.
@@ -92,6 +99,13 @@ impl Fragments {
     /// Crate-internal: borrow the layout buffer.
     pub(crate) fn layout(&self) -> &LockedBytes {
         &self.layout
+    }
+
+    /// Crate-internal: destructure into its components. Used by
+    /// [`LayeredFragmenter`] to wrap a sub-strategy's output in additional
+    /// layout metadata without copying the chunk buffers.
+    pub(crate) fn into_parts(self) -> (Vec<LockedBytes>, LockedBytes, usize) {
+        (self.chunks, self.layout, self.total_len)
     }
 }
 

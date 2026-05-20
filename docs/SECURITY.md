@@ -191,14 +191,53 @@ Variable chunk sizes: 1-8 bytes typical (configurable via `frag_min`, `frag_max`
 Variable chunk counts: 8-64 chunks per scatter (depends on key length)
 Per-scatter random seed: each vault initialization gets fresh randomization
 
-### Strategies
+### Strategies (shipped in 0.5.0)
 
-| Strategy | Pattern | Defends best against |
-|----------|---------|---------------------|
-| `StandardFragmenter` | Chunked shuffle + filler | Pattern recognition |
-| `InterleavedFragmenter` | Bytes interleaved with decoy at strides | Statistical analysis |
-| `RandomFragmenter` | Non-contiguous random fragments | Linear memory scans |
-| `LayeredFragmenter` | Compose multiple strategies | Sophisticated attackers |
+| Strategy                | Storage shape                              | Layout encoding                        | Defends best against    | Memory overhead |
+|-------------------------|--------------------------------------------|----------------------------------------|-------------------------|-----------------|
+| `StandardFragmenter`    | Many `LockedBytes`, each 1–8 contiguous key bytes, shuffled order | One u32 offset per chunk; `u32::MAX` sentinel for decoy chunks | Pattern recognition + linear scans | 1–2× key (with decoy) |
+| `RandomFragmenter`      | Many `LockedBytes` (default 1–4 bytes), each holding bytes drawn from **non-contiguous** key positions | Per chunk: `(size: u32, pos[0]..pos[size-1]: u32)` | Contiguous-format recognition (DER, PEM, ASCII-armor) | 5× key (4 bytes layout per real byte) |
+| `InterleavedFragmenter` | One large `LockedBytes` pool (default 4× key length), key bytes scattered at random positions, padding filled with CSPRNG bytes | `(pool_size: u32, pos[0]..pos[key_len-1]: u32)` | Byte-level statistical analysis | 4× key |
+| `LayeredFragmenter`     | Whatever the picked sub-strategy produces, with a 4-byte strategy-index header prepended to its layout | `(strategy_idx: u32, sub_strategy_layout)` | Sophisticated attackers who know one strategy but not which | Same as picked sub-strategy |
+
+#### Per-strategy threat focus
+
+- **`StandardFragmenter`** (the baseline): chunks are contiguous runs of
+  key bytes. The defense is "find a chunk, you got 1–8 bytes." When
+  combined with `SelfReferenceDecoy` (Layer 4), an attacker also can't
+  tell which chunks are real.
+
+- **`RandomFragmenter`**: each chunk's bytes are *non-contiguous in the
+  original key*. Even a successful chunk read reveals at most
+  `max_chunk` (default 4) bytes from random positions, with no
+  contiguous run. Defeats format-recognition attacks that need a
+  contiguous header.
+
+- **`InterleavedFragmenter`**: one large pool, key bytes at random
+  positions among CSPRNG-random padding. An attacker who reads the pool
+  cannot distinguish key bytes from padding without the layout map.
+  The trade-off: the pool is a single contiguous allocation, so a
+  partial-read attack against the pool yields a substring of the pool
+  (mostly padding, occasionally a key byte). Best paired with
+  `LayeredFragmenter` so the attacker doesn't even know they have a
+  pool.
+
+- **`LayeredFragmenter`**: each `fragment` call picks one sub-strategy
+  uniformly at random and delegates. The attacker has to guess which
+  sub-strategy was used to know what layout encoding to apply.
+  Composition through routing (rather than chained transformations)
+  avoids materializing the key between layers.
+
+#### Decoy compatibility
+
+- `StandardFragmenter::with_decoy` — full support; emits paired real and
+  decoy chunks recognized via the `u32::MAX` sentinel.
+- `RandomFragmenter` — no built-in decoy slot in 0.5.0. Combine with
+  `LayeredFragmenter` if you want decoy + non-contiguous scatter.
+- `InterleavedFragmenter` — no separate decoy: the pool padding itself
+  is CSPRNG noise that doubles as decoy.
+- `LayeredFragmenter` — inherits decoy behavior from whichever
+  sub-strategy was picked for a given fragmentation.
 
 ### Performance
 
