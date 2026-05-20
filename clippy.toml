@@ -1,8 +1,50 @@
-﻿# clippy configuration for key-vault
+# clippy configuration for key-vault
 avoid-breaking-exported-api = true
-msrv = "1.75"
+msrv = "1.85"
 cognitive-complexity-threshold = 30
 type-complexity-threshold = 250
 too-many-arguments-threshold = 7
 trivial-copy-size-limit = 128
 single-char-binding-names-threshold = 5
+
+# Domain terms that legitimately appear in rustdoc without backticks.
+# Adding them here suppresses the (often noisy) `clippy::doc_markdown` lint
+# for these specific identifiers, while still catching genuinely missed
+# backticks elsewhere.
+doc-valid-idents = [
+    "..",
+    # ISA / arch
+    "x86_64",
+    "aarch64",
+    "ARMv8",
+    "ARMv9",
+    # TEE / hardware
+    "TrustZone",
+    "IntelTDX",
+    "TDX",
+    "SGX",
+    "SEV",
+    "SEV-SNP",
+    "SNP",
+    "DPAPI",
+    # Crypto / standards
+    "BLAKE3",
+    "ChaCha20",
+    "ChaCha20-Poly1305",
+    "Poly1305",
+    "AES-GCM",
+    "AEAD",
+    "DER",
+    "PEM",
+    "PROT_NONE",
+    "PROT_READ",
+    "VirtualLock",
+    "VirtualUnlock",
+    "VirtualProtect",
+    # Org / product
+    "KeyVault",
+    "HashiCorp",
+    "HiveDB",
+    "CSPRNG",
+    "OSes",
+]

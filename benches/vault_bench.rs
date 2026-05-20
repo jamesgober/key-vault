@@ -1,6 +1,6 @@
-﻿//! Vault benchmarks. Will be populated in Phase 0.5.0 (Performance verification).
+//! Vault benchmarks. Will be populated in Phase 0.5.0 (Performance verification).
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn placeholder(c: &mut Criterion) {
     c.bench_function("placeholder", |b| b.iter(|| 1 + 1));

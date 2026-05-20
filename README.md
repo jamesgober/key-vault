@@ -13,7 +13,7 @@
     <a href="https://crates.io/crates/key-vault"><img alt="downloads" src="https://img.shields.io/crates/d/key-vault?color=%230099ff"></a>
     <a href="https://docs.rs/key-vault"><img src="https://docs.rs/key-vault/badge.svg" alt="Documentation"></a>
     <a href="https://github.com/jamesgober/key-vault/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamesgober/key-vault/actions/workflows/ci.yml/badge.svg"></a>
-    <a href="#license"><img src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg" alt="License"></a>
+    <a href="https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md" title="MSRV"><img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.75%2B-blue"></a>
 </p>
 
 <p align="center">
@@ -33,16 +33,8 @@
 </p>
 
 <p>
-    <strong>key-vault</strong> ships with multiple fragment strategies (standard, interleaved, random, layered composition), decoy strategies (random, self-referential, key-derived), pluggable key fetchers (TPM 2.0 hardware, OS keychains, encrypted files, environment variables), and an extensible security monitor for failure detection and anomaly alerting. Master key recovery, atomic key rotation, multi-key vaults, and TEE detection are built in. Post-quantum safe symmetric defaults (256-bit minimum) future-proof you against the next decade of cryptographic landscape changes.
+    <strong>key-vault</strong> ships with multiple <b>fragment strategies</b> (standard, interleaved, random, layered composition), <b>decoy strategies</b> (random, self-referential, key-derived), pluggable <b>key fetchers</b> (TPM 2.0 hardware, OS keychains, encrypted files, environment variables), and an <b>extensible security monitor</b> for failure detection and anomaly alerting. Master key recovery, atomic key rotation, multi-key vaults, and <b>TEE detection</b> are built in. <b>Post-quantum</b> safe symmetric defaults (256-bit minimum) future-proof you against the next decade of cryptographic landscape changes.
 </p>
-
----
-
-## Status
-
-**Active development.** Scaffolded and on the path to 1.0. See [.dev/ROADMAP.md](.dev/ROADMAP.md) for milestone tracking.
-
-The public API is not yet stable. Pin specific versions; expect changes pre-1.0.
 
 ---
 
@@ -52,15 +44,15 @@ The complete defense stack:
 
 | Layer | Defense | Defends Against |
 |-------|---------|-----------------|
-| **1** | Secure Acquisition (TPM, Keychain, etc.) | Untrusted key sources |
-| **2** | Memory Page Locking (mlock / VirtualLock) | Swap files, hibernation |
-| **3** | Fragment Strategy (variable chunks, shuffle) | Pattern recognition, memory scraping |
-| **4** | Decoy Bytes (self-referential filler) | Entropy/frequency analysis |
-| **5** | Codex Transformation (byte swap) | Memory dump analysis |
-| **6** | Constant-Time Operations | Timing side-channels |
-| **7** | Zero-On-Drop | Use-after-free leakage |
-| **8** | Security Monitor (failure detection) | Brute-force, anomalous access |
-| **9** | Audit Logging | Forensic trail, compliance |
+| **1** | **Secure Acquisition** (TPM, Keychain, etc.) | Untrusted key sources |
+| **2** | **Memory Page Locking** (mlock / VirtualLock) | Swap files, hibernation |
+| **3** | **Fragment Strategy** (variable chunks, shuffle) | Pattern recognition, memory scraping |
+| **4** | **Decoy Bytes** (self-referential filler) | Entropy/frequency analysis |
+| **5** | **Codex Transformation** (byte swap) | Memory dump analysis |
+| **6** | **Constant-Time Operations** | Timing side-channels |
+| **7** | **Zero-On-Drop** | Use-after-free leakage |
+| **8** | **Security Monitor** (failure detection) | Brute-force, anomalous access |
+| **9** | **Audit Logging** | Forensic trail, compliance |
 | **10** | (Bonus) Page Protection Toggling | Snapshot attacks |
 
 **Full details:** see [docs/SECURITY.md](docs/SECURITY.md) for the comprehensive security architecture.
@@ -139,15 +131,16 @@ The complete defense stack:
 
 ## Quick start
 
-\\\	oml
+```toml
 [dependencies]
 key-vault = "0.1"
-\\\
+```
 
-\\\ust
+
+```rust
 // Examples land as the public API stabilizes.
 // See examples/ and the rustdoc once 0.2 ships.
-\\\
+```
 
 ---
 
@@ -206,6 +199,11 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
----
 
-<sub>Copyright &copy; 2026 <strong>James Gober</strong>. All rights reserved.</sub>
+
+<!-- FOOT COPYRIGHT
+################################################# -->
+<div align="center">
+  <h2></h2>
+  <sup>COPYRIGHT <small>&copy;</small> 2026 <strong>JAMES GOBER.</strong></sup>
+</div>

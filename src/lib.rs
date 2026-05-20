@@ -9,57 +9,27 @@
 //!
 //! # The 9 Layers (plus bonus Layer 10)
 //!
-//! 1. **Secure Acquisition** (`KeyFetch` trait — TPM/HSM/Keychain/File/Env)
+//! 1. **Secure Acquisition** ([`KeyFetch`] trait — TPM/HSM/Keychain/File/Env)
 //! 2. **Memory Page Locking** (`mlock` / `VirtualLock` — prevents swap)
-//! 3. **Fragment Strategy** (variable chunks, shuffled, non-contiguous)
-//! 4. **Decoy Bytes** (self-referential filler, statistically indistinguishable)
-//! 5. **Codex Transformation** (byte swap via involution)
-//! 6. **Constant-Time Operations** (subtle::ConstantTimeEq)
-//! 7. **Zero-On-Drop** (zeroize crate)
-//! 8. **Security Monitor** (failed decrypt detection, threshold lockout)
+//! 3. **Fragment Strategy** ([`FragmentStrategy`] — variable chunks, shuffled, non-contiguous)
+//! 4. **Decoy Bytes** ([`DecoyStrategy`] — self-referential filler, statistically indistinguishable)
+//! 5. **Codex Transformation** ([`Codex`] — byte swap via involution)
+//! 6. **Constant-Time Operations** (`subtle::ConstantTimeEq`)
+//! 7. **Zero-On-Drop** (`zeroize` crate)
+//! 8. **Security Monitor** ([`SecurityMonitor`] — failed decrypt detection, threshold lockout)
 //! 9. **Audit Logging** (every key access tracked)
 //! 10. **(Bonus) Page Protection Toggling** (PROT_NONE when not in use)
 //!
 //! See `docs/SECURITY.md` for the full architecture and `docs/TRANSFORMATION.md`
 //! for a visual walkthrough.
 //!
-//! # Design philosophy
-//!
-//! `key-vault` is a focused primitive for keeping cryptographic key material safe in
-//! memory while the application is running. It is deliberately **NOT**:
-//!
-//! - A cryptographic library (use `crypt-io` for actual encryption)
-//! - A secrets manager (use HashiCorp Vault for centralized secret distribution)
-//! - A password manager (different problem domain)
-//!
-//! It **IS**:
-//!
-//! - A defense-in-depth in-memory key storage primitive
-//! - A pluggable key acquisition framework
-//! - A library for making memory-resident keys hard to extract via memory analysis
-//!
-//! # Threat model
-//!
-//! `key-vault` protects against:
-//!
-//! - **Memory scraping by code with read access** (some malware, forensic tools)
-//! - **Swap file persistence** (mlock prevents swap)
-//! - **Pattern recognition in memory dumps** (fragment + decoy + codex defeats analysis)
-//! - **Use-after-free leakage** (zeroize on drop)
-//! - **Brute-force decryption attempts** (security monitor + threshold lockout)
-//! - **Timing side-channels** (constant-time operations)
-//! - **Insider threats / compliance** (audit logging)
-//!
-//! It does NOT protect against:
-//!
-//! - **Code execution in your process** (an attacker running your code can call defrag)
-//! - **Hardware compromise** (TPM/HSM/TEE provide different guarantees)
-//! - **Side-channel attacks on the crypto layer** (separate concern, `crypt-io`'s job)
-//!
 //! # Status
 //!
-//! Early scaffolding. Public API not yet defined. See [the repository](https://github.com/jamesgober/key-vault)
-//! and `.dev/ROADMAP.md` for the milestone plan.
+//! Phase 0.2.0 — foundation types defined. [`KeyHandle`], [`KeyVault`],
+//! [`KeyVaultBuilder`], the five core traits, [`IdentityCodex`], and
+//! [`tee::detect_tee_capabilities`] are in place. Real fragmentation, mlock,
+//! decoy, and zeroize land in Phases 0.3 and 0.4. See `.dev/ROADMAP.md` for
+//! the full milestone plan.
 //!
 //! # License
 //!
@@ -81,6 +51,31 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::missing_safety_doc)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+
+extern crate alloc;
+
+pub mod codex;
+pub mod decoy;
+mod error;
+pub mod fetcher;
+pub mod fragment;
+mod handle;
+mod metadata;
+pub mod monitor;
+pub mod tee;
+mod vault;
+
+pub use crate::codex::{Codex, IdentityCodex};
+pub use crate::decoy::DecoyStrategy;
+pub use crate::error::{Error, Result};
+pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};
+pub use crate::fragment::{FragmentStrategy, Fragments};
+pub use crate::handle::{KeyHandle, KeyId};
+pub use crate::metadata::{AlgorithmHint, KeyMetadata};
+pub use crate::monitor::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};
+pub use crate::vault::{KeyVault, KeyVaultBuilder, VaultConfig};
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
