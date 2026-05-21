@@ -1,0 +1,65 @@
+[package]
+name = "key-vault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.key-vault]
+path = ".."
+features = ["fragment-all", "decoy-all", "codex", "codex-dynamic"]
+
+# `cargo fuzz run <target>` picks the binary by name. Each [[bin]] below
+# corresponds to one file under `fuzz_targets/`. Naming convention:
+# `fuzz_<area>_<aspect>` so listings sort by area.
+[[bin]]
+name = "fuzz_fragment_standard"
+path = "fuzz_targets/fuzz_fragment_standard.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_fragment_interleaved"
+path = "fuzz_targets/fuzz_fragment_interleaved.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_fragment_random"
+path = "fuzz_targets/fuzz_fragment_random.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_fragment_layered"
+path = "fuzz_targets/fuzz_fragment_layered.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_decoy_strategies"
+path = "fuzz_targets/fuzz_decoy_strategies.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_codex_involution"
+path = "fuzz_targets/fuzz_codex_involution.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_vault_end_to_end"
+path = "fuzz_targets/fuzz_vault_end_to_end.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1

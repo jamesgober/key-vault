@@ -136,6 +136,19 @@ pub trait AuditSink: Send + Sync {
     /// Receive one audit event. The sink may inspect any field but
     /// must not mutate the event (it is passed by reference).
     fn on_event(&self, event: &AuditEvent);
+
+    /// Hot-path optimization hook: a sink that returns `true` here
+    /// declares that it will discard every event without inspecting
+    /// any field. The vault uses this to skip [`AuditEvent`]
+    /// construction entirely on the hot path, avoiding one `String`
+    /// allocation per `with_key` / `fragment` / `defragment` call.
+    ///
+    /// Default: `false`. Override only when the sink is provably
+    /// inert ([`NoAudit`] is the canonical example).
+    #[inline]
+    fn is_no_op(&self) -> bool {
+        false
+    }
 }
 
 // Blanket forwarding impl so callers can pass a pre-wrapped
@@ -143,5 +156,10 @@ pub trait AuditSink: Send + Sync {
 impl AuditSink for alloc::sync::Arc<dyn AuditSink> {
     fn on_event(&self, event: &AuditEvent) {
         (**self).on_event(event);
+    }
+
+    #[inline]
+    fn is_no_op(&self) -> bool {
+        (**self).is_no_op()
     }
 }

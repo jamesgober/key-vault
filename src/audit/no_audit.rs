@@ -28,4 +28,9 @@ pub struct NoAudit;
 impl AuditSink for NoAudit {
     #[inline]
     fn on_event(&self, _event: &AuditEvent) {}
+
+    #[inline]
+    fn is_no_op(&self) -> bool {
+        true
+    }
 }

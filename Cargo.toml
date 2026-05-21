@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -128,6 +128,16 @@ windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+
+# Heap profiler used by the dhat_hot_path example to verify the
+# zero-allocation hot-path claim in docs/PERFORMANCE.md. Only pulled
+# in when the example is built (cargo treats examples as a separate
+# compile target).
+dhat = "0.3"
+
+[[example]]
+name = "dhat_hot_path"
+required-features = []
 
 [[bench]]
 name = "access_latency"

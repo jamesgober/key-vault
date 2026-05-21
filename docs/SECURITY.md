@@ -749,6 +749,55 @@ failure_window_seconds = 60
 
 ---
 
+## Verification methodology (shipped in 0.11.0)
+
+The 1.0 contract makes specific security claims. Each is backed by a
+runnable verification:
+
+| Claim | Verification | Location |
+|-------|--------------|----------|
+| Fragment round-trip is identity across arbitrary inputs | `proptest` sweeps over `StandardFragmenter`, `InterleavedFragmenter`, `RandomFragmenter`, plus the `with_chunk_range` variant | `tests/proptest_invariants.rs` |
+| Every codex implementation satisfies `decode(encode(b)) == b` for every byte | `proptest` full byte-range sweep for `IdentityCodex`, `StaticCodex`, `DynamicCodex` | `tests/proptest_invariants.rs` |
+| `SelfReferenceDecoy` only emits bytes drawn from the source key | `proptest` (cross-platform) + dedicated fuzz target | `tests/proptest_invariants.rs`, `fuzz/fuzz_targets/fuzz_decoy_strategies.rs` |
+| `KeyHandle::Debug` never reveals the internal id | `proptest` regex assertion + unit-test sweep over 1024 handles | `tests/proptest_invariants.rs`, `src/handle.rs` |
+| Concurrent readers never observe a torn read across rotation | 4-thread reader loop vs. 50 rotations, asserting byte uniformity | `tests/proptest_invariants.rs` |
+| Layer 2: `mlock` actually pins pages on Linux | `/proc/self/status` `VmLck` delta after 64 registrations | `tests/mlock_verified.rs` (cfg = `target_os = "linux"`) |
+| No panics / infinite loops / OOMs on arbitrary inputs | `cargo-fuzz` targets, one per fetcher / fragment strategy / decoy strategy / codex / vault end-to-end | `fuzz/fuzz_targets/*.rs` |
+| Hot-path allocation profile | `dhat`-based example binary measuring `with_key` × 100,000 | `examples/dhat_hot_path.rs` |
+| Constant-time `KeyHandle` equality | Built on `subtle::ConstantTimeEq` — same primitive `ring` / `aws-lc-rs` use | `src/handle.rs` (the dependency does the heavy lifting; we apply it) |
+
+### Running the verifications
+
+```bash
+# All cross-platform property tests run as part of the normal gate.
+cargo test --all-features
+
+# Linux-only mlock verification (skipped on macOS/Windows by cfg gate).
+cargo test --all-features --test mlock_verified
+
+# Hot-path allocation profile.
+cargo run --release --example dhat_hot_path
+# → produces dhat-heap.json
+
+# cargo-fuzz targets (Linux/macOS; nightly Rust).
+cd fuzz
+cargo +nightly fuzz run fuzz_fragment_standard -- -max_total_time=3600
+# Repeat per target. Roadmap requires 1 CPU-hour per target for 1.0 sign-off.
+```
+
+### What's not yet verified by automation
+
+- **Constant-time property of the full `with_key` call** (not just
+  `KeyHandle::eq`) — `dudect` is the gold standard; deferred to a
+  post-0.11 follow-up because dudect's runtime hookup is intrusive.
+- **`zeroize` actually overwrites memory after drop** — the `zeroize`
+  crate's own tests cover this for the primitive; an end-to-end test
+  reading freed memory through raw pointers requires `unsafe` outside
+  the crate's safety contract.
+- **Cold-boot resistance** — out of scope, requires hardware testing.
+
+---
+
 ## When to Disable Layers
 
 There are legitimate reasons to disable layers:

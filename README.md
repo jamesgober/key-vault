@@ -69,7 +69,7 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.10.0 |
+| Component | Status as of 0.11.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
@@ -88,6 +88,7 @@ shipped code.
 | **Layer 9 — Audit trail** (`AuditEvent` + `AuditSink` + `NoAudit` + `LogAudit`, emission on every vault op) | shipped (0.9.1) |
 | **Multi-key vaults, rotation, master-key recovery** (`register` / `with_key` / `rotate` / `unlock_with_master`) | **shipped** |
 | Criterion benchmark suite + `docs/PERFORMANCE.md` | shipped (0.10.0) |
+| Fuzz harness (`cargo-fuzz`) + `proptest` invariants + mlock verification + dhat hot-path | shipped (0.11.0) |
 
 Each phase's exit criteria, scope, and timeline are tracked in
 [.dev/ROADMAP.md](.dev/ROADMAP.md).
@@ -170,11 +171,11 @@ Measured numbers from the reference machine (see [docs/PERFORMANCE.md](docs/PERF
 | Target | Measured | Status |
 |--------|----------|--------|
 | Vault construction (empty) | ~165 ns | ✅ |
-| `with_key` defrag, no codex, 16/32/64 B | 158 / 175 / 211 ns | ✅ under 500 ns |
-| `with_key` defrag, with codex, 16/32/64 B | 190 / 228 / 310 ns | ✅ under 1 µs |
+| `with_key` defrag, no codex, 16/32/64 B (0.11) | 88 / 102 / 136 ns | ✅ under 500 ns |
+| `with_key` defrag, with codex, 16/32/64 B (0.11) | 120 / 149 / 227 ns | ✅ under 1 µs |
 | Concurrent reads, 1 → 64 threads | scales out, no contention | ✅ lock-free |
 | Memory overhead per key (Linux 1000-key RSS) | ~5 KiB | ✅ under 16 KiB |
-| Zero allocations on hot path | not yet `dhat`-verified | planned for 0.11 |
+| Allocations per `with_key` (default `NoAudit`) | ~2 (dhat-measured) | ⚠️ documented (zero-alloc deferred post-1.0) |
 
 Run `cargo bench --all-features` to reproduce on your hardware.
 
@@ -184,7 +185,7 @@ Run `cargo bench --all-features` to reproduce on your hardware.
 
 ```toml
 [dependencies]
-key-vault = "0.10"
+key-vault = "0.11"
 ```
 
 ```rust

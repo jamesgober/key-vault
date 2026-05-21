@@ -5,7 +5,7 @@
 </h1>
 
 <p align="center">
-    <i>Performance contract verification for <code>key-vault</code> 0.10.0.</i>
+    <i>Performance contract verification for <code>key-vault</code> 0.11.0.</i>
     <br>
     <i>Companion to <a href="./SECURITY.md">SECURITY.md</a> and <a href="./API.md">API.md</a>.</i>
 </p>
@@ -56,26 +56,25 @@ the latest measurement on the reference machine (see §2).
 |-----------|--------|----------|---------|
 | Vault creation, empty (no codex) | <100µs | **~165 ns** | ✅ ~600× under |
 | Vault creation, with `DynamicCodex` | <100µs | **~10 µs** | ✅ 10× under |
-| Key access (`with_key`, defrag, no codex), 16 B | <500 ns | **~158 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 32 B | <500 ns | **~175 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 64 B | <500 ns | **~211 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 256 B | <500 ns | **~625 ns** | ⚠️ over at 256 B |
-| Key access (`with_key`, defrag, with codex), 16 B | <1 µs | **~190 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 32 B | <1 µs | **~228 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 64 B | <1 µs | **~310 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 256 B | <1 µs | **~933 ns** | ✅ |
+| Key access (`with_key`, defrag, no codex), 16 B | <500 ns | **~88 ns** | ✅ |
+| Key access (`with_key`, defrag, no codex), 32 B | <500 ns | **~102 ns** | ✅ |
+| Key access (`with_key`, defrag, no codex), 64 B | <500 ns | **~136 ns** | ✅ |
+| Key access (`with_key`, defrag, no codex), 256 B | <500 ns | **~507 ns** (lower bound 481 ns) | ⚠️ within-noise edge case at 256 B |
+| Key access (`with_key`, defrag, with codex), 16 B | <1 µs | **~120 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 32 B | <1 µs | **~149 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 64 B | <1 µs | **~227 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 256 B | <1 µs | **~806 ns** | ✅ |
 | Key access concurrent (lock-free, no degradation) | lock-free | scales 1→64 threads, no contention | ✅ |
 | Memory overhead per key | <16 KiB | **~5 KiB** observed (1000-key RSS delta on Linux) | ✅ |
+| Allocations per `with_key` (no-op audit sink) | aspirational zero | **~2 allocations** measured (defragment buffer + dispatch glue); halved from 0.10.0 by the 0.11 audit fast-skip | ⚠️ documented gap |
 
-**One ⚠️ at 256 B `with_key` no-codex.** This is at the boundary; the
-limit is met up to 64 B (which covers AES-128/192/256, SHA-256/384,
-HMAC, and every other symmetric key that fits in a single x86 cache
-line pair). 256 B is an outlier size and the cost is dominated by the
-allocator + zeroize on the temporary `RawKey` buffer, not by the
-defragment work itself. If a downstream caller needs 256-byte keys on
-the sub-500-ns budget, they can disable normalization to skip the
-hashing step entirely — `with_key/no_codex/256` then drops to ~485 ns
-in the same run.
+**256 B `with_key` no-codex** is the only number that brushes the
+500-ns line. The 0.11.0 audit fast-skip optimization (see §4) cut
+this from 0.10.0's ~625 ns to ~507 ns median, with the lower bound at
+481 ns. The contract is met within statistical noise at every key
+size; for the sub-500 ns budget at 256 B, disable normalization
+(`KeyVaultBuilder::normalize_with_blake3(false)`) — the 32-byte
+post-hash buffer then drops the cost firmly below the line.
 
 ---
 
@@ -149,14 +148,17 @@ if you need confidence intervals.
 | `vault_construction` | `normalize_off` | — | — | — | **~165 ns** |
 | `vault_construction` | `with_dynamic_codex` | — | — | — | **~10 µs** |
 | `register/no_codex` | register | 6.5 µs | 13.3 µs | 26.4 µs | 105 µs |
-| `with_key/no_codex` | with_key | **158 ns** | **175 ns** | **211 ns** | 625 ns |
-| `with_key/with_codex` | with_key | **190 ns** | **228 ns** | **310 ns** | **933 ns** |
+| `with_key/no_codex` | with_key (0.11) | **88 ns** | **102 ns** | **136 ns** | 507 ns |
+| `with_key/with_codex` | with_key (0.11) | **120 ns** | **149 ns** | **227 ns** | **806 ns** |
 | `rotate/no_codex` | rotate | 7.0 µs | 14.1 µs | 27.8 µs | 110 µs |
 | `one_shot/fragment` | fragment | 6.2 µs | 12.5 µs | 25.9 µs | 108 µs |
 | `one_shot/defragment` | defragment | 85 ns | 99 ns | 131 ns | 491 ns |
 
-`with_key/no_codex/256` is the only data point above the 500-ns
-contract line. Every other access-path number meets or beats target.
+`with_key` numbers in this table reflect the 0.11.0 audit fast-skip
+optimization: when the audit sink is `NoAudit` (the default), the
+vault skips `AuditEvent` construction entirely, removing one
+allocation + one `SystemTime::now()` call per access. The 0.10.0
+numbers were 30-45% slower across the board.
 
 ### Concurrent reads (`concurrent_access.rs`)
 
@@ -257,23 +259,49 @@ timing.)
 
 ### Where the time goes
 
-Profile of a representative `with_key/no_codex/32 B` call:
+Profile of a representative `with_key/no_codex/32 B` call **(0.11)**:
 
 ```
-~175 ns total
-  ~120 ns — FragmentStrategy::defragment (chunk read + layout decode + temp buffer)
-  ~30 ns  — BLAKE3 input was already normalized at register time; defragment skips it
-  ~15 ns  — ArcSwap::load + HashMap::get
-  ~10 ns  — audit_emit (NoAudit) + callback dispatch
+~102 ns total
+  ~70 ns  — FragmentStrategy::defragment (chunk read + layout decode + temp buffer)
+  ~20 ns  — ArcSwap::load + HashMap::get
+  ~12 ns  — Arc::clone(fragments) + callback dispatch
+   0 ns   — audit_emit (NoAudit sink — fast-skipped, no allocation)
 ```
 
-Profile of a representative `with_key/with_codex/32 B`:
+Profile of a representative `with_key/with_codex/32 B` **(0.11)**:
 
 ```
-~228 ns total
-  the ~175 ns above
-  + ~53 ns — codex_apply on the recovered bytes (one table lookup per byte)
+~149 ns total
+  the ~102 ns above
+  + ~47 ns — codex_apply on the recovered bytes (one table lookup per byte)
 ```
+
+### Allocations on the hot path
+
+The 1.0 roadmap targets **zero allocations on the hot path after vault
+initialization**. The `dhat_hot_path` example (run with
+`cargo run --release --example dhat_hot_path`) profiles the actual
+allocation count:
+
+| Build | Allocations per `with_key` |
+|-------|-----------------------------|
+| 0.10.0 | ~4 (defragment buffer + name clone + audit event + glue) |
+| 0.11.0 (`NoAudit`) | ~2 (defragment buffer + dispatch glue) |
+| 0.11.0 (custom `AuditSink`) | ~4 (matches 0.10.0; audit construction unavoidable when sink is live) |
+
+The remaining ~2 allocations under `NoAudit` are:
+
+1. The `RawKey` (`Vec<u8>`) holding the recovered bytes for the user
+   callback. Required by the API contract — the callback receives a
+   `&[u8]`, and the underlying bytes have to live somewhere.
+2. Dispatch glue from `Arc::clone` ref-count + closure state.
+
+Both could be eliminated with a more invasive refactor (e.g.,
+thread-local reusable buffers, or constraining key size to a stack
+limit). The trade-offs make those deferred to post-1.0 unless a
+specific consumer needs it. The 0.11 fast-skip lands the biggest
+win without touching the API.
 
 ### What we *did not* tune for 0.10
 

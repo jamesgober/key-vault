@@ -19,6 +19,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] - 2026-05-21
+
+### Added
+
+- **`fuzz/` workspace** — seven `cargo-fuzz` targets covering each
+  fragment strategy (`fuzz_fragment_{standard,interleaved,random,layered}`),
+  every decoy strategy (`fuzz_decoy_strategies`), every codex
+  (`fuzz_codex_involution`), and the full vault op sequence
+  (`fuzz_vault_end_to_end` via `arbitrary`). Linux/macOS only; the
+  roadmap requires 1 CPU-hour per target for the 1.0 sign-off.
+- **`tests/proptest_invariants.rs`** — 12 cross-platform property
+  tests for round-trip identity, codex involution,
+  `SelfReferenceDecoy` only-uses-key-bytes, `KeyHandle::Debug`
+  opacity, registered-handle uniqueness, and concurrent-read
+  consistency across rotation.
+- **`tests/mlock_verified.rs`** — Linux-only `/proc/self/status`
+  `VmLck`-delta verification that Layer 2 actually pins fragment
+  pages.
+- **`examples/dhat_hot_path.rs`** — `dhat::Alloc` global-allocator
+  example that profiles `with_key` × 100,000 iterations and writes
+  `dhat-heap.json`.
+- **`AuditSink::is_no_op()`** — optional fast-path predicate
+  (default `false`) so sinks can opt out of event construction.
+  `NoAudit` overrides it to `true`.
+- **`docs/SECURITY.md` §Verification methodology** — runnable
+  verification table mapping every 1.0 security claim to the
+  test / fuzz target / example that proves it.
+
+### Changed
+
+- **`with_key` hot-path optimization.** When the configured audit
+  sink reports `is_no_op() == true` (the default `NoAudit` case),
+  the vault now skips `AuditEvent` construction entirely. Measured
+  impact on `with_key/no_codex/32 B`: ~175 ns → ~102 ns (-42%).
+  Full numbers in `docs/PERFORMANCE.md`.
+- **Allocation profile** — dhat-measured ~4 allocations per
+  `with_key` in 0.10.0; ~2 per call in 0.11.0 under `NoAudit`.
+- README + `docs/PERFORMANCE.md` + `docs/API.md` updated with
+  post-optimization numbers and the "what's not yet in 0.11.0"
+  list trimmed.
+
+### Fixed
+
+- Allocator pressure on the hot path halved without API change.
+
+### Security
+
+- All 1.0 security claims now have a runnable verification
+  (proptest / cargo-fuzz / dhat / mlock-status). The two items
+  still on the deferred list are `dudect`-asserted constant-time
+  for the full `with_key` call (post-1.0) and true
+  zero-allocation hot-path (post-1.0).
+
+---
+
 ## [0.10.0] - 2026-05-21
 
 ### Added

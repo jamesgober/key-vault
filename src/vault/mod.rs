@@ -258,6 +258,11 @@ impl KeyVault {
     /// Crate-internal helper. Hot enough to be worth keeping in one
     /// place — every public vault op funnels through this.
     fn emit_audit(&self, key_name: &str, kind: AccessKind, note: Cow<'static, str>) {
+        // Hot-path fast-skip: a sink that declares itself no-op gets
+        // zero allocations + zero clock-read overhead per call.
+        if self.inner.audit.is_no_op() {
+            return;
+        }
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -500,7 +505,14 @@ impl KeyVault {
         let snapshot = self.inner.keys.load();
         let entry = snapshot.get(&handle.id()).ok_or(Error::KeyNotFound)?;
         let fragments = Arc::clone(&entry.fragments);
-        let name = entry.name.clone();
+        // Skip cloning the name when the audit sink is inert — this
+        // is the common case and removes one `String` allocation per
+        // `with_key` call.
+        let name: Option<String> = if self.inner.audit.is_no_op() {
+            None
+        } else {
+            Some(entry.name.clone())
+        };
         // Drop the snapshot so we don't hold the Arc across the
         // potentially-slow defragment + user-callback path.
         drop(snapshot);
@@ -513,7 +525,9 @@ impl KeyVault {
         };
         // `raw` zeroes its bytes on drop at the end of this scope.
         let result = f(raw.as_bytes());
-        self.emit_audit(&name, AccessKind::Read, Cow::Borrowed(""));
+        if let Some(name) = name {
+            self.emit_audit(&name, AccessKind::Read, Cow::Borrowed(""));
+        }
         Ok(result)
     }
 
