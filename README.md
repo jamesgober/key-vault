@@ -36,7 +36,11 @@
     <strong>key-vault</strong> ships with multiple <b>fragment strategies</b> (standard, interleaved, random, layered composition), <b>decoy strategies</b> (random, self-referential, key-derived), pluggable <b>key fetchers</b> (TPM 2.0 hardware, OS keychains, encrypted files, environment variables), and an <b>extensible security monitor</b> for failure detection and anomaly alerting. Master key recovery, atomic key rotation, multi-key vaults, and <b>TEE detection</b> are built in. <b>Post-quantum</b> safe symmetric defaults (256-bit minimum) future-proof you against the next decade of cryptographic landscape changes.
 </p>
 
----
+
+<hr>
+<br>
+
+
 
 ## 9-Layer Defense Architecture
 
@@ -59,110 +63,7 @@ The complete defense stack:
 
 **Visual walkthrough:** see [docs/TRANSFORMATION.md](docs/TRANSFORMATION.md) for a step-by-step trace of what happens to a key as it passes through all the layers.
 
----
-
-## Current status
-
-**`key-vault` is pre-1.0; the public API is not yet stable.** The 9-layer
-architecture above is the **1.0 design target**. Each release lights up more
-of it. The "Features" section below documents the 1.0 surface; the table here
-records what is actually built today so you can match the README against the
-shipped code.
-
-| Component | Status as of 0.11.0 |
-|-----------|--------------------|
-| Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
-| Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
-| **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | shipped |
-| **Layer 3 — All four fragment strategies**: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter` | shipped |
-| **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | shipped |
-| **Layer 5 — Full codex stack**: `IdentityCodex`, `FnCodex`, `StaticCodex`, `DynamicCodex` (table in `LockedBytes`) | shipped |
-| **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | shipped |
-| **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer + codex table) | shipped |
-| BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | shipped |
-| TEE detection (`detect_tee_capabilities`) | shipped (real x86_64 + Apple SE + AWS Nitro probes) |
-| `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
-| `KeyVaultBuilder::with_chunk_range` / `with_decoy` / `with_codex` | shipped |
-| **Layer 1 — built-in fetchers** (`EnvFetch`, `FileFetch`, `KeychainFetch`, `TpmFetch` detection) | **shipped** |
-| **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | shipped |
-| **Layer 9 — Audit trail** (`AuditEvent` + `AuditSink` + `NoAudit` + `LogAudit`, emission on every vault op) | shipped (0.9.1) |
-| **Multi-key vaults, rotation, master-key recovery** (`register` / `with_key` / `rotate` / `unlock_with_master`) | **shipped** |
-| Criterion benchmark suite + `docs/PERFORMANCE.md` | shipped (0.10.0) |
-| Fuzz harness (`cargo-fuzz`) + `proptest` invariants + mlock verification + dhat hot-path | shipped (0.11.0) |
-
-Each phase's exit criteria, scope, and timeline are tracked in
-[.dev/ROADMAP.md](.dev/ROADMAP.md).
-
----
-
-## Features (the 1.0 design)
-
-### Defense-in-depth memory protection (1.0 design)
-
-- **Memory page locking** (mlock / VirtualLock) prevents key material from being swapped to disk
-- **Fragment storage** splits keys into variable-sized chunks at non-contiguous addresses
-- **Self-referential decoy bytes** statistically indistinguishable from real key material
-- **Codex transformation** (opt-in) adds byte-level obfuscation
-- **Zero-on-drop** via zeroize overwrites memory when keys leave scope
-- **Constant-time comparisons** via subtle prevent timing attacks
-- **No debug exposure** — `KeyHandle`'s `Debug` impl always prints `KeyHandle(<redacted>)` (shipped today)
-
-### Pluggable key fetchers (all four shipped in 0.7.0)
-
-- **`TpmFetch`** — detection-only in 1.0, full integration deferred to 1.x (feature `fetcher-tpm`)
-- **`KeychainFetch`** — macOS Keychain, Windows Credential Manager, Linux Secret Service via the `keyring` crate (feature `fetcher-keychain`)
-- **`FileFetch`** — file-on-disk with strict Unix permission checks (`0o600`) (feature `fetcher-file`)
-- **`EnvFetch`** — process environment variable, error messages never log the value (feature `fetcher-env`)
-- **Custom fetchers** via the `KeyFetch` trait — bring your own HSM, KMS client, or proprietary source
-
-### Fragment strategies (all four shipped in 0.5.0)
-
-- **Standard** — variable chunks + Fisher-Yates shuffle, each chunk in its own mlock'd allocation
-- **Random** — chunks of variable size whose bytes come from **non-contiguous** positions in the key (no chunk holds a contiguous key substring longer than 1)
-- **Interleaved** — single large pool, key bytes scattered at random positions, gaps filled with CSPRNG padding
-- **Layered** — routes each fragmentation to a uniformly-picked sub-strategy; strategy index encoded in the layout header so defragment dispatches correctly
-- **Custom** — implement the `FragmentStrategy` trait
-
-See [docs/SECURITY.md](docs/SECURITY.md#strategies-shipped-in-050) for the
-per-strategy threat-model comparison.
-
-### Decoy strategies (1.0 design, `DecoyStrategy` trait shipped)
-
-- **Random** — raw RNG bytes (fastest, weakest) — **shipped in 0.4.0**
-- **Self-Reference** — real key bytes used as filler (strongest, recommended default) — **shipped in 0.4.0**
-- **Key-Derived** — BLAKE3-XOF bytes seeded by key + per-call nonce — **shipped in 0.4.0**
-
-### Codex layer (Layer 5, all four shipped in 0.6.0)
-
-- **`IdentityCodex`** — no transformation (default, max performance) — shipped in 0.2.0
-- **`FnCodex`** — user-provided closure (involution-only) — shipped in 0.2.0
-- **`StaticCodex`** — declarative swap table (`from_swaps(&[(u8, u8)])`) or fresh random involution (`random_involution()`) — **shipped in 0.6.0**
-- **`DynamicCodex`** — per-vault randomized involution with no fixed points — **shipped in 0.6.0**
-
-All codex tables live in `LockedBytes` (mlock'd, zeroed on drop).
-Encoding/decoding is one memory load per byte (constant-time, branch-free).
-
-### Security monitoring (Layer 8, shipped in 0.8.0)
-
-- **Failed decryption detection** — `KeyVault::report_failure(name, note)` forwards to the monitor with structured context — **shipped**
-- **Anomalous access patterns** — `KeyVault::report_anomalous_access(name, note)` — **shipped**
-- **Threshold lockout** — sliding-window per-key counter triggers lockout (configurable via `KeyVaultBuilder::with_failure_threshold(max, window)`); `KeyVault::fragment` / `defragment` return `Error::LockedOut` when locked; operators reset via `KeyVault::clear_lockout` — **shipped**
-- **Pluggable sinks** — `NoMonitor`, `CompositeMonitor`, `LogMonitor` (via `tracing`) shipped; webhook + metrics sinks deferred to post-1.0 due to HTTP/metrics-lib dep weight
-
-### Audit trail (Layer 9, shipped in 0.9.1)
-
-- **Per-operation `AuditEvent`** — every `register` / `with_key` / `rotate` / `unregister` / `fragment` / `defragment` / `unlock_with_master` call emits an event through the configured sink
-- **`NoAudit`** — default no-op sink (events constructed + discarded)
-- **`LogAudit`** — `tracing`-backed sink (feature `monitor-tracing`), emits structured `info!` events on `key_vault::audit`
-- **Custom sinks** — implement the `AuditSink` trait. Contract: non-blocking, no panics, no back-pressure into the vault
-
-### Operational features
-
-- **Master-key emergency unlock** — `unlock_with_master(bytes)` clears a threshold-driven lockout (BLAKE3-digest stored, constant-time compare) — **shipped in 0.9.0**
-- **Key rotation** — `KeyVault::rotate(handle, new_key)` atomic swap via `ArcSwap::rcu`, safe under concurrent readers — **shipped in 0.9.0**
-- **Multiple keys per vault** — named-key registry with `register` / `with_key` / `unregister` / `handle_for_name` / `metadata` — **shipped in 0.9.0**
-- **TEE detection** — check for Intel SGX, Intel TDX, AMD SEV, AMD SEV-SNP, ARM TrustZone, Apple Secure Enclave, AWS Nitro — **shipped**
-- **Key normalization** — BLAKE3 hash input to neutralize format-based pattern leaks — **shipped in 0.3.0**
+<br>
 
 ### Performance targets (1.0 design — verified in 0.10.0)
 
@@ -171,21 +72,23 @@ Measured numbers from the reference machine (see [docs/PERFORMANCE.md](docs/PERF
 | Target | Measured | Status |
 |--------|----------|--------|
 | Vault construction (empty) | ~165 ns | ✅ |
-| `with_key` defrag, no codex, 16/32/64 B (0.11) | 88 / 102 / 136 ns | ✅ under 500 ns |
-| `with_key` defrag, with codex, 16/32/64 B (0.11) | 120 / 149 / 227 ns | ✅ under 1 µs |
+| `with_key` defrag, no codex, 16/32/64/256 B | 31 / 39 / 51 / 147 ns | ✅ all under 500 ns |
+| `with_key` defrag, with codex, 16/32/64/256 B | 48 / 72 / 126 / 439 ns | ✅ all under 1 µs |
 | Concurrent reads, 1 → 64 threads | scales out, no contention | ✅ lock-free |
 | Memory overhead per key (Linux 1000-key RSS) | ~5 KiB | ✅ under 16 KiB |
-| Allocations per `with_key` (default `NoAudit`) | ~2 (dhat-measured) | ⚠️ documented (zero-alloc deferred post-1.0) |
+| Allocations per `with_key` (default `NoAudit`) | **0** (dhat-measured over 100k iterations) | ✅ zero-alloc hot path |
 
 Run `cargo bench --all-features` to reproduce on your hardware.
 
----
+
+<br>
+
 
 ## Quick start
 
 ```toml
 [dependencies]
-key-vault = "0.11"
+key-vault = "1.0"
 ```
 
 ```rust
@@ -217,7 +120,8 @@ let caps = detect_tee_capabilities();
 println!("{caps}");
 ```
 
----
+<hr>
+
 
 ## Threat model
 

@@ -161,7 +161,7 @@ impl KeyHandle {
         self.id
     }
 
-    /// Construct a placeholder handle for use in doctests and unit tests.
+    /// Construct an unbound handle for use in doctests and unit tests.
     ///
     /// **Not part of the supported public API.** This exists only so that
     /// rustdoc examples can demonstrate opacity without first standing up a full

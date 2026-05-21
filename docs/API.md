@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 0.11.0.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 1.0.0.</i>
     <br>
     <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -1588,8 +1588,8 @@ impl KeyFetch for EnvironmentFetch {
 | Round-trip for every `FragmentStrategy` | 1000-iteration stress + per-strategy unit tests in CI. |
 | Codex involution property | 256-byte sweep verified for `StaticCodex`, `DynamicCodex`, `FnCodex`, `IdentityCodex`. |
 
-**Threat model.** See [`docs/SECURITY.md`](SECURITY.md) for the
-comprehensive per-layer architecture and threat-model coverage.
+**Threat model.** See [`docs/SECURITY.md`](SECURITY.md) for the full
+per-layer architecture and threat-model coverage.
 
 <a href="#top">↑ TOP</a>
 

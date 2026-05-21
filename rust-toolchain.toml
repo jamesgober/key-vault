@@ -1,0 +1,11 @@
+# Pin the Rust toolchain so every checkout builds against the same
+# compiler. Required by REPS §Reproducibility & Build Determinism:
+# documenting the version in a README is insufficient — it must be
+# enforced by tooling.
+#
+# `channel` is the crate's declared MSRV. CI also runs `stable` as a
+# matrix dimension; this file makes a fresh local clone reproduce the
+# MSRV build without any extra setup.
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]

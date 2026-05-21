@@ -517,14 +517,29 @@ impl KeyVault {
         // potentially-slow defragment + user-callback path.
         drop(snapshot);
 
-        let encoded = self.inner.fragmenter.defragment(&fragments)?;
-        let raw = if let Some(codex) = &self.inner.codex {
-            codex_apply(codex.as_ref(), &encoded)
-        } else {
-            encoded
-        };
-        // `raw` zeroes its bytes on drop at the end of this scope.
-        let result = f(raw.as_bytes());
+        let total = fragments.total_len();
+        let codex = self.inner.codex.clone();
+        let result = SCRATCH.with(|cell| -> Result<T> {
+            let mut buf = cell.borrow_mut();
+            // Grow lazily; the buffer is reused across calls so the
+            // typical steady state is a no-op resize.
+            if buf.len() < total {
+                buf.resize(total, 0);
+            }
+            // Defragment directly into the scratch — no `RawKey` /
+            // `Vec<u8>` allocation on the hot path.
+            self.inner
+                .fragmenter
+                .defragment_into(&fragments, &mut buf[..total])?;
+            // Codex decode in place (also alloc-free).
+            if let Some(c) = &codex {
+                codex_decode_in_place(c.as_ref(), &mut buf[..total]);
+            }
+            // Run the user callback under a guard that volatile-zeros
+            // the scratch on the way out — even if the callback panics.
+            let guard = ZeroOnExit(&mut buf[..total]);
+            Ok(f(&*guard.0))
+        })?;
         if let Some(name) = name {
             self.emit_audit(&name, AccessKind::Read, Cow::Borrowed(""));
         }
@@ -687,12 +702,66 @@ impl KeyVault {
 
 /// Apply a codex's transformation to every byte of a key.
 ///
-/// Used both for encoding (pre-fragment) and decoding (post-defragment).
-/// For involution-based codices `decode == encode`; the function name
-/// reflects that — it's a single transformation pass either way.
+/// Used by the `fragment` (write) path. For involution-based codices
+/// `decode == encode`; the function name reflects that — it's a single
+/// transformation pass either way. Allocates a fresh [`RawKey`] for the
+/// transformed output.
 fn codex_apply(codex: &dyn Codex, key: &RawKey) -> RawKey {
     let bytes: Vec<u8> = key.as_bytes().iter().map(|&b| codex.encode(b)).collect();
     RawKey::new(bytes)
+}
+
+/// In-place codex decode over a mutable byte slice.
+///
+/// Used by the [`KeyVault::with_key`] hot path: the thread-local scratch
+/// buffer holds the defragmented (codex-encoded) bytes; we run the codex
+/// over them in place rather than allocating a fresh [`RawKey`]. Zero
+/// allocations.
+fn codex_decode_in_place(codex: &dyn Codex, bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        *b = codex.decode(*b);
+    }
+}
+
+// ------------------------- Hot-path scratch -------------------------
+//
+// `KeyVault::with_key` defragments into this thread-local instead of
+// allocating a fresh `RawKey` per call. The buffer grows lazily to the
+// largest key the thread has accessed; subsequent calls reuse the
+// allocation. A `ScratchGuard` zero-on-scope-exit (panic-safe).
+
+thread_local! {
+    static SCRATCH: core::cell::RefCell<Vec<u8>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Guard that volatile-zeros the borrowed scratch slice when it drops.
+/// Used at the bottom of `KeyVault::with_key` so the recovered key
+/// material is scrubbed even if the user callback panics.
+struct ZeroOnExit<'a>(&'a mut [u8]);
+
+impl Drop for ZeroOnExit<'_> {
+    fn drop(&mut self) {
+        volatile_zero_slice(self.0);
+    }
+}
+
+/// Volatile-zero a byte slice. Used to scrub the scratch buffer when
+/// the user callback returns, even if it panics.
+fn volatile_zero_slice(s: &mut [u8]) {
+    let len = s.len();
+    if len == 0 {
+        return;
+    }
+    let ptr = s.as_mut_ptr();
+    for i in 0..len {
+        // SAFETY: ptr is the unique writable borrow we hold for the
+        // duration of this function call; ptr.add(i) for i in 0..len
+        // is in-bounds.
+        unsafe {
+            core::ptr::write_volatile(ptr.add(i), 0u8);
+        }
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 impl core::fmt::Debug for KeyVault {

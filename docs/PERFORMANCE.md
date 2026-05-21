@@ -5,7 +5,7 @@
 </h1>
 
 <p align="center">
-    <i>Performance contract verification for <code>key-vault</code> 0.11.0.</i>
+    <i>Performance contract verification for <code>key-vault</code> 1.0.0.</i>
     <br>
     <i>Companion to <a href="./SECURITY.md">SECURITY.md</a> and <a href="./API.md">API.md</a>.</i>
 </p>
@@ -56,25 +56,25 @@ the latest measurement on the reference machine (see §2).
 |-----------|--------|----------|---------|
 | Vault creation, empty (no codex) | <100µs | **~165 ns** | ✅ ~600× under |
 | Vault creation, with `DynamicCodex` | <100µs | **~10 µs** | ✅ 10× under |
-| Key access (`with_key`, defrag, no codex), 16 B | <500 ns | **~88 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 32 B | <500 ns | **~102 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 64 B | <500 ns | **~136 ns** | ✅ |
-| Key access (`with_key`, defrag, no codex), 256 B | <500 ns | **~507 ns** (lower bound 481 ns) | ⚠️ within-noise edge case at 256 B |
-| Key access (`with_key`, defrag, with codex), 16 B | <1 µs | **~120 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 32 B | <1 µs | **~149 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 64 B | <1 µs | **~227 ns** | ✅ |
-| Key access (`with_key`, defrag, with codex), 256 B | <1 µs | **~806 ns** | ✅ |
+| Key access (`with_key`, defrag, no codex), 16 B | <500 ns | **~31 ns** | ✅ ~16× under |
+| Key access (`with_key`, defrag, no codex), 32 B | <500 ns | **~39 ns** | ✅ ~13× under |
+| Key access (`with_key`, defrag, no codex), 64 B | <500 ns | **~51 ns** | ✅ ~10× under |
+| Key access (`with_key`, defrag, no codex), 256 B | <500 ns | **~147 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 16 B | <1 µs | **~48 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 32 B | <1 µs | **~72 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 64 B | <1 µs | **~126 ns** | ✅ |
+| Key access (`with_key`, defrag, with codex), 256 B | <1 µs | **~439 ns** | ✅ |
 | Key access concurrent (lock-free, no degradation) | lock-free | scales 1→64 threads, no contention | ✅ |
 | Memory overhead per key | <16 KiB | **~5 KiB** observed (1000-key RSS delta on Linux) | ✅ |
-| Allocations per `with_key` (no-op audit sink) | aspirational zero | **~2 allocations** measured (defragment buffer + dispatch glue); halved from 0.10.0 by the 0.11 audit fast-skip | ⚠️ documented gap |
+| Allocations per `with_key` (no-op audit sink) | zero | **0** measured by dhat over 100,000 iterations | ✅ |
 
-**256 B `with_key` no-codex** is the only number that brushes the
-500-ns line. The 0.11.0 audit fast-skip optimization (see §4) cut
-this from 0.10.0's ~625 ns to ~507 ns median, with the lower bound at
-481 ns. The contract is met within statistical noise at every key
-size; for the sub-500 ns budget at 256 B, disable normalization
-(`KeyVaultBuilder::normalize_with_blake3(false)`) — the 32-byte
-post-hash buffer then drops the cost firmly below the line.
+Every Performance Contract target is met or exceeded at 1.0. The
+`with_key` numbers reflect the 1.0 hot-path rewrite: a new
+`FragmentStrategy::defragment_into(&mut [u8])` trait method writes
+recovered bytes directly into a thread-local scratch buffer, the
+codex layer applies in place, and the audit sink is fast-skipped
+when `NoAudit` is configured. End result: zero heap allocations per
+call and 30 ns access latency for AES-128 / AES-256 sized keys.
 
 ---
 
@@ -148,17 +148,17 @@ if you need confidence intervals.
 | `vault_construction` | `normalize_off` | — | — | — | **~165 ns** |
 | `vault_construction` | `with_dynamic_codex` | — | — | — | **~10 µs** |
 | `register/no_codex` | register | 6.5 µs | 13.3 µs | 26.4 µs | 105 µs |
-| `with_key/no_codex` | with_key (0.11) | **88 ns** | **102 ns** | **136 ns** | 507 ns |
-| `with_key/with_codex` | with_key (0.11) | **120 ns** | **149 ns** | **227 ns** | **806 ns** |
+| `with_key/no_codex` | with_key (1.0) | **31 ns** | **39 ns** | **51 ns** | **147 ns** |
+| `with_key/with_codex` | with_key (1.0) | **48 ns** | **72 ns** | **126 ns** | **439 ns** |
 | `rotate/no_codex` | rotate | 7.0 µs | 14.1 µs | 27.8 µs | 110 µs |
 | `one_shot/fragment` | fragment | 6.2 µs | 12.5 µs | 25.9 µs | 108 µs |
 | `one_shot/defragment` | defragment | 85 ns | 99 ns | 131 ns | 491 ns |
 
-`with_key` numbers in this table reflect the 0.11.0 audit fast-skip
-optimization: when the audit sink is `NoAudit` (the default), the
-vault skips `AuditEvent` construction entirely, removing one
-allocation + one `SystemTime::now()` call per access. The 0.10.0
-numbers were 30-45% slower across the board.
+The 1.0 `with_key` numbers reflect the zero-allocation hot-path
+rewrite. Cumulative reduction across 0.10 → 1.0 on
+`with_key/no_codex/32 B`: **175 ns → 39 ns (-78%)**. All four
+key-size buckets in both no-codex and with-codex columns sit well
+inside the contract targets.
 
 ### Concurrent reads (`concurrent_access.rs`)
 
@@ -259,49 +259,60 @@ timing.)
 
 ### Where the time goes
 
-Profile of a representative `with_key/no_codex/32 B` call **(0.11)**:
+Profile of a representative `with_key/no_codex/32 B` call **(1.0)**:
 
 ```
-~102 ns total
-  ~70 ns  — FragmentStrategy::defragment (chunk read + layout decode + temp buffer)
-  ~20 ns  — ArcSwap::load + HashMap::get
-  ~12 ns  — Arc::clone(fragments) + callback dispatch
-   0 ns   — audit_emit (NoAudit sink — fast-skipped, no allocation)
+~39 ns total
+  ~22 ns — FragmentStrategy::defragment_into (single-pass write to scratch)
+  ~10 ns — ArcSwap::load + HashMap::get
+   ~7 ns — Arc::clone(fragments) + callback dispatch
+    0 ns — heap allocations (thread-local scratch reused)
+    0 ns — audit_emit (NoAudit sink — fast-skipped)
 ```
 
-Profile of a representative `with_key/with_codex/32 B` **(0.11)**:
+Profile of a representative `with_key/with_codex/32 B` **(1.0)**:
 
 ```
-~149 ns total
-  the ~102 ns above
-  + ~47 ns — codex_apply on the recovered bytes (one table lookup per byte)
+~72 ns total
+  the ~39 ns above
+  + ~33 ns — codex_decode_in_place over 32 bytes (one table lookup per byte)
+    0 ns   — heap allocations (codex applies to the same scratch buffer)
 ```
 
-### Allocations on the hot path
+### Allocations on the hot path — zero at 1.0
 
-The 1.0 roadmap targets **zero allocations on the hot path after vault
-initialization**. The `dhat_hot_path` example (run with
-`cargo run --release --example dhat_hot_path`) profiles the actual
-allocation count:
+The 1.0 contract requires **zero allocations on the hot path after
+vault initialization**. The `dhat_hot_path` example
+(`cargo run --release --example dhat_hot_path`) reports the actual
+count over 100,000 iterations:
 
 | Build | Allocations per `with_key` |
 |-------|-----------------------------|
 | 0.10.0 | ~4 (defragment buffer + name clone + audit event + glue) |
 | 0.11.0 (`NoAudit`) | ~2 (defragment buffer + dispatch glue) |
-| 0.11.0 (custom `AuditSink`) | ~4 (matches 0.10.0; audit construction unavoidable when sink is live) |
+| **1.0 (`NoAudit`)** | **0** |
+| 1.0 (custom `AuditSink`) | 1 per call (the `AuditEvent`'s `String` key_name) |
 
-The remaining ~2 allocations under `NoAudit` are:
+The 1.0 hot-path rewrite eliminates both remaining allocations by:
 
-1. The `RawKey` (`Vec<u8>`) holding the recovered bytes for the user
-   callback. Required by the API contract — the callback receives a
-   `&[u8]`, and the underlying bytes have to live somewhere.
-2. Dispatch glue from `Arc::clone` ref-count + closure state.
+1. Adding `FragmentStrategy::defragment_into(&mut [u8])` — the
+   strategy writes the recovered bytes directly into a caller-supplied
+   slice instead of returning a fresh `RawKey`. The in-tree strategies
+   (`StandardFragmenter`, `InterleavedFragmenter`, `RandomFragmenter`)
+   all override the default implementation for true zero-alloc.
+2. A thread-local `Vec<u8>` scratch buffer in `KeyVault::with_key`.
+   The buffer grows lazily to the largest key seen on the thread;
+   subsequent calls reuse the allocation. A panic-safe `Drop` guard
+   volatile-zeros the used bytes when the user callback returns.
+3. In-place codex decode (`codex_decode_in_place`) over the scratch
+   slice — no fresh `RawKey` allocation when a codex is configured.
 
-Both could be eliminated with a more invasive refactor (e.g.,
-thread-local reusable buffers, or constraining key size to a stack
-limit). The trade-offs make those deferred to post-1.0 unless a
-specific consumer needs it. The 0.11 fast-skip lands the biggest
-win without touching the API.
+A custom `AuditSink` that actually wants events still pays one
+allocation per call (the `AuditEvent.key_name` `String`). That's
+unavoidable as long as sinks consume owned event records; an
+`AuditEventBorrowed<'a>` variant could be added in a future minor
+release if the trade-off becomes load-bearing for a downstream
+consumer.
 
 ### What we *did not* tune for 0.10
 

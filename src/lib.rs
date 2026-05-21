@@ -38,6 +38,12 @@
 #![doc(html_root_url = "https://docs.rs/key-vault")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
+// REPS §Code Quality canonical lint set. `#![deny(warnings)]` is
+// intentionally NOT used at the crate root — new rustc versions can
+// introduce lints that retroactively break downstream builds of a
+// published crate. CI carries `RUSTFLAGS="-D warnings"` instead so the
+// gate is enforced where the lint surface is pinned to the toolchain
+// matrix.
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -46,6 +52,7 @@
 #![deny(clippy::expect_used)]
 #![deny(clippy::todo)]
 #![deny(clippy::unimplemented)]
+#![deny(clippy::unreachable)]
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]

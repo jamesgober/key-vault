@@ -1,0 +1,68 @@
+# cargo-deny configuration for key-vault.
+#
+# REPS §Dependency Management requires `cargo deny check` in CI for
+# license, advisory, and source-policy enforcement. This file
+# configures the four checks `cargo deny` exposes.
+#
+# Run locally:
+#     cargo install --locked cargo-deny
+#     cargo deny check
+
+[graph]
+# Restrict the policy graph to the targets we actually publish for.
+# CI runs against this exact matrix.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+]
+
+# -------- advisories --------
+# RustSec advisory database. Any unfixed vulnerability fails CI.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+# -------- licenses --------
+# Only OSI-approved permissive licenses on the dependency graph.
+# Update this list intentionally if a new dep arrives with a new
+# license — silent additions are PROHIBITED by REPS.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+# -------- bans --------
+# Block known-problematic crates and flag duplicate versions in the
+# tree so we notice when something pulls in two copies of (say) syn.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+# -------- sources --------
+# Only the official registry. No git dependencies, no path
+# dependencies on the public graph.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

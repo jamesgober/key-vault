@@ -2,7 +2,7 @@
 
 > **9-Layer Defense-in-Depth + 1 Bonus Layer**
 >
-> This document is the comprehensive security architecture for `key-vault`. Every layer is documented with what it defends against, what it does NOT defend against, performance impact, and how it composes with other layers.
+> This document is the full security architecture for `key-vault`. Every layer is documented with what it defends against, what it does NOT defend against, performance impact, and how it composes with other layers.
 
 ---
 

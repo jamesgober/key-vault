@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::Result;
+use crate::error::Error;
 use crate::fetcher::RawKey;
 use crate::memory::LockedBytes;
 
@@ -144,7 +145,7 @@ pub trait FragmentStrategy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Fragment`](crate::Error::Fragment) on configuration
+    /// Returns [`Error::Fragment`] on configuration
     /// inconsistency (for example a strategy that requires a minimum key
     /// length and was handed a shorter input).
     fn fragment(&self, key: &RawKey) -> Result<Fragments>;
@@ -153,11 +154,43 @@ pub trait FragmentStrategy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Defragment`](crate::Error::Defragment) if the layout
+    /// Returns [`Error::Defragment`] if the layout
     /// disagrees with what this strategy produced. The vault will not
     /// attempt to retry — a defragmentation failure indicates corruption or
     /// a mismatched strategy.
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey>;
+
+    /// Reassemble fragments directly into a caller-supplied buffer.
+    ///
+    /// This is the hot-path entry point used by
+    /// [`KeyVault::with_key`](crate::KeyVault::with_key): callers
+    /// supply a scratch buffer (typically a thread-local), the strategy
+    /// writes the recovered bytes in place, and no [`RawKey`] /
+    /// `Vec<u8>` allocation occurs.
+    ///
+    /// `out.len()` must equal `fragments.total_len()`. Implementations
+    /// must return [`Error::Defragment`] if the
+    /// supplied slice is the wrong size.
+    ///
+    /// The default implementation falls back to
+    /// [`defragment`](Self::defragment) and copies — overriding this method
+    /// is the cheap way to opt into the zero-allocation hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Defragment`] when
+    /// `out.len() != fragments.total_len()` or the underlying defragment
+    /// fails.
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
+        if out.len() != fragments.total_len() {
+            return Err(Error::Defragment(alloc::string::ToString::to_string(
+                "scratch buffer size does not match fragments.total_len()",
+            )));
+        }
+        let raw = self.defragment(fragments)?;
+        out.copy_from_slice(raw.as_bytes());
+        Ok(())
+    }
 
     /// Short identifier for audit and error attribution.
     fn describe(&self) -> Cow<'_, str>;

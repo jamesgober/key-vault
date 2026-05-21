@@ -19,6 +19,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.0] - 2026-05-21
+
+### Added
+
+- **`FragmentStrategy::defragment_into(&mut [u8])`** — new trait
+  method that writes recovered bytes directly into a caller-supplied
+  scratch buffer. Backward-compatible default implementation
+  forwards to `defragment()` + copy; the three in-tree strategies
+  (`StandardFragmenter`, `InterleavedFragmenter`, `RandomFragmenter`)
+  override it for the zero-allocation hot path. Existing out-of-tree
+  `FragmentStrategy` implementations compile unchanged.
+- **`docs/STABILITY-1.0.md`** — the 1.0 stability contract: every
+  frozen item, every behavioural contract, the MSRV policy, the
+  migration plan for `1.x` and `2.x`.
+- **`docs/ARCHITECTURE.md`** — internal module layout, data flows for
+  the three hot paths (`register`, `with_key`, `rotate`), strategy
+  trait extension points, dependency rationale.
+- **`docs/PLATFORM-NOTES.md`** — Linux / macOS / Windows specifics,
+  per-platform mlock behaviour, fetcher availability matrix, TEE
+  detection per architecture, CI matrix, cross-compilation notes.
+- **`docs/HARDWARE.md`** — TPM / HSM / TEE integration status at 1.0
+  (detection only) and the post-1.0 hardware roadmap.
+- **`rust-toolchain.toml`** — pins the toolchain channel to `1.85.0`
+  at the crate root so fresh clones build against the MSRV without
+  manual setup. REPS §Reproducibility requires this.
+- **`deny.toml`** — `cargo deny` policy: permissive licenses only,
+  official crates.io registry only, no git deps, advisories deny on
+  detected.
+- **CI supply-chain job** — `cargo audit` (RustSec advisory database)
+  + `cargo deny check` on every push. REPS §Dependency Management
+  requires both.
+
+### Changed
+
+- **Zero-allocation hot path.** `KeyVault::with_key` now performs
+  zero heap allocations under the default `NoAudit` sink (dhat-
+  measured over 100,000 iterations). Implementation: thread-local
+  scratch buffer + the new `defragment_into` trait method + in-place
+  codex decode + panic-safe volatile-zero guard. Wall-clock impact
+  on `with_key/no_codex/32 B`: 102 ns (0.11) → 39 ns (1.0); -78%
+  cumulative from 0.10.0.
+- **`StandardFragmenter::defragment_into`** uses a single-pass write
+  to chunk offsets — no intermediate `Vec<(offset, chunk)>` for
+  sorting. The semantics are unchanged; only the algorithm allocates
+  less.
+- **Lint set** in `src/lib.rs` extended with
+  `#![deny(clippy::unreachable)]` to match the REPS canonical block.
+  Documented why `#![deny(warnings)]` is enforced at CI (via
+  `RUSTFLAGS`) rather than at the crate root.
+- **REPS-forbidden doc terms** replaced: "comprehensive" in
+  `docs/SECURITY.md` and `docs/API.md`, "placeholder" in
+  `src/handle.rs`.
+
+### Security
+
+- No security-surface changes — this is the stable 1.0 cut. All 9
+  defense layers and the 1.0 verification matrix carry forward from
+  0.11.0 unchanged.
+
+### Stability
+
+- **The 1.0 API contract** in `docs/STABILITY-1.0.md` takes effect at
+  this tag. Breaking any item listed there requires a `2.0` release
+  with a documented migration guide.
+
+---
+
 ## [0.11.0] - 2026-05-21
 
 ### Added

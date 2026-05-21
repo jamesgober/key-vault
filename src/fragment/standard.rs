@@ -259,18 +259,32 @@ impl FragmentStrategy for StandardFragmenter {
     }
 
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
+        let mut out = alloc::vec![0u8; fragments.total_len()];
+        self.defragment_into(fragments, &mut out)?;
+        Ok(RawKey::new(out))
+    }
+
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
         let n_chunks = fragments.chunk_count();
         let layout = fragments.layout().as_bytes();
+        let total_len = fragments.total_len();
         if layout.len() != n_chunks * 4 {
             return Err(Error::Defragment(alloc::string::ToString::to_string(
                 "layout buffer length does not match chunk count",
             )));
         }
+        if out.len() != total_len {
+            return Err(Error::Defragment(alloc::string::ToString::to_string(
+                "scratch buffer size does not match fragments.total_len()",
+            )));
+        }
 
-        // Read each layout entry. Real chunks (offset < DECOY_OFFSET) are
-        // collected; decoy chunks (offset == DECOY_OFFSET) are dropped on
-        // the floor — they contributed only to attacker confusion.
-        let mut paired: Vec<(u32, &LockedBytes)> = Vec::with_capacity(n_chunks);
+        // Single-pass: write each real chunk directly into `out` at the
+        // offset recorded in the layout buffer. Decoy chunks
+        // (`offset == DECOY_OFFSET`) are skipped. No intermediate
+        // (offset, chunk) Vec is allocated — this is the change that
+        // removes one heap allocation per `with_key` call.
+        let mut written = 0usize;
         for (i, chunk) in fragments.chunks().iter().enumerate() {
             let raw: [u8; 4] = layout[i * 4..i * 4 + 4].try_into().map_err(|_| {
                 Error::Defragment(alloc::string::ToString::to_string(
@@ -281,27 +295,29 @@ impl FragmentStrategy for StandardFragmenter {
             if offset == DECOY_OFFSET {
                 continue;
             }
-            paired.push((offset, chunk));
+            let chunk_bytes = chunk.as_bytes();
+            let start = offset as usize;
+            let end = start.checked_add(chunk_bytes.len()).ok_or_else(|| {
+                Error::Defragment(alloc::string::ToString::to_string(
+                    "chunk offset overflowed when added to chunk length",
+                ))
+            })?;
+            if end > total_len {
+                return Err(Error::Defragment(alloc::string::ToString::to_string(
+                    "chunk would write past end of output buffer",
+                )));
+            }
+            out[start..end].copy_from_slice(chunk_bytes);
+            written = written.saturating_add(chunk_bytes.len());
         }
-        paired.sort_by_key(|&(offset, _)| offset);
 
-        // Concatenate into an exact-capacity output buffer. The caller's
-        // RawKey takes ownership; in Phase 0.3 the bytes still live in a
-        // plain Vec on this temporary contiguous buffer. Future phases
-        // route the output through a Zeroizing wrapper at the public-API
-        // boundary.
-        let mut out: Vec<u8> = Vec::with_capacity(fragments.total_len());
-        for (_, chunk) in paired {
-            out.extend_from_slice(chunk.as_bytes());
-        }
-
-        if out.len() != fragments.total_len() {
+        if written != total_len {
             return Err(Error::Defragment(alloc::string::ToString::to_string(
                 "reassembled length does not match recorded total",
             )));
         }
 
-        Ok(RawKey::new(out))
+        Ok(())
     }
 
     fn describe(&self) -> Cow<'_, str> {

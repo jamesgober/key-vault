@@ -34,3 +34,25 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # Supply-chain checks. REPS §Dependency Management requires both
+  # `cargo audit` (RustSec advisory database) and `cargo deny check`
+  # (license / source / version policy) in CI.
+  supply-chain:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

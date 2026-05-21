@@ -166,11 +166,21 @@ impl FragmentStrategy for RandomFragmenter {
     }
 
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
+        let mut out = alloc::vec![0u8; fragments.total_len()];
+        self.defragment_into(fragments, &mut out)?;
+        Ok(RawKey::new(out))
+    }
+
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
         let layout = fragments.layout().as_bytes();
         let chunks = fragments.chunks();
         let total_len = fragments.total_len();
 
-        let mut out: Vec<u8> = alloc::vec![0u8; total_len];
+        if out.len() != total_len {
+            return Err(Error::Defragment(alloc::string::ToString::to_string(
+                "scratch buffer size does not match fragments.total_len()",
+            )));
+        }
         let mut layout_cursor = 0usize;
         for chunk in chunks {
             // Read size prefix.
@@ -222,7 +232,7 @@ impl FragmentStrategy for RandomFragmenter {
             )));
         }
 
-        Ok(RawKey::new(out))
+        Ok(())
     }
 
     fn describe(&self) -> Cow<'_, str> {

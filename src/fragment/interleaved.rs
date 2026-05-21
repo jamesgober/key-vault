@@ -142,6 +142,12 @@ impl FragmentStrategy for InterleavedFragmenter {
     }
 
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
+        let mut out = alloc::vec![0u8; fragments.total_len()];
+        self.defragment_into(fragments, &mut out)?;
+        Ok(RawKey::new(out))
+    }
+
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
         let chunks = fragments.chunks();
         if chunks.len() != 1 {
             return Err(Error::Defragment(alloc::string::ToString::to_string(
@@ -152,6 +158,11 @@ impl FragmentStrategy for InterleavedFragmenter {
         let layout = fragments.layout().as_bytes();
         let key_len = fragments.total_len();
 
+        if out.len() != key_len {
+            return Err(Error::Defragment(alloc::string::ToString::to_string(
+                "scratch buffer size does not match fragments.total_len()",
+            )));
+        }
         if layout.len() != 4 + key_len * 4 {
             return Err(Error::Defragment(alloc::string::ToString::to_string(
                 "interleaved layout size does not match key length",
@@ -168,8 +179,7 @@ impl FragmentStrategy for InterleavedFragmenter {
         }
 
         let pool_bytes = pool.as_bytes();
-        let mut out: Vec<u8> = Vec::with_capacity(key_len);
-        for i in 0..key_len {
+        for (i, slot) in out.iter_mut().enumerate().take(key_len) {
             let raw: [u8; 4] = layout[4 + i * 4..4 + (i + 1) * 4].try_into().map_err(|_| {
                 Error::Defragment(alloc::string::ToString::to_string("layout slice"))
             })?;
@@ -179,10 +189,10 @@ impl FragmentStrategy for InterleavedFragmenter {
                     "interleaved layout position out of range",
                 )));
             }
-            out.push(pool_bytes[pos]);
+            *slot = pool_bytes[pos];
         }
 
-        Ok(RawKey::new(out))
+        Ok(())
     }
 
     fn describe(&self) -> Cow<'_, str> {
