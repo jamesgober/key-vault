@@ -30,6 +30,7 @@ use arc_swap::ArcSwap;
 use subtle::ConstantTimeEq;
 
 use crate::Result;
+use crate::audit::{AccessKind, AuditEvent, AuditSink};
 use crate::codex::Codex;
 use crate::decoy::DecoyStrategy;
 use crate::error::Error;
@@ -156,6 +157,12 @@ struct VaultInner {
     /// `RawKey::Drop`) immediately after registration. Used by
     /// [`KeyVault::unlock_with_master`] as an emergency unlock.
     master_hash: Option<[u8; 32]>,
+    /// Layer-9 audit sink. Defaults to a no-op
+    /// [`NoAudit`](crate::NoAudit) when no sink is configured. Every
+    /// vault operation (register / unregister / read / rotate /
+    /// fragment / defragment / master-unlock) emits an
+    /// [`AuditEvent`](crate::AuditEvent) through this sink.
+    audit: Arc<dyn AuditSink>,
 }
 
 impl KeyVault {
@@ -245,6 +252,25 @@ impl KeyVault {
         self.inner.monitor.on_anomalous_access(&ctx);
     }
 
+    /// Build an [`AuditEvent`] with `now` timestamp and the calling
+    /// thread's id, and forward it to the configured audit sink.
+    ///
+    /// Crate-internal helper. Hot enough to be worth keeping in one
+    /// place — every public vault op funnels through this.
+    fn emit_audit(&self, key_name: &str, kind: AccessKind, note: Cow<'static, str>) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let event = AuditEvent {
+            timestamp,
+            key_name: key_name.to_string(),
+            kind,
+            thread_id: std::thread::current().id(),
+            note,
+        };
+        self.inner.audit.on_event(&event);
+    }
+
     /// Append a failure timestamp for `key_name` and evict entries older
     /// than the configured window. Returns the resulting count and the
     /// oldest timestamp still in the window (if any).
@@ -311,7 +337,11 @@ impl KeyVault {
         } else {
             working
         };
-        self.inner.fragmenter.fragment(&encoded)
+        let result = self.inner.fragmenter.fragment(&encoded);
+        if result.is_ok() {
+            self.emit_audit("", AccessKind::OneShotFragment, Cow::Borrowed(""));
+        }
+        result
     }
 
     /// Reassemble fragments produced by [`KeyVault::fragment`].
@@ -330,11 +360,13 @@ impl KeyVault {
             return Err(Error::LockedOut);
         }
         let encoded = self.inner.fragmenter.defragment(fragments)?;
-        if let Some(codex) = &self.inner.codex {
-            Ok(codex_apply(codex.as_ref(), &encoded))
+        let decoded = if let Some(codex) = &self.inner.codex {
+            codex_apply(codex.as_ref(), &encoded)
         } else {
-            Ok(encoded)
-        }
+            encoded
+        };
+        self.emit_audit("", AccessKind::OneShotDefragment, Cow::Borrowed(""));
+        Ok(decoded)
     }
 
     // ----- Named-key registry (Phase 0.9) -----
@@ -402,6 +434,7 @@ impl KeyVault {
             );
             new_map
         });
+        self.emit_audit(&entry.name, AccessKind::Register, Cow::Borrowed(""));
         Ok(handle)
     }
 
@@ -414,6 +447,13 @@ impl KeyVault {
     /// Returns [`Error::KeyNotFound`](crate::Error::KeyNotFound) if no
     /// key is registered under the given handle.
     pub fn unregister(&self, handle: KeyHandle) -> Result<()> {
+        // Capture the name (for the audit event) before mutating the map.
+        let name = self
+            .inner
+            .keys
+            .load()
+            .get(&handle.id())
+            .map(|e| e.name.clone());
         let mut removed = false;
         let _previous = self.inner.keys.rcu(|current| {
             let mut new_map = (**current).clone();
@@ -421,6 +461,9 @@ impl KeyVault {
             new_map
         });
         if removed {
+            if let Some(name) = name {
+                self.emit_audit(&name, AccessKind::Unregister, Cow::Borrowed(""));
+            }
             Ok(())
         } else {
             Err(Error::KeyNotFound)
@@ -457,6 +500,7 @@ impl KeyVault {
         let snapshot = self.inner.keys.load();
         let entry = snapshot.get(&handle.id()).ok_or(Error::KeyNotFound)?;
         let fragments = Arc::clone(&entry.fragments);
+        let name = entry.name.clone();
         // Drop the snapshot so we don't hold the Arc across the
         // potentially-slow defragment + user-callback path.
         drop(snapshot);
@@ -469,6 +513,7 @@ impl KeyVault {
         };
         // `raw` zeroes its bytes on drop at the end of this scope.
         let result = f(raw.as_bytes());
+        self.emit_audit(&name, AccessKind::Read, Cow::Borrowed(""));
         Ok(result)
     }
 
@@ -496,14 +541,16 @@ impl KeyVault {
             return Err(Error::LockedOut);
         }
 
-        // Verify the key exists first so we don't pay the fragmentation
-        // cost on a missing handle.
-        {
+        // Verify the key exists first (and capture its name for the
+        // audit event) so we don't pay the fragmentation cost on a
+        // missing handle.
+        let name = {
             let snapshot = self.inner.keys.load();
-            if !snapshot.contains_key(&handle.id()) {
-                return Err(Error::KeyNotFound);
-            }
-        }
+            snapshot
+                .get(&handle.id())
+                .map(|e| e.name.clone())
+                .ok_or(Error::KeyNotFound)?
+        };
 
         let new_len = new_key.len();
         let new_fragments = Arc::new(self.fragment(&new_key)?);
@@ -523,6 +570,7 @@ impl KeyVault {
             new_map
         });
         if found {
+            self.emit_audit(&name, AccessKind::Rotate, Cow::Borrowed(""));
             Ok(())
         } else {
             // Race: handle was unregistered between the check and the
@@ -596,7 +644,13 @@ impl KeyVault {
             )
         })?;
         let attempt_hash = blake3::hash(attempt);
-        if bool::from(stored.as_slice().ct_eq(attempt_hash.as_bytes())) {
+        let matched = bool::from(stored.as_slice().ct_eq(attempt_hash.as_bytes()));
+        self.emit_audit(
+            "<master>",
+            AccessKind::MasterUnlockAttempt { matched },
+            Cow::Borrowed(""),
+        );
+        if matched {
             self.clear_lockout();
             Ok(())
         } else {
@@ -647,6 +701,9 @@ pub struct KeyVaultBuilder {
     fragmenter: StandardFragmenter,
     codex: Option<Arc<dyn Codex>>,
     monitor: Option<Arc<dyn SecurityMonitor>>,
+    /// Optional Layer-9 audit sink. Defaults to
+    /// [`NoAudit`](crate::NoAudit) at `build` time.
+    audit: Option<Arc<dyn AuditSink>>,
     /// Hash of the master credential, if one was registered. We hold
     /// the hash (not the plaintext) so the master bytes don't linger
     /// in the builder's state.
@@ -666,6 +723,7 @@ impl core::fmt::Debug for KeyVaultBuilder {
             .field("fragmenter", &self.fragmenter)
             .field("codex", &self.codex.as_ref().map(|_| "<set>"))
             .field("monitor", &self.monitor.as_ref().map(|_| "<set>"))
+            .field("audit", &self.audit.as_ref().map(|_| "<set>"))
             .field("master_key", &self.master_hash.as_ref().map(|_| "<set>"))
             .finish()
     }
@@ -681,6 +739,7 @@ impl KeyVaultBuilder {
             fragmenter: StandardFragmenter::new(),
             codex: None,
             monitor: None,
+            audit: None,
             master_hash: None,
         }
     }
@@ -806,6 +865,25 @@ impl KeyVaultBuilder {
         self
     }
 
+    /// Attach a Layer-9 audit sink.
+    ///
+    /// Every vault operation (register, unregister, read, rotate,
+    /// fragment, defragment, master-unlock attempt) emits an
+    /// [`AuditEvent`](crate::AuditEvent) through this sink. Default
+    /// is [`NoAudit`](crate::NoAudit) — events are constructed and
+    /// discarded.
+    ///
+    /// See [`AuditSink`](crate::AuditSink) for the implementor
+    /// contract (non-blocking, no panics, no back-pressure).
+    #[must_use]
+    pub fn with_audit_sink<A>(mut self, sink: A) -> Self
+    where
+        A: AuditSink + 'static,
+    {
+        self.audit = Some(Arc::new(sink));
+        self
+    }
+
     /// Register a master credential for emergency unlock.
     ///
     /// The vault stores the **BLAKE3 hash** of the supplied bytes; the
@@ -837,6 +915,9 @@ impl KeyVaultBuilder {
         let monitor: Arc<dyn SecurityMonitor> = self
             .monitor
             .unwrap_or_else(|| Arc::new(crate::monitor::NoMonitor));
+        let audit: Arc<dyn AuditSink> = self
+            .audit
+            .unwrap_or_else(|| Arc::new(crate::audit::NoAudit));
         KeyVault {
             inner: Arc::new(VaultInner {
                 config: self.config,
@@ -847,6 +928,7 @@ impl KeyVaultBuilder {
                 failure_tracker: Mutex::new(HashMap::new()),
                 locked_out: AtomicBool::new(false),
                 master_hash: self.master_hash,
+                audit,
             }),
         }
     }
@@ -1416,6 +1498,170 @@ mod tests {
         // Correct master → unlocked.
         v.unlock_with_master(&master_bytes).unwrap();
         assert!(!v.is_locked_out());
+    }
+
+    // ----- Phase 0.9: Layer 9 audit-trail tests -----
+
+    /// Helper audit sink that captures every event for assertions.
+    struct CapturingAudit {
+        events: Mutex<Vec<(crate::audit::AccessKind, String)>>,
+    }
+
+    impl CapturingAudit {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+        fn count_of(&self, kind: crate::audit::AccessKind) -> usize {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .count()
+        }
+        fn last_for(&self, kind: crate::audit::AccessKind) -> Option<String> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find_map(|(k, name)| (*k == kind).then(|| name.clone()))
+        }
+    }
+
+    impl crate::audit::AuditSink for CapturingAudit {
+        fn on_event(&self, event: &crate::audit::AuditEvent) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.kind, event.key_name.clone()));
+        }
+    }
+
+    #[test]
+    fn register_emits_register_event() {
+        let audit = Arc::new(CapturingAudit::new());
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+        let _ = v
+            .register("primary", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+        assert_eq!(audit.count_of(crate::audit::AccessKind::Register), 1);
+        assert_eq!(
+            audit.last_for(crate::audit::AccessKind::Register),
+            Some("primary".to_string())
+        );
+    }
+
+    #[test]
+    fn unregister_emits_unregister_event() {
+        let audit = Arc::new(CapturingAudit::new());
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+        let h = v
+            .register("primary", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+        v.unregister(h).unwrap();
+        assert_eq!(audit.count_of(crate::audit::AccessKind::Unregister), 1);
+        assert_eq!(
+            audit.last_for(crate::audit::AccessKind::Unregister),
+            Some("primary".to_string())
+        );
+    }
+
+    #[test]
+    fn with_key_emits_read_event() {
+        let audit = Arc::new(CapturingAudit::new());
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+        let h = v
+            .register("data", RawKey::new(alloc::vec![0xa5u8; 16]))
+            .unwrap();
+        let _ = v.with_key(h, <[u8]>::to_vec).unwrap();
+        assert_eq!(audit.count_of(crate::audit::AccessKind::Read), 1);
+        assert_eq!(
+            audit.last_for(crate::audit::AccessKind::Read),
+            Some("data".to_string())
+        );
+    }
+
+    #[test]
+    fn rotate_emits_rotate_event() {
+        let audit = Arc::new(CapturingAudit::new());
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+        let h = v
+            .register("data", RawKey::new(alloc::vec![1u8; 16]))
+            .unwrap();
+        v.rotate(h, RawKey::new(alloc::vec![2u8; 16])).unwrap();
+        assert_eq!(audit.count_of(crate::audit::AccessKind::Rotate), 1);
+        assert_eq!(
+            audit.last_for(crate::audit::AccessKind::Rotate),
+            Some("data".to_string())
+        );
+    }
+
+    #[test]
+    fn fragment_and_defragment_emit_oneshot_events() {
+        let audit = Arc::new(CapturingAudit::new());
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+        let raw = RawKey::new(alloc::vec![0u8; 16]);
+        let frags = v.fragment(&raw).unwrap();
+        let _ = v.defragment(&frags).unwrap();
+        assert_eq!(audit.count_of(crate::audit::AccessKind::OneShotFragment), 1);
+        assert_eq!(
+            audit.count_of(crate::audit::AccessKind::OneShotDefragment),
+            1
+        );
+    }
+
+    #[test]
+    fn master_unlock_emits_event_with_match_status() {
+        let audit = Arc::new(CapturingAudit::new());
+        let master = b"correct".to_vec();
+        let v = KeyVaultBuilder::new()
+            .with_master_key(RawKey::new(master.clone()))
+            .with_failure_threshold(1, Duration::from_secs(30))
+            .with_audit_sink(Arc::clone(&audit) as Arc<dyn crate::audit::AuditSink>)
+            .build();
+
+        v.report_failure("k", None);
+        assert!(v.is_locked_out());
+
+        let _ = v.unlock_with_master(b"wrong");
+        assert_eq!(
+            audit.count_of(crate::audit::AccessKind::MasterUnlockAttempt { matched: false }),
+            1
+        );
+
+        v.unlock_with_master(&master).unwrap();
+        assert_eq!(
+            audit.count_of(crate::audit::AccessKind::MasterUnlockAttempt { matched: true }),
+            1
+        );
+    }
+
+    #[test]
+    fn no_audit_default_does_not_panic() {
+        // Default sink is NoAudit — events are still constructed but go
+        // nowhere. Verify the happy path completes without surprises.
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v.register("k", RawKey::new(alloc::vec![0u8; 16])).unwrap();
+        let _ = v.with_key(h, <[u8]>::to_vec).unwrap();
+        v.unregister(h).unwrap();
     }
 
     #[test]

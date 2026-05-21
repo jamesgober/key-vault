@@ -1,7 +1,7 @@
-<h1 align="center">
-    <b>key-vault</b>
-    <br>
-    <sub><sup>API REFERENCE</sup></sub>
+<h1 align="center">    
+  <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg"><br>
+  <b>key-vault</b>
+  <br><sub><sup>API REFERENCE</sup></sub>
 </h1>
 
 <p align="center">
@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 0.9.0.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 0.9.1.</i>
     <br>
     <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -508,6 +508,9 @@ Fluent builder for [`KeyVault`](#keyvault).
   master-key credential at build time. Stores the BLAKE3 digest of
   `master`; plaintext drops + zeroes immediately. Used by
   `KeyVault::unlock_with_master` for emergency unlock.
+- `with_audit_sink<A: AuditSink + 'static>(self, sink: A) -> Self`
+  — attach a Layer-9 audit sink. Every public op emits an
+  `AuditEvent` through it. Default is `NoAudit`.
 - `build(self) -> KeyVault` — finalize. Infallible.
 
 **Example:**
@@ -1232,6 +1235,100 @@ let _vault = KeyVaultBuilder::new().with_monitor(LogMonitor::new()).build();
 
 <hr>
 
+### `AuditSink` (trait, Layer 9)
+
+Source: `src/audit/mod.rs`
+
+Outbound channel for the vault's audit trail.
+
+```rust,ignore
+pub trait AuditSink: Send + Sync {
+    fn on_event(&self, event: &AuditEvent);
+}
+```
+
+**Contract:**
+
+- **Non-blocking.** Sink calls must return promptly. Network / disk
+  work belongs on a background worker.
+- **No panics.** A panicking sink implementation is a bug in the
+  implementation, not the vault.
+- **No back-pressure.** If the sink is overloaded, shed events
+  internally — never block the caller.
+- **`Send + Sync`.** Sinks are shared across threads.
+
+Built-in implementations: [`NoAudit`](#noaudit) (default),
+[`LogAudit`](#logaudit) (feature `monitor-tracing`).
+
+A blanket `impl AuditSink for Arc<dyn AuditSink>` lets callers pass
+pre-wrapped sinks.
+
+<hr>
+
+### `AuditEvent`
+
+Source: `src/audit/mod.rs`
+
+`#[non_exhaustive]`. Single record in the vault's audit trail.
+
+**Fields:**
+
+- `pub timestamp: Duration` — since UNIX_EPOCH.
+- `pub key_name: String` — never key bytes. Empty for one-shot
+  `fragment` / `defragment`; `"<master>"` for master-unlock attempts.
+- `pub kind: AccessKind` — discriminant of the operation.
+- `pub thread_id: std::thread::ThreadId`.
+- `pub note: Cow<'static, str>` — caller-supplied free-text label.
+
+<hr>
+
+### `AccessKind`
+
+Source: `src/audit/mod.rs`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum AccessKind {
+    Register,
+    Unregister,
+    Read,
+    Rotate,
+    OneShotFragment,
+    OneShotDefragment,
+    MasterUnlockAttempt { matched: bool },
+}
+```
+
+Implements `Display` for human-readable labels (`"register"`,
+`"master-unlock-ok"` / `"master-unlock-fail"`, etc.).
+
+<hr>
+
+### `NoAudit`
+
+Source: `src/audit/no_audit.rs`
+
+Inert default. Discards every event. Always available. The vault
+uses this when no sink is configured.
+
+<hr>
+
+### `LogAudit`
+
+Source: `src/audit/log_audit.rs` · Feature: `monitor-tracing`
+
+Emits structured `tracing` events at `info!` level on the
+`key_vault::audit` target. Fields are structured (`key_name`,
+`kind`, `thread_id`, `timestamp_ms_since_epoch`, `note`) for easy
+filtering.
+
+```rust
+use key_vault::{KeyVaultBuilder, LogAudit};
+let _vault = KeyVaultBuilder::new().with_audit_sink(LogAudit::new()).build();
+```
+
+<hr>
+
 ### `FailureContext`
 
 Source: `src/monitor/mod.rs`
@@ -1500,24 +1597,17 @@ comprehensive per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 0.9.0 (yet)
+### What's not in 0.9.1 (yet)
 
 - **`MetricsMonitor`** (metrics-lib integration) and **`WebhookMonitor`**
   (HTTP POST to alert endpoint) — deferred to post-1.0; both require
   external dependencies. Build a custom `SecurityMonitor` impl in the
   meantime.
-- **Dedicated `AuditEvent` surface** (Layer 9) — `LogMonitor` carries
-  failure/anomaly/breach events today; per-access audit hook deferred.
 - **Master-key-as-KEK** — the master is an emergency-unlock
   credential only. Sealing other keys with the master needs a
   key-derivation scheme; deferred to post-1.0.
-- **Criterion benchmark suite** — planned for 0.10.0.
-- **Layer 9 audit logging** — planned for 0.8.0.
-- **Multi-key vaults, key rotation, master key recovery** — planned for
-  0.9.0. Today's `KeyVault::fragment` / `defragment` operate per-call
-  without a named-key registry.
-- **Criterion benchmarks** — planned for 0.10.0. Performance targets in
-  the README are 1.0 design goals, not measurements.
+- **Criterion benchmark suite** — planned for 0.10.0. Performance
+  targets in the README are 1.0 design goals, not measurements.
 - **`frag_len` / `frag_symbols` configuration knobs** — deferred to a
   later phase.
 

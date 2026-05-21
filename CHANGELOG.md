@@ -19,6 +19,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.1] - 2026-05-21
+
+### Added
+
+- **Layer 9 — Audit trail.** Closes the gap left open in 0.9.0
+  (which had listed Layer 9 as "partial — per-access audit hook
+  deferred"). New module `key_vault::audit`:
+  - `AuditEvent { timestamp, key_name, kind, thread_id, note }` —
+    `#[non_exhaustive]`, carries only non-secret fields.
+  - `AccessKind` enum covering `Register`, `Unregister`, `Read`,
+    `Rotate`, `OneShotFragment`, `OneShotDefragment`, and
+    `MasterUnlockAttempt { matched: bool }` — `#[non_exhaustive]`.
+  - `AuditSink` trait — `Send + Sync`, contract is non-blocking,
+    no panics, no back-pressure into the vault.
+  - Blanket impl `AuditSink for Arc<dyn AuditSink>` so callers can
+    pre-wrap a sink and pass it through the builder.
+  - `NoAudit` — default no-op sink.
+  - `LogAudit` — `tracing`-backed sink emitting `info!` events at
+    `key_vault::audit` (feature `monitor-tracing`).
+- **`KeyVaultBuilder::with_audit_sink`** — install a sink at build
+  time. Defaults to `NoAudit`.
+- **Per-operation emission.** `KeyVault::register`, `unregister`,
+  `with_key`, `rotate`, `fragment`, `defragment`, and
+  `unlock_with_master` all emit an `AuditEvent` before returning.
+
+### Changed
+
+- `.gitignore` restructured into clear sections (Rust artifacts,
+  editor / OS junk, secrets) with no behavior change.
+- README status table now reads "Status as of 0.9.1"; the Layer 9
+  row is marked **shipped (0.9.1)**.
+- `docs/API.md` documents the new audit module with examples.
+
+### Security
+
+- The audit trail carries **only the key name**, never key bytes.
+- The reserved name `"<master>"` is used for master-unlock attempts;
+  `MasterUnlockAttempt.matched` reports the constant-time
+  comparison result.
+- Sink contract explicitly forbids back-pressure into the vault.
+
+---
+
 ## [0.9.0] - 2026-05-20
 
 ### Added

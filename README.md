@@ -69,14 +69,14 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.9.0 |
+| Component | Status as of 0.9.1 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
 | **Layer 2 — mlock / VirtualLock** (via internal `LockedBytes` wrapper) | shipped |
 | **Layer 3 — All four fragment strategies**: `StandardFragmenter`, `RandomFragmenter`, `InterleavedFragmenter`, `LayeredFragmenter` | shipped |
 | **Layer 4 — Decoy strategies** (`RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy`) | shipped |
-| **Layer 5 — Full codex stack**: `IdentityCodex`, `FnCodex`, `StaticCodex`, `DynamicCodex` (table in `LockedBytes`) | **shipped** |
+| **Layer 5 — Full codex stack**: `IdentityCodex`, `FnCodex`, `StaticCodex`, `DynamicCodex` (table in `LockedBytes`) | shipped |
 | **Layer 6 — Constant-time `KeyHandle` equality** (via `subtle::ConstantTimeEq`) | shipped |
 | **Layer 7 — Zero-on-drop** (every fragment + layout buffer + intermediate plaintext + decoy buffer + codex table) | shipped |
 | BLAKE3 key normalization (wired through `KeyVaultBuilder::normalize_with_blake3`) | shipped |
@@ -84,8 +84,8 @@ shipped code.
 | `KeyVault::fragment` / `KeyVault::defragment` convenience methods | shipped (uses `StandardFragmenter` internally) |
 | `KeyVaultBuilder::with_chunk_range` / `with_decoy` / `with_codex` | shipped |
 | **Layer 1 — built-in fetchers** (`EnvFetch`, `FileFetch`, `KeychainFetch`, `TpmFetch` detection) | **shipped** |
-| **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | **shipped** |
-| Layer 9 — Dedicated audit logging surface | partial — `LogMonitor` covers failure/anomaly events; per-access audit event deferred |
+| **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | shipped |
+| **Layer 9 — Audit trail** (`AuditEvent` + `AuditSink` + `NoAudit` + `LogAudit`, emission on every vault op) | shipped (0.9.1) |
 | **Multi-key vaults, rotation, master-key recovery** (`register` / `with_key` / `rotate` / `unlock_with_master`) | **shipped** |
 | Criterion benchmark suite | planned for 0.10.0 |
 
@@ -147,6 +147,13 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 - **Anomalous access patterns** — `KeyVault::report_anomalous_access(name, note)` — **shipped**
 - **Threshold lockout** — sliding-window per-key counter triggers lockout (configurable via `KeyVaultBuilder::with_failure_threshold(max, window)`); `KeyVault::fragment` / `defragment` return `Error::LockedOut` when locked; operators reset via `KeyVault::clear_lockout` — **shipped**
 - **Pluggable sinks** — `NoMonitor`, `CompositeMonitor`, `LogMonitor` (via `tracing`) shipped; webhook + metrics sinks deferred to post-1.0 due to HTTP/metrics-lib dep weight
+
+### Audit trail (Layer 9, shipped in 0.9.1)
+
+- **Per-operation `AuditEvent`** — every `register` / `with_key` / `rotate` / `unregister` / `fragment` / `defragment` / `unlock_with_master` call emits an event through the configured sink
+- **`NoAudit`** — default no-op sink (events constructed + discarded)
+- **`LogAudit`** — `tracing`-backed sink (feature `monitor-tracing`), emits structured `info!` events on `key_vault::audit`
+- **Custom sinks** — implement the `AuditSink` trait. Contract: non-blocking, no panics, no back-pressure into the vault
 
 ### Operational features
 

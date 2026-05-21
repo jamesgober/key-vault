@@ -1,39 +1,42 @@
-﻿target/
-**/*.rs.bk
-*.pdb
-Cargo.lock.bak
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
+﻿# Development
 /dev
 /.dev
-*.rlib
-*.rmeta
-*.so
-*.dylib
-*.dll
-*.a
-**/test_output/
-**/.test-*
-coverage/
-*.profraw
-*.profdata
-target/doc/
-book/
-**/criterion/
-flamegraph.svg
-perf.data*
-*.heap-profile
-*.log
+/.claude
+
+# Rust/Cargo Build Artifacts
+/target/
+**/*.rs.bk
+
+# Dependencies
+/node_modules/
+/vendor/
+
+# Editor & OS Junk
+/.vscode
+.DS_Store
+.Spotlight-V100
+.Trash-*
+.Trashes
+.directory
+.LSOverride
+.AppleDouble
+Desktop.ini
+ehthumbs.db
+Thumbs.db
+$RECYCLE.BIN/
+
+# Environment & Secrets
 .env
-.env.local
-desktop.ini
-.claude/
-# Fuzz artifacts
-fuzz/target/
-fuzz/corpus/
-fuzz/artifacts/
+/config/
+storage/*.key
+Homestead.yaml
+Homestead.json
+/config.json
+
+# Sublime Text & Other IDEs
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+._*

@@ -56,6 +56,7 @@
 
 extern crate alloc;
 
+pub mod audit;
 pub mod codex;
 pub mod decoy;
 mod error;
@@ -69,6 +70,9 @@ mod normalize;
 pub mod tee;
 mod vault;
 
+#[cfg(feature = "monitor-tracing")]
+pub use crate::audit::LogAudit;
+pub use crate::audit::{AccessKind, AuditEvent, AuditSink, NoAudit};
 pub use crate::codex::{Codex, DynamicCodex, IdentityCodex, StaticCodex};
 pub use crate::decoy::{DecoyStrategy, KeyDerivedDecoy, RandomDecoy, SelfReferenceDecoy};
 pub use crate::error::{Error, Result};
