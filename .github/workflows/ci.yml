@@ -37,7 +37,12 @@ jobs:
 
   # Supply-chain checks. REPS §Dependency Management requires both
   # `cargo audit` (RustSec advisory database) and `cargo deny check`
-  # (license / source / version policy) in CI.
+  # (license / source / version policy) in CI. We use
+  # `taiki-e/install-action` which installs precompiled binaries —
+  # this sidesteps the compile-from-source MSRV churn that
+  # `rustsec/audit-check@v2` runs into when transitive deps of
+  # `cargo-audit` bump their own MSRV ahead of the runner's stable
+  # toolchain.
   supply-chain:
     name: Supply-chain audit
     runs-on: ubuntu-latest
@@ -47,12 +52,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: supply-chain
+      - name: Install cargo-audit + cargo-deny (precompiled)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
       - name: cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
       - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
+        run: cargo deny --all-features check
