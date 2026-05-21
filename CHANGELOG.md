@@ -19,6 +19,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] - 2026-05-21
+
+### Added
+
+- **Criterion benchmark suite.** Six `[[bench]]` targets under
+  `benches/`, all `harness = false`:
+  - `access_latency.rs` — `KeyVaultBuilder::build`, `register`,
+    `with_key`, `rotate`, one-shot `fragment` / `defragment` across
+    16/32/64/256-byte keys.
+  - `concurrent_access.rs` — `with_key` throughput at 1 / 4 / 16 / 64
+    threads, plus a 4-reader / 1-rotator contention bench.
+  - `fragment_strategies.rs` — `StandardFragmenter` vs.
+    `InterleavedFragmenter` vs. `RandomFragmenter` vs.
+    `LayeredFragmenter` through the `FragmentStrategy` trait.
+  - `decoy_strategies.rs` — `RandomDecoy` vs. `SelfReferenceDecoy`
+    vs. `KeyDerivedDecoy` through the full vault stack.
+  - `codex_overhead.rs` — `IdentityCodex` /
+    `StaticCodex::random_involution` / `DynamicCodex` plus a no-codex
+    baseline.
+  - `memory_overhead.rs` — 100-key registration timing + Linux
+    1000-key RSS-delta probe.
+- **`docs/PERFORMANCE.md`** — methodology, reference-machine results,
+  tuning guide, and documented intentional costs.
+
+### Changed
+
+- `StandardFragmenter` no longer `#[derive(Default)]`. Added an
+  explicit `impl Default for StandardFragmenter` that forwards to
+  `StandardFragmenter::new()` (default chunk range `1..=8`). Fixes a
+  latent panic where `StandardFragmenter::default()` would produce
+  `min_chunk = 0, max_chunk = 0` and panic on the first `fragment`
+  call with `Error::Fragment("invalid chunk-size range")`.
+- Removed placeholder `benches/vault_bench.rs`; replaced by the six
+  bench files above.
+
+### Fixed
+
+- `StandardFragmenter::default()` panicking on first use (see
+  Changed). Behaviour now matches the documented `new()` constructor.
+
+### Security
+
+- No security-surface changes in 0.10.0; all 9 defense layers carry
+  forward from 0.9.1 unchanged.
+
+---
+
 ## [0.9.1] - 2026-05-21
 
 ### Added

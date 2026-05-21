@@ -69,7 +69,7 @@ of it. The "Features" section below documents the 1.0 surface; the table here
 records what is actually built today so you can match the README against the
 shipped code.
 
-| Component | Status as of 0.9.1 |
+| Component | Status as of 0.10.0 |
 |-----------|--------------------|
 | Public type system (`Error`, `Result`, `KeyHandle`, `KeyMetadata`, `RawKey`, `FetchContext`, `Fragments`) | shipped |
 | Trait surfaces (`KeyFetch`, `FragmentStrategy`, `DecoyStrategy`, `Codex`, `SecurityMonitor`) | shipped |
@@ -87,7 +87,7 @@ shipped code.
 | **Layer 8 — Monitor implementations** (`NoMonitor`, `CompositeMonitor`, `LogMonitor` via tracing) + threshold-driven lockout | shipped |
 | **Layer 9 — Audit trail** (`AuditEvent` + `AuditSink` + `NoAudit` + `LogAudit`, emission on every vault op) | shipped (0.9.1) |
 | **Multi-key vaults, rotation, master-key recovery** (`register` / `with_key` / `rotate` / `unlock_with_master`) | **shipped** |
-| Criterion benchmark suite | planned for 0.10.0 |
+| Criterion benchmark suite + `docs/PERFORMANCE.md` | shipped (0.10.0) |
 
 Each phase's exit criteria, scope, and timeline are tracked in
 [.dev/ROADMAP.md](.dev/ROADMAP.md).
@@ -163,15 +163,20 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 - **TEE detection** — check for Intel SGX, Intel TDX, AMD SEV, AMD SEV-SNP, ARM TrustZone, Apple Secure Enclave, AWS Nitro — **shipped**
 - **Key normalization** — BLAKE3 hash input to neutralize format-based pattern leaks — **shipped in 0.3.0**
 
-### Performance targets (1.0 design — not yet measured)
+### Performance targets (1.0 design — verified in 0.10.0)
 
-- **Key acquisition** — sub-second from hardware, sub-millisecond from keychain
-- **Key access** (defrag into temporary buffer) — sub-microsecond (~500ns including audit + monitor)
-- **Concurrent access** — lock-free reads after vault initialization
-- **Memory overhead** — < 16 KiB per key (including fragment + decoy overhead)
-- **Zero allocations** on the hot path (after vault initialization)
+Measured numbers from the reference machine (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for methodology and the full result tables):
 
-> **Note on benchmark numbers:** detailed criterion-backed benchmark numbers will land with **v1.0.0** (Phase 0.10.0 in the roadmap). Until then, performance numbers are targets, not measurements.
+| Target | Measured | Status |
+|--------|----------|--------|
+| Vault construction (empty) | ~165 ns | ✅ |
+| `with_key` defrag, no codex, 16/32/64 B | 158 / 175 / 211 ns | ✅ under 500 ns |
+| `with_key` defrag, with codex, 16/32/64 B | 190 / 228 / 310 ns | ✅ under 1 µs |
+| Concurrent reads, 1 → 64 threads | scales out, no contention | ✅ lock-free |
+| Memory overhead per key (Linux 1000-key RSS) | ~5 KiB | ✅ under 16 KiB |
+| Zero allocations on hot path | not yet `dhat`-verified | planned for 0.11 |
+
+Run `cargo bench --all-features` to reproduce on your hardware.
 
 ---
 
@@ -179,7 +184,7 @@ Encoding/decoding is one memory load per byte (constant-time, branch-free).
 
 ```toml
 [dependencies]
-key-vault = "0.9"
+key-vault = "0.10"
 ```
 
 ```rust

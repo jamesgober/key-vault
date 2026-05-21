@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 0.9.1.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 0.10.0.</i>
     <br>
     <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -1597,7 +1597,7 @@ comprehensive per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 0.9.1 (yet)
+### What's not in 0.10.0 (yet)
 
 - **`MetricsMonitor`** (metrics-lib integration) and **`WebhookMonitor`**
   (HTTP POST to alert endpoint) — deferred to post-1.0; both require
@@ -1606,8 +1606,11 @@ comprehensive per-layer architecture and threat-model coverage.
 - **Master-key-as-KEK** — the master is an emergency-unlock
   credential only. Sealing other keys with the master needs a
   key-derivation scheme; deferred to post-1.0.
-- **Criterion benchmark suite** — planned for 0.10.0. Performance
-  targets in the README are 1.0 design goals, not measurements.
+- **Fuzz / `dhat` / `dudect` verification** — planned for 0.11.0
+  (security hardening phase). Performance numbers in
+  [`docs/PERFORMANCE.md`](./PERFORMANCE.md) are measured; static
+  allocation profile and constant-time properties are not yet
+  asserted by automated tooling.
 - **`frag_len` / `frag_symbols` configuration knobs** — deferred to a
   later phase.
 

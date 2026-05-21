@@ -68,7 +68,7 @@ const DEFAULT_MAX_CHUNK: usize = 8;
 /// let recovered = vault.defragment(&frags).unwrap();
 /// assert_eq!(recovered.len(), original_len);
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StandardFragmenter {
     min_chunk: usize,
     max_chunk: usize,
@@ -128,6 +128,14 @@ impl StandardFragmenter {
     {
         self.decoy = Some(Arc::new(decoy));
         self
+    }
+}
+
+impl Default for StandardFragmenter {
+    /// Same as [`StandardFragmenter::new`] — the default-range
+    /// (`min = 1`, `max = 8`) fragmenter with no decoy strategy.
+    fn default() -> Self {
+        Self::new()
     }
 }
 

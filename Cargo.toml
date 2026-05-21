@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -130,7 +130,27 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 
 [[bench]]
-name = "vault_bench"
+name = "access_latency"
+harness = false
+
+[[bench]]
+name = "concurrent_access"
+harness = false
+
+[[bench]]
+name = "fragment_strategies"
+harness = false
+
+[[bench]]
+name = "decoy_strategies"
+harness = false
+
+[[bench]]
+name = "codex_overhead"
+harness = false
+
+[[bench]]
+name = "memory_overhead"
 harness = false
 
 [profile.release]
