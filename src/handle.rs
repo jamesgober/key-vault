@@ -219,8 +219,8 @@ mod tests {
         let a = KeyId::next();
         let b = KeyId::next();
         let c = KeyId::next();
-        assert!(a != b);
-        assert!(b != c);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
         assert!(a.get() < b.get());
         assert!(b.get() < c.get());
     }
@@ -229,7 +229,7 @@ mod tests {
     fn handles_are_distinct() {
         let h1 = KeyHandle::allocate();
         let h2 = KeyHandle::allocate();
-        assert!(h1 != h2);
+        assert_ne!(h1, h2);
     }
 
     #[test]

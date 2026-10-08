@@ -189,7 +189,7 @@ mod tests {
         let buf = LockedBytes::from_slice(&[]);
         assert_eq!(buf.len(), 0);
         assert!(!buf.is_locked());
-        assert!(buf.as_bytes().is_empty());
+        assert_eq!(buf.as_bytes(), []);
     }
 
     #[test]
