@@ -166,9 +166,11 @@ impl FragmentStrategy for RandomFragmenter {
     }
 
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
-        let mut out = alloc::vec![0u8; fragments.total_len()];
-        self.defragment_into(fragments, &mut out)?;
-        Ok(RawKey::new(out))
+        // Wrap the output in `RawKey` before writing so a partial write
+        // is zeroed on drop if `defragment_into` returns an error.
+        let mut out = RawKey::new(alloc::vec![0u8; fragments.total_len()]);
+        self.defragment_into(fragments, out.as_bytes_mut())?;
+        Ok(out)
     }
 
     fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {

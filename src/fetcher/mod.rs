@@ -127,6 +127,16 @@ impl RawKey {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Crate-internal mutable access to the raw bytes.
+    ///
+    /// Lets internal code allocate the `RawKey` first and then write key
+    /// material into it, so `RawKey`'s zero-on-drop covers the buffer
+    /// from the first byte written, including on early error returns
+    /// and unwinding.
+    pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
 }
 
 impl fmt::Debug for RawKey {

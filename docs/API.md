@@ -52,7 +52,7 @@ cargo add key-vault
 
 | Feature | Default | Effect |
 |---------|---------|--------|
-| `std` | ✅ | Standard-library types. Required by the current implementation. |
+| `std` | ✅ | Standard-library types. Required: a build without `std` stops with a `compile_error!`. `no_std` is not supported. |
 | `mlock` | ✅ | `mlock` / `VirtualLock` page locking on `LockedBytes`. |
 | `zeroize` | ✅ | `zeroize` integration; zero-on-drop on every key buffer. |
 | `fragment-standard` | ✅ | `StandardFragmenter` (the default). |

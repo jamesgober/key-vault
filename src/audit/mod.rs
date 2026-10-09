@@ -105,8 +105,7 @@ impl fmt::Display for AccessKind {
 #[non_exhaustive]
 pub struct AuditEvent {
     /// Time the event was emitted, expressed as a `Duration` since the
-    /// Unix epoch. Same encoding used by [`KeyMetadata`](crate::KeyMetadata)
-    /// for portability to future `no_std` builds.
+    /// Unix epoch. Same encoding used by [`KeyMetadata`](crate::KeyMetadata).
     pub timestamp: Duration,
     /// Logical name of the key. For one-shot fragment/defragment
     /// operations (no registry entry) the value is the empty string.

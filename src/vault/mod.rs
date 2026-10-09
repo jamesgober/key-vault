@@ -526,18 +526,21 @@ impl KeyVault {
             if buf.len() < total {
                 buf.resize(total, 0);
             }
+            // The guard is created before the first plaintext byte is
+            // written, so the scratch is volatile-zeroed on every exit
+            // path: normal return, an error from `defragment_into`
+            // after a partial write, or a panic in the codex or the
+            // user callback.
+            let guard = ZeroOnExit(&mut buf[..total]);
             // Defragment directly into the scratch — no `RawKey` /
             // `Vec<u8>` allocation on the hot path.
             self.inner
                 .fragmenter
-                .defragment_into(&fragments, &mut buf[..total])?;
+                .defragment_into(&fragments, &mut *guard.0)?;
             // Codex decode in place (also alloc-free).
             if let Some(c) = &codex {
-                codex_decode_in_place(c.as_ref(), &mut buf[..total]);
+                codex_decode_in_place(c.as_ref(), &mut *guard.0);
             }
-            // Run the user callback under a guard that volatile-zeros
-            // the scratch on the way out — even if the callback panics.
-            let guard = ZeroOnExit(&mut buf[..total]);
             Ok(f(&*guard.0))
         })?;
         if let Some(name) = name {
@@ -705,10 +708,14 @@ impl KeyVault {
 /// Used by the `fragment` (write) path. For involution-based codices
 /// `decode == encode`; the function name reflects that — it's a single
 /// transformation pass either way. Allocates a fresh [`RawKey`] for the
-/// transformed output.
+/// transformed output and transforms it in place, so the buffer is
+/// zeroed on drop even if a user codex panics partway through.
 fn codex_apply(codex: &dyn Codex, key: &RawKey) -> RawKey {
-    let bytes: Vec<u8> = key.as_bytes().iter().map(|&b| codex.encode(b)).collect();
-    RawKey::new(bytes)
+    let mut out = RawKey::new(key.as_bytes().to_vec());
+    for b in out.as_bytes_mut() {
+        *b = codex.encode(*b);
+    }
+    out
 }
 
 /// In-place codex decode over a mutable byte slice.
@@ -735,8 +742,10 @@ thread_local! {
 }
 
 /// Guard that volatile-zeros the borrowed scratch slice when it drops.
-/// Used at the bottom of `KeyVault::with_key` so the recovered key
-/// material is scrubbed even if the user callback panics.
+/// `KeyVault::with_key` creates it before defragmenting into the
+/// scratch, so recovered key material is scrubbed on success, on an
+/// error partway through defragmentation, and on unwind from a
+/// panicking codex or user callback.
 struct ZeroOnExit<'a>(&'a mut [u8]);
 
 impl Drop for ZeroOnExit<'_> {
@@ -1773,5 +1782,143 @@ mod tests {
         assert_eq!(b.failures.load(Ordering::SeqCst), 1);
         assert_eq!(a.breaches.load(Ordering::SeqCst), 1);
         assert_eq!(b.breaches.load(Ordering::SeqCst), 1);
+    }
+
+    // ----- Scratch-buffer wiping on every exit path -----
+
+    /// `true` if every byte of this thread's `with_key` scratch buffer
+    /// is zero. Also returns the buffer length so callers can check the
+    /// scratch was actually used.
+    fn scratch_is_all_zero() -> (bool, usize) {
+        SCRATCH.with(|cell| {
+            let buf = cell.borrow();
+            (buf.iter().all(|&b| b == 0), buf.len())
+        })
+    }
+
+    /// Replace the fragments stored for `handle` with `fragments`.
+    fn replace_fragments(v: &KeyVault, handle: KeyHandle, fragments: Fragments) {
+        let fragments = Arc::new(fragments);
+        let _previous = v.inner.keys.rcu(|current| {
+            let mut new_map = (**current).clone();
+            let entry = new_map.get_mut(&handle.id()).expect("handle registered");
+            entry.fragments = Arc::clone(&fragments);
+            new_map
+        });
+    }
+
+    #[test]
+    fn with_key_zeroes_scratch_when_defragment_fails_partway() {
+        use crate::memory::LockedBytes;
+
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v
+            .register("partial", RawKey::new(b"abcdef".to_vec()))
+            .unwrap();
+
+        // Corrupt layout: chunk 0 (4 bytes at offset 0) is valid and gets
+        // copied into the scratch; chunk 1 (4 bytes at offset 4) runs past
+        // `total_len = 6`, so `defragment_into` errors after the first
+        // write.
+        let chunks = alloc::vec![
+            LockedBytes::from_slice(b"SECR"),
+            LockedBytes::from_slice(b"ETXX"),
+        ];
+        let mut layout = Vec::new();
+        layout.extend_from_slice(&0u32.to_le_bytes());
+        layout.extend_from_slice(&4u32.to_le_bytes());
+        let corrupt = Fragments::from_parts(chunks, LockedBytes::from_slice(&layout), 6);
+        replace_fragments(&v, h, corrupt);
+
+        let mut called = false;
+        let result = v.with_key(h, |_| called = true);
+        assert!(matches!(result, Err(Error::Defragment(_))));
+        assert!(!called);
+
+        let (all_zero, len) = scratch_is_all_zero();
+        assert!(len >= 6, "scratch buffer was not used");
+        assert!(all_zero, "plaintext left in scratch after defragment error");
+    }
+
+    /// Codex whose `encode` is the identity and whose `decode` panics on
+    /// the third byte once armed.
+    struct PanickingCodex {
+        armed: AtomicBool,
+        decoded: core::sync::atomic::AtomicUsize,
+    }
+
+    impl Codex for PanickingCodex {
+        fn encode(&self, byte: u8) -> u8 {
+            byte
+        }
+
+        fn decode(&self, byte: u8) -> u8 {
+            let fail = self.armed.load(Ordering::SeqCst)
+                && self.decoded.fetch_add(1, Ordering::SeqCst) == 2;
+            assert!(!fail, "codex decode failure (test)");
+            byte
+        }
+    }
+
+    #[test]
+    fn with_key_zeroes_scratch_when_codex_panics() {
+        let codex = Arc::new(PanickingCodex {
+            armed: AtomicBool::new(false),
+            decoded: core::sync::atomic::AtomicUsize::new(0),
+        });
+        let v = KeyVaultBuilder::new()
+            .normalize_with_blake3(false)
+            .with_codex(ArcCodex(Arc::clone(&codex)))
+            .build();
+        let h = v
+            .register("panicky", RawKey::new(b"panic-secret-123".to_vec()))
+            .unwrap();
+
+        codex.armed.store(true, Ordering::SeqCst);
+        let mut called = false;
+        let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            v.with_key(h, |_| called = true)
+        }));
+        assert!(outcome.is_err(), "codex panic should propagate");
+        assert!(!called);
+
+        let (all_zero, len) = scratch_is_all_zero();
+        assert!(len >= 16, "scratch buffer was not used");
+        assert!(all_zero, "plaintext left in scratch after codex panic");
+
+        // The vault stays usable on this thread after the unwind.
+        codex.armed.store(false, Ordering::SeqCst);
+        let copy = v.with_key(h, <[u8]>::to_vec).unwrap();
+        assert_eq!(copy, b"panic-secret-123");
+        assert!(scratch_is_all_zero().0);
+    }
+
+    #[test]
+    fn with_key_zeroes_scratch_when_callback_panics() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v
+            .register("cb", RawKey::new(b"callback-secret".to_vec()))
+            .unwrap();
+        let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            v.with_key(h, |_| panic!("callback failure (test)"))
+        }));
+        assert!(outcome.is_err());
+        let (all_zero, len) = scratch_is_all_zero();
+        assert!(len >= 15, "scratch buffer was not used");
+        assert!(all_zero, "plaintext left in scratch after callback panic");
+    }
+
+    /// Adapter so a test can keep an `Arc` handle to a codex it also
+    /// hands to the builder (which takes the codex by value).
+    struct ArcCodex<C>(Arc<C>);
+
+    impl<C: Codex> Codex for ArcCodex<C> {
+        fn encode(&self, byte: u8) -> u8 {
+            self.0.encode(byte)
+        }
+
+        fn decode(&self, byte: u8) -> u8 {
+            self.0.decode(byte)
+        }
     }
 }

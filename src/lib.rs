@@ -31,13 +31,18 @@
 //! decoy, and zeroize land in Phases 0.3 and 0.4. See `.dev/ROADMAP.md` for
 //! the full milestone plan.
 //!
+//! # Standard library requirement
+//!
+//! key-vault requires the standard library. The `std` feature is on by
+//! default and must stay enabled: a build without it stops with a
+//! `compile_error!`. There is no `no_std` support today.
+//!
 //! # License
 //!
 //! Dual-licensed under Apache-2.0 OR MIT.
 
 #![doc(html_root_url = "https://docs.rs/key-vault")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(not(feature = "std"), no_std)]
 // REPS §Code Quality canonical lint set. `#![deny(warnings)]` is
 // intentionally NOT used at the crate root — new rustc versions can
 // introduce lints that retroactively break downstream builds of a
@@ -60,6 +65,12 @@
 #![deny(clippy::missing_safety_doc)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+
+// The crate uses `std` throughout (HashMap, Mutex, Instant, SystemTime,
+// thread ids). The `std` feature is kept so existing feature lists stay
+// valid, but turning it off is not supported.
+#[cfg(not(feature = "std"))]
+compile_error!("key-vault currently requires the `std` feature; no_std support is planned");
 
 extern crate alloc;
 

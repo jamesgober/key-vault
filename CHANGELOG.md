@@ -19,6 +19,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.1] - 2026-10-08
+
+### Fixed
+
+- **Plaintext could remain in the `with_key` scratch buffer if
+  decoding failed or panicked.** `KeyVault::with_key` rebuilds the key
+  in a thread-local scratch buffer, but the guard that zeroes that
+  buffer was created only after defragmentation and the codex decode.
+  If `defragment_into` returned an error after a partial write, or a
+  `Codex::decode` implementation panicked, the bytes already written
+  stayed in the buffer. The guard now covers the buffer from before the
+  first write, so it is zeroed on success, on error and on unwind. New
+  unit tests check the buffer is all zeros after a defragment error, a
+  panicking codex and a panicking callback.
+- **Same gap in the one-shot paths.** `StandardFragmenter`,
+  `InterleavedFragmenter` and `RandomFragmenter::defragment` built
+  their output in a plain `Vec<u8>` and wrapped it in a `RawKey` only on
+  success, so a partial result was freed without being zeroed on error.
+  The internal codex pass used by `KeyVault::fragment` and
+  `KeyVault::defragment` had the same problem if a codex panicked. Both
+  now write into a `RawKey` from the start, whose drop zeroes the
+  buffer.
+
+### Changed
+
+- **The `std` feature is now explicitly required**
+  ([#3](https://github.com/jamesgober/key-vault/issues/3)). The crate
+  declared `#![cfg_attr(not(feature = "std"), no_std)]`, but it uses
+  `std` types throughout and a build without `std` has never compiled.
+  That attribute is removed, and building without the `std` feature
+  now stops with a clear `compile_error!` instead of a list of
+  unresolved `std` paths. The `std` feature itself is kept (and stays
+  on by default), so existing feature lists keep working. Docs that
+  mentioned future `no_std` builds now say that `std` is required.
+  `no_std` support is not part of this release.
+
+### Removed
+
+- **Unused `rand_core = "0.6"` dependency.** Nothing in the crate used
+  it under any feature; randomness comes from `getrandom`.
+
+---
+
 ## [1.0.0] - 2026-05-21
 
 ### Added

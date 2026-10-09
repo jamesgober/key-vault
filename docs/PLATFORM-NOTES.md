@@ -179,8 +179,9 @@ gotchas if you cross-compile from one host to another:
   requires the macOS SDK headers. Easiest path: build natively on
   macOS or use a Cirrus / GitHub Actions macOS runner.
 - **From any host to musl Linux**: `keyring` pulls in `dbus` which
-  expects glibc; build with `--no-default-features` and disable
-  `fetcher-keychain` for static musl targets.
+  expects glibc; leave the `fetcher-keychain` feature off (it is not
+  a default feature) for static musl targets. Keep `std` enabled: the
+  crate requires it.
 
 ---
 

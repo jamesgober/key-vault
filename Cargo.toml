@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -47,7 +47,7 @@ path = "src/lib.rs"
 default = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]
 
 # Core
-std = []                              # Standard library (default on)
+std = []                              # Standard library (default on, required)
 mlock = []                            # Lock memory pages from swap (default on)
 zeroize = ["dep:zeroize"]             # Zero on drop (default on)
 
@@ -102,7 +102,6 @@ arc-swap = "1.7"
 
 # Cryptographically secure RNG
 getrandom = "0.2"
-rand_core = "0.6"
 
 # Cryptographic hashing for key normalization (BLAKE3 - fast, post-quantum safe)
 blake3 = "1"

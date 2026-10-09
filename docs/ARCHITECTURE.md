@@ -255,7 +255,7 @@ KeyHandle from caller, new RawKey
 |-------|----------|
 | `subtle` | Constant-time `KeyHandle` equality + master-key digest comparison |
 | `arc-swap` | Lock-free reads + atomic writes on the named-key registry |
-| `getrandom` + `rand_core` | CSPRNG seeding for the fragmenter and decoy strategies |
+| `getrandom` | CSPRNG seeding for the fragmenter and decoy strategies |
 | `blake3` | Key normalisation hash + master-key digest hash + XOF in `KeyDerivedDecoy` |
 | `zeroize` | Optional `ZeroizeOnDrop` derive on internal byte buffers |
 | `keyring` (`fetcher-keychain` feature) | OS keychain integration |

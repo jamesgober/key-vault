@@ -60,9 +60,8 @@ pub struct KeyMetadata {
     /// Time at which the key was registered with the vault, expressed as a
     /// `Duration` since the [`UNIX_EPOCH`](std::time::UNIX_EPOCH).
     ///
-    /// We use `Duration` instead of `SystemTime` so the type is portable to
-    /// `no_std` builds in the future. Callers that need a wall-clock
-    /// representation can reconstruct one via
+    /// Stored as a `Duration` rather than a `SystemTime`. Callers that need
+    /// a wall-clock representation can reconstruct one via
     /// `UNIX_EPOCH + metadata.registered_since_epoch()`.
     registered_since_epoch: Duration,
     /// Raw key length in bytes.
