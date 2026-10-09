@@ -47,14 +47,14 @@ pub(crate) struct Mutex<T> {
     value: UnsafeCell<T>,
 }
 
+#[cfg(not(feature = "std"))]
 // SAFETY: access to `value` is serialized by `locked` (acquire on lock,
 // release on unlock), so sharing the lock between threads only ever hands
 // out one `&mut T` at a time. `T: Send` is required because the value can
 // be reached from whichever thread takes the lock.
-#[cfg(not(feature = "std"))]
 unsafe impl<T: Send> Sync for Mutex<T> {}
-// SAFETY: moving the lock moves the value; that is fine when `T: Send`.
 #[cfg(not(feature = "std"))]
+// SAFETY: moving the lock moves the value; that is fine when `T: Send`.
 unsafe impl<T: Send> Send for Mutex<T> {}
 
 #[cfg(not(feature = "std"))]

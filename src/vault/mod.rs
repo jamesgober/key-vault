@@ -3713,21 +3713,25 @@ mod page_protection_tests {
         frags.region().expect("key is not page-protected").mapping()
     }
 
-    /// `true` if the OS reports the region as inaccessible.
-    fn is_inaccessible(addr: usize) -> bool {
+    /// `Some(true)` if the OS reports the region as inaccessible,
+    /// `Some(false)` if readable, `None` where the test cannot ask the OS.
+    #[allow(clippy::unnecessary_wraps)] // `None` on other platforms.
+    fn is_inaccessible(addr: usize) -> Option<bool> {
         #[cfg(target_os = "linux")]
         {
-            crate::test_util::maps_perms(addr).as_deref() == Some("---p")
+            Some(crate::test_util::maps_perms(addr).as_deref() == Some("---p"))
         }
         #[cfg(windows)]
         {
-            crate::test_util::virtual_query_protect(addr)
-                == windows_sys::Win32::System::Memory::PAGE_NOACCESS
+            Some(
+                crate::test_util::virtual_query_protect(addr)
+                    == windows_sys::Win32::System::Memory::PAGE_NOACCESS,
+            )
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = addr;
-            true
+            None
         }
     }
 
@@ -3770,23 +3774,36 @@ mod page_protection_tests {
         let h = v.register("k", RawKey::new(alloc::vec![0x5a; 48])).unwrap();
         let (addr, len) = region_of(&v, h);
         assert!(len >= crate::memory::page_size());
-        assert!(is_inaccessible(addr), "region readable after register");
+        assert_ne!(
+            is_inaccessible(addr),
+            Some(false),
+            "region readable after register"
+        );
 
         let snapshot = v.inner.keys.load();
         let frags = snapshot.get(&h.id()).unwrap().fragments.share();
         drop(snapshot);
         {
             let _open = frags.open().unwrap().expect("region");
-            assert!(!is_inaccessible(addr), "region not readable while open");
+            assert_ne!(
+                is_inaccessible(addr),
+                Some(true),
+                "region not readable while open"
+            );
             #[cfg(target_os = "linux")]
             assert_eq!(crate::test_util::maps_perms(addr).as_deref(), Some("r--p"));
             // A second reader shares the window.
             let second = frags.open().unwrap();
             drop(second);
-            assert!(!is_inaccessible(addr), "inner reader closed the window");
+            assert_ne!(
+                is_inaccessible(addr),
+                Some(true),
+                "inner reader closed the window"
+            );
         }
-        assert!(
+        assert_ne!(
             is_inaccessible(addr),
+            Some(false),
             "region readable after the last reader"
         );
 
@@ -3794,7 +3811,11 @@ mod page_protection_tests {
             v.with_key(h, <[u8]>::to_vec).unwrap(),
             alloc::vec![0x5a; 48]
         );
-        assert!(is_inaccessible(addr), "region readable after with_key");
+        assert_ne!(
+            is_inaccessible(addr),
+            Some(false),
+            "region readable after with_key"
+        );
     }
 
     /// Normalization key and master verifier are protected too.
@@ -3809,10 +3830,10 @@ mod page_protection_tests {
             panic!("keyed normalizer missing");
         };
         let (addr, _) = secret.0.region().expect("protected").mapping();
-        assert!(is_inaccessible(addr));
+        assert_ne!(is_inaccessible(addr), Some(false));
         let h = v.register("k", RawKey::new(b"abc".to_vec())).unwrap();
         assert_eq!(v.with_key(h, <[u8]>::len).unwrap(), 32);
-        assert!(is_inaccessible(addr));
+        assert_ne!(is_inaccessible(addr), Some(false));
         v.unlock_with_master(b"m").unwrap();
     }
 
@@ -3834,7 +3855,7 @@ mod page_protection_tests {
                 });
             }
         });
-        assert!(is_inaccessible(addr));
+        assert_ne!(is_inaccessible(addr), Some(false));
     }
 
     #[test]
