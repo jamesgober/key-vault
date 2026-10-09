@@ -176,7 +176,7 @@ impl FragmentStrategy for RandomFragmenter {
     }
 
     fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
-        let layout = fragments.layout().as_bytes();
+        let layout = fragments.layout_bytes();
         let chunks = fragments.chunks();
         let total_len = fragments.total_len();
 
@@ -293,7 +293,7 @@ mod tests {
         let original = key(&bytes);
         let a = frag.fragment(&original).unwrap();
         let b = frag.fragment(&original).unwrap();
-        assert_ne!(a.layout().as_bytes(), b.layout().as_bytes());
+        assert_ne!(a.layout_bytes(), b.layout_bytes());
     }
 
     #[test]

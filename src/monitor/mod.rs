@@ -8,9 +8,12 @@
 //! detect decryption failures or unusual access on its own; it never sees
 //! what the caller does with a key.
 //!
-//! The threshold lockout that goes with this layer is advisory and
-//! vault-wide; see [`KeyVault::is_locked_out`](crate::KeyVault::is_locked_out).
-//! It does nothing against an attacker who can read process memory.
+//! The lockouts that go with this layer are advisory: the vault-wide
+//! threshold ([`KeyVault::is_locked_out`](crate::KeyVault::is_locked_out))
+//! and, since 1.1, the per-key threshold
+//! ([`KeyVault::is_key_locked_out`](crate::KeyVault::is_key_locked_out)).
+//! They count only the failures reported to the vault and do nothing
+//! against an attacker who can read process memory.
 //!
 //! Built-in monitors: [`NoMonitor`] (default), [`CompositeMonitor`], and
 //! `LogMonitor` (behind the `monitor-tracing` feature).
@@ -57,6 +60,20 @@ pub struct AccessContext {
     pub note: Cow<'static, str>,
 }
 
+/// Which lockout a [`ThresholdContext`] is about.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockoutScope {
+    /// The vault-wide threshold
+    /// ([`KeyVaultBuilder::with_failure_threshold`](crate::KeyVaultBuilder::with_failure_threshold)):
+    /// every key is locked out.
+    Vault,
+    /// The per-key threshold
+    /// ([`KeyVaultBuilder::with_key_lockout`](crate::KeyVaultBuilder::with_key_lockout)):
+    /// only the key registered under `key_name` is locked out.
+    Key,
+}
+
 /// Context for a configured threshold being crossed (e.g. N failures in M
 /// seconds).
 #[non_exhaustive]
@@ -68,8 +85,11 @@ pub struct ThresholdContext {
     pub failures_in_window: u32,
     /// Width of the configured window.
     pub window: Duration,
-    /// `true` if this breach has put the vault into lock-out state.
+    /// `true` if this breach started the lockout (it was not already in
+    /// place).
     pub lockout_triggered: bool,
+    /// Whether the vault-wide or the per-key threshold was crossed.
+    pub scope: LockoutScope,
 }
 
 /// Outbound channel for anomaly events.

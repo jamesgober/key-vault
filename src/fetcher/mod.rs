@@ -5,10 +5,10 @@
 //! environment variable, or a custom user-provided source. Fetchers only
 //! read keys; they add no protection to the key once it is in memory.
 //!
-//! Built-in fetchers in 1.0.x (each behind its own feature):
+//! Built-in fetchers (each behind its own feature, all requiring `std`):
 //!
 //! - `KeychainFetch` (`fetcher-keychain`): OS credential store. UTF-8
-//!   secrets only.
+//!   passwords by default, binary secrets with `KeychainFetch::binary`.
 //! - `FileFetch` (`fetcher-file`): reads a **plaintext** file. No
 //!   decryption.
 //! - `EnvFetch` (`fetcher-env`): reads an environment variable. The value
@@ -91,10 +91,14 @@ impl FetchContext {
 
 /// Container for raw key material returned by a [`KeyFetch`] implementation.
 ///
-/// `RawKey` deliberately exposes no method that returns a borrowed `&[u8]` to
-/// outside the crate. The only consumer of the inner bytes is the
-/// fragmentation pipeline. From outside `key-vault` you can construct a
-/// `RawKey`, hand it to the vault, and never see it again.
+/// The usual life of a `RawKey` is: a fetcher (or your code) builds it,
+/// you hand it to [`KeyVault::register`](crate::KeyVault::register), and
+/// it is wiped as soon as the vault has copied it into locked storage. Its
+/// bytes are readable only through the deliberately loud
+/// [`RawKey::expose_secret`], which exists for custom
+/// [`FragmentStrategy`](crate::FragmentStrategy) and
+/// [`DecoyStrategy`](crate::DecoyStrategy) implementations and for
+/// reading the result of [`KeyVault::defragment`](crate::KeyVault::defragment).
 ///
 /// # Wiping
 ///
@@ -136,11 +140,30 @@ impl RawKey {
         self.bytes.is_empty()
     }
 
-    /// Crate-internal access to the raw bytes for the fragmentation pipeline.
+    /// Borrow the key bytes.
     ///
-    /// This is `pub(crate)` and not part of the public API. The only legitimate
-    /// consumers live inside this crate.
-    #[allow(dead_code)] // wired up by FragmentStrategy implementations in Phase 0.3.
+    /// For custom [`FragmentStrategy`](crate::FragmentStrategy) and
+    /// [`DecoyStrategy`](crate::DecoyStrategy) implementations, and for
+    /// reading what [`KeyVault::defragment`](crate::KeyVault::defragment)
+    /// returned. Everything this crate does to keep keys out of reach
+    /// stops applying to copies you make of this slice: keep them short
+    /// lived and wipe them (for example with `zeroize`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use key_vault::RawKey;
+    ///
+    /// let key = RawKey::new(vec![1, 2, 3]);
+    /// assert_eq!(key.expose_secret(), &[1, 2, 3]);
+    /// ```
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Crate-internal shorthand for [`RawKey::expose_secret`].
+    #[inline]
     #[must_use]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes

@@ -18,10 +18,12 @@
 //! # When to use
 //!
 //! The vault uses no codex unless one is passed to
-//! [`KeyVaultBuilder::with_codex`](crate::KeyVaultBuilder::with_codex).
-//! The `codex` and `codex-dynamic` Cargo features are reserved and have no
-//! effect in 1.0.x; the codex types are always compiled. A table codex adds
-//! a few nanoseconds per byte to the access path.
+//! [`KeyVaultBuilder::with_codex`](crate::KeyVaultBuilder::with_codex), or
+//! the `codex` / `codex-dynamic` feature is on and the vault is built with
+//! [`KeyVaultBuilder::from_features`](crate::KeyVaultBuilder::from_features)
+//! (which adds a fresh [`DynamicCodex`]). The codex types are always
+//! compiled. A table codex adds a few nanoseconds per byte to the access
+//! path.
 //!
 //! # Involution requirement
 //!

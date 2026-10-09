@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 
 use super::DecoyStrategy;
 use crate::Result;
-use crate::error::Error;
 use crate::fetcher::RawKey;
 
 /// Decoy strategy that produces uniformly-random bytes from the OS CSPRNG.
@@ -44,7 +43,7 @@ impl DecoyStrategy for RandomDecoy {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; output_len];
-        getrandom::getrandom(&mut buf).map_err(|_| Error::Internal("OS RNG failed"))?;
+        crate::rng::fill(&mut buf)?;
         Ok(buf)
     }
 

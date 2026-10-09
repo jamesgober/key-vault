@@ -121,7 +121,7 @@ impl FragmentStrategy for InterleavedFragmenter {
         // Step 2: build the pool. Start with random padding, then overlay
         // key bytes at the chosen positions.
         let mut pool: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; pool_size]);
-        getrandom::getrandom(&mut pool).map_err(|_| Error::Internal("OS RNG failed"))?;
+        crate::rng::fill(&mut pool)?;
         for (i, &pos) in positions.iter().enumerate() {
             pool[pos as usize] = bytes[i];
         }
@@ -162,7 +162,7 @@ impl FragmentStrategy for InterleavedFragmenter {
             )));
         }
         let pool = &chunks[0];
-        let layout = fragments.layout().as_bytes();
+        let layout = fragments.layout_bytes();
         let key_len = fragments.total_len();
 
         if out.len() != key_len {

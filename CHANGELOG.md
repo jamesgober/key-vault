@@ -19,6 +19,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-10-09
+
+Minor release: new API, no breaking changes. Everything new is opt-in
+except dump exclusion, the keyed master verifier, the `KeychainFetch`
+and `FileFetch` fixes, and the `LayeredFragmenter` speed-up.
+`cargo semver-checks` against 1.0.2 finds no breaking change (default
+and all features).
+
+### Security
+
+- **Key memory is kept out of crash and core dumps.** Every page that
+  holds key material (fragments, layout maps, codex tables, the
+  `with_key` scratch buffer, and the new normalization key and master
+  verifier) is excluded through the same per-page reference count that
+  handles page locking: `madvise(MADV_DONTDUMP)` on Linux and Android,
+  `madvise(MADV_NOCORE)` on FreeBSD and DragonFly, and
+  `WerRegisterExcludedMemoryBlock` on Windows 10 1709 and later (looked
+  up at run time; WER caps it at 512 blocks per process). The flag is
+  removed when the last buffer on a page is dropped. macOS has no
+  per-page exclusion, and dumps taken by a debugger or another tool
+  (gcore, procdump, Task Manager) are not affected. A test checks the
+  `dd` flag in `/proc/self/smaps` on Linux.
+- **Small key buffers come from a dedicated page pool.** Buffers of up
+  to 2048 bytes (fragments, layout maps, codex tables, the normalization
+  key, the master verifier) are carved from pages the crate maps for
+  itself, locked and excluded from dumps once, holding only key
+  buffers, and kept for the life of the process; freed blocks are zeroed
+  and reused. Before, each one sat on a general heap page shared with
+  unrelated objects, and every register / rotate / unregister locked and
+  released heap pages one system call at a time. Larger buffers keep
+  the per-page reference count from 1.0.2.
+- **Page protection (Layer 10) is implemented**, opt-in with
+  `KeyVaultBuilder::with_page_protection(true)`. Heap pages are shared
+  with unrelated objects and cannot be made inaccessible, so each
+  registered key gets a private mapping of its own (at least one page)
+  that is `PROT_NONE` / `PAGE_NOACCESS` except while `with_key` reads
+  it. Concurrent readers share one open window. The mapping is locked
+  and excluded from dumps, and zeroed before it is unmapped. It costs
+  about 1.5 µs per `with_key` on Linux. Windows drops a `VirtualLock`
+  when pages become `PAGE_NOACCESS`, so on Windows protected keys can
+  be paged out while inaccessible; the docs say to keep the page file
+  encrypted if you turn this on there. Tests check the mapping state
+  (`/proc/self/maps`, `VirtualQuery`) and that reading a protected key
+  in a child process crashes it.
+- **Per-key lockout.** `with_key_lockout(max, window, lock_for)` locks
+  out only the key whose name crossed the threshold; every other key
+  keeps working. Before, the only lockout was vault-wide, so failures
+  reported for one key name locked out every key. New
+  `KeyVault::is_key_locked_out` and `KeyVault::clear_key_lockout`;
+  `clear_lockout` and a successful `unlock_with_master` clear per-key
+  lockouts too. Off by default.
+- **Master-unlock backoff.** `with_master_unlock_backoff(base, max)`
+  refuses `unlock_with_master` attempts, without checking them, for
+  `base`, `2 * base`, ... up to `max` after each failure, with the new
+  `Error::RateLimited { retry_after }`. Attempts are serialized. Off by
+  default, because it makes a correct credential wait after a wrong one.
+- **The master verifier is keyed.** It was plain, unsalted
+  `BLAKE3(master)`; it is now `BLAKE3-keyed(k, master)` with a random
+  32-byte `k` per builder, kept in locked, dump-excluded memory, so a
+  copy of the digest alone cannot be used to guess the master offline.
+  The verifier is never exposed or persisted, so nothing changes for
+  callers.
+- **Keyed normalization (opt-in).** `with_keyed_normalization()` (random
+  key per vault; effective keys change every run) and
+  `with_normalization_key(key)` (stable with the same key) store
+  `BLAKE3-keyed(k, key)` instead of `BLAKE3(key)`. Plain BLAKE3 stays
+  the default: the normalized value is the effective key `with_key`
+  returns, and callers persist data under it, so changing the default
+  would change every key. That change is planned for 2.0.
+- **`KeychainFetch` never reached the OS keychain.** The crate depended
+  on `keyring` 3 without any store feature, and `keyring` then uses its
+  in-memory mock store on every platform, so every fetch failed with
+  "no such entry". `fetcher-keychain` now enables the native stores:
+  Keychain Services, Windows Credential Manager, and the Secret Service
+  over D-Bus on Linux and the BSDs (pure Rust, no `libdbus`). A test
+  checks the entry is not the mock credential.
+- **`FileFetch` checks the owner and the directories (Unix).** The file
+  must be owned by the process's effective user or root, and every
+  directory on the resolved path, plus the directory holding the path
+  as given (where a symlink would live), must be owned by that user or
+  root and not be writable by group or others unless sticky. The
+  resolved path must still lead to the opened file, so a swap after
+  `open` is reported. `skip_directory_check()` keeps the mode and owner
+  checks only. This rejects files that 1.0.x accepted when they sit in
+  a directory others can write.
+
+### Added
+
+- **`no_std` + `alloc` support**
+  ([#3](https://github.com/jamesgober/key-vault/issues/3)). With
+  `default-features = false` the crate is `#![no_std]`. The vault is
+  built with `KeyVaultBuilder::build_with_clock` and a caller-supplied
+  `Clock` (`build` does not exist without `std`, so forgetting the clock
+  is a compile error). Randomness comes from `getrandom`; on targets it
+  has no backend for, register an RNG with `key_vault::register_rng!`,
+  or linking fails. Spin locks replace `std::sync`, the registry is a
+  `BTreeMap`, and the `with_key` scratch buffer is allocated per call.
+  Fetchers, `monitor-tracing`, the `tee` module and
+  `AuditEvent::thread_id` need `std`. On hosted Unix and Windows targets
+  page locking, dump exclusion and page protection work without `std`.
+  A new CI job builds the library for `thumbv7em-none-eabihf` and runs
+  `tests/no_std_vault.rs` against the `no_std` build.
+- `Clock` trait and `StdClock`; `KeyVaultBuilder::build_with_clock`.
+  Lockout windows, per-key lockout expiry, backoff, and metadata and
+  audit timestamps come from the vault's clock.
+- `KeyVaultBuilder::with_fragmenter` selects any `FragmentStrategy` for
+  the vault (it always used `StandardFragmenter`). The default is
+  dispatched statically, so the hot path does not pay for the choice.
+- `KeyVaultBuilder::from_features()` configures a builder from the Cargo
+  features (see Changed).
+- For custom strategies: `RawKey::expose_secret`,
+  `Fragments::from_chunks`, `Fragments::chunk`,
+  `Fragments::layout_bytes` and `Fragments::total_len`. External crates
+  could not implement `FragmentStrategy` before.
+- `KeychainFetch::binary()` reads binary secrets with `get_secret`.
+- `FileFetch::skip_directory_check()`.
+- `VaultConfig` fields: `keyed_normalization`, `key_lockout_threshold`,
+  `key_lockout_window`, `key_lockout_duration`, `master_backoff_base`,
+  `master_backoff_max`, `page_protection`.
+- `LockoutScope` and `ThresholdContext::scope`: breach events say
+  whether the vault-wide or the per-key threshold fired. `LogMonitor`
+  logs it.
+- `Error::RateLimited { retry_after }`.
+- `KeyId` implements `PartialOrd` and `Ord`.
+
+### Changed
+
+- **The 20 reserved Cargo features have meaning or are deprecated.**
+  They never change what `KeyVaultBuilder::new()` builds, so existing
+  vaults behave the same. `fragment-*`, `decoy-*`, `codex`,
+  `codex-dynamic`, `monitor`, `audit` and the presets choose what
+  `KeyVaultBuilder::from_features()` sets up: the fragmenter (layered,
+  then random, then interleaved, then standard), the decoy on the
+  standard fragmenter (the strongest enabled: self-reference, then
+  key-derived, then random), a `DynamicCodex`, and with
+  `monitor-tracing` the `LogMonitor` / `LogAudit`. With the default
+  features that is the standard fragmenter with self-reference decoys,
+  which is what the 1.0 docs described. `mlock`, `zeroize`, `tee-detect`
+  and `post-quantum` are deprecated no-ops: page locking and
+  zeroization cannot be turned off, TEE detection is always compiled
+  with `std`, and `post-quantum` was informational.
+- The `fetcher-*` features and `monitor-tracing` imply `std`.
+- `LayeredFragmenter::defragment` no longer copies every chunk into a
+  new locked buffer (one `mlock` each) on every call; it hands the
+  sub-strategy a view of the same chunks, and it now implements the
+  allocation-free `defragment_into`.
+- `KeyVault`'s `Debug` output shows the fragmenter and whether a decoy
+  was ignored because a non-standard fragmenter is in use.
+- `blake3`, `subtle` and `libc` are used without default features, and
+  `arc-swap` only with `std`; `std` turns their `std` features back on.
+  `getrandom` enables its `custom` feature, which only takes effect on
+  targets without a `getrandom` backend.
+- The `TpmFetch` error message no longer calls itself "detection-only".
+
+### Fixed
+
+- `LayeredFragmenter` module docs claimed `log2(N)` bits of extra
+  uncertainty; the strategy index is stored in the clear in the layout.
+- `KeyId` docs said the counter saturates; it is a 64-bit counter that
+  cannot realistically wrap.
+
+---
+
 ## [1.0.2] - 2026-10-08
 
 No public API changes. `cargo semver-checks` against 1.0.1 reports no

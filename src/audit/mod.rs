@@ -34,6 +34,7 @@ use alloc::borrow::Cow;
 use alloc::string::String;
 use core::fmt;
 use core::time::Duration;
+#[cfg(feature = "std")]
 use std::thread::ThreadId;
 
 mod no_audit;
@@ -106,6 +107,7 @@ impl fmt::Display for AccessKind {
 pub struct AuditEvent {
     /// Time the event was emitted, expressed as a `Duration` since the
     /// Unix epoch. Same encoding used by [`KeyMetadata`](crate::KeyMetadata).
+    /// Comes from the vault's [`Clock`](crate::Clock).
     pub timestamp: Duration,
     /// Logical name of the key. For one-shot fragment/defragment
     /// operations (no registry entry) the value is the empty string.
@@ -114,7 +116,8 @@ pub struct AuditEvent {
     pub key_name: String,
     /// Operation discriminant.
     pub kind: AccessKind,
-    /// Thread that produced the event.
+    /// Thread that produced the event. Only in `std` builds.
+    #[cfg(feature = "std")]
     pub thread_id: ThreadId,
     /// Caller-supplied free-text label. Never includes key material.
     pub note: Cow<'static, str>,

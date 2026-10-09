@@ -6,14 +6,26 @@
 //! disk encryption (LUKS / FileVault / BitLocker) or decrypt the file
 //! yourself and pass the result to [`RawKey::new`].
 //!
-//! # Permission check
+//! # Permission checks (Unix)
 //!
-//! On Unix the file is opened once and the permission bits are read from
-//! the open handle (`fstat`), so the check and the read always refer to
-//! the same file even if the path is swapped (for example by a symlink
-//! replacement) in between. By default files readable or writable by group
-//! or others (any bit in `0o077`) are rejected. The check does not look at
-//! the file's owner or at the parent directory's permissions.
+//! The file is opened once and its mode and owner are read from the open
+//! handle (`fstat`), so the checks and the read always refer to the same
+//! file even if the path is swapped (for example by a symlink replacement)
+//! in between. By default:
+//!
+//! - files readable or writable by group or others (any bit in `0o077`)
+//!   are rejected;
+//! - the file must be owned by the user the process runs as (effective
+//!   uid) or by root (1.1);
+//! - every directory on the path, after symlinks are resolved, must be
+//!   owned by that user or root and must not be writable by group or
+//!   others unless it has the sticky bit (like `/tmp`); the directory
+//!   holding the path you gave (where a symlink would live) is checked the
+//!   same way (1.1). Otherwise another user could replace the key file.
+//!   The resolved path must still lead to the file that was opened.
+//!
+//! [`FileFetch::skip_directory_check`] turns off the directory check;
+//! [`FileFetch::allow_loose_perms`] turns off all of them.
 //!
 //! On Windows there is no permission check: NTFS ACLs are trusted as is.
 //!
@@ -67,6 +79,7 @@ use crate::error::Error;
 pub struct FileFetch {
     path: PathBuf,
     strict_perms: bool,
+    check_dirs: bool,
 }
 
 impl FileFetch {
@@ -77,10 +90,12 @@ impl FileFetch {
         Self {
             path: path.into(),
             strict_perms: true,
+            check_dirs: true,
         }
     }
 
-    /// Disable strict Unix permission checking.
+    /// Disable every Unix permission check: file mode, owner and
+    /// directories.
     ///
     /// Useful for test fixtures and containers where the user controlling
     /// the file is the same as the process user but the file may have
@@ -89,6 +104,18 @@ impl FileFetch {
     #[must_use]
     pub fn allow_loose_perms(mut self) -> Self {
         self.strict_perms = false;
+        self
+    }
+
+    /// Keep the file mode and owner checks but skip the directory check.
+    ///
+    /// For layouts where a directory on the path is legitimately writable
+    /// by a group (a shared deploy directory, for example) and you trust
+    /// every member of it. Anyone who can write a directory on the path can
+    /// replace the key file.
+    #[must_use]
+    pub fn skip_directory_check(mut self) -> Self {
+        self.check_dirs = false;
         self
     }
 
@@ -104,7 +131,15 @@ impl KeyFetch for FileFetch {
         // Open once. The permission check and the read both use this
         // handle, so they see the same file.
         let file = File::open(&self.path).map_err(|e| io_error(&self.path, &e))?;
-        read_checked(file, &self.path, self.strict_perms)
+        let checks = if self.strict_perms {
+            Checks {
+                file: true,
+                dirs: self.check_dirs,
+            }
+        } else {
+            Checks::NONE
+        };
+        read_checked(file, &self.path, checks)
     }
 
     fn describe(&self) -> Cow<'_, str> {
@@ -112,11 +147,31 @@ impl KeyFetch for FileFetch {
     }
 }
 
-/// Check permissions on the open `file` (if `strict`) and read it to the
-/// end.
-fn read_checked(mut file: File, path: &Path, strict: bool) -> Result<RawKey> {
-    if strict {
-        check_perms(&file, path)?;
+/// Which permission checks to run.
+#[derive(Debug, Clone, Copy)]
+struct Checks {
+    /// File mode and owner.
+    file: bool,
+    /// Directories on the path.
+    dirs: bool,
+}
+
+impl Checks {
+    #[cfg(all(test, unix))]
+    const ALL: Self = Self {
+        file: true,
+        dirs: true,
+    };
+    const NONE: Self = Self {
+        file: false,
+        dirs: false,
+    };
+}
+
+/// Run the permission checks on the open `file` and read it to the end.
+fn read_checked(mut file: File, path: &Path, checks: Checks) -> Result<RawKey> {
+    if checks.file {
+        check_perms(&file, path, checks.dirs)?;
     }
     read_to_end_wiping(&mut file, path)
 }
@@ -172,27 +227,98 @@ fn io_error(path: &Path, e: &std::io::Error) -> Error {
     }
 }
 
+/// `Error::Acquisition` from the file fetcher with the given reason.
 #[cfg(unix)]
-fn check_perms(file: &File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+fn rejected(reason: String) -> Error {
+    Error::Acquisition {
+        source: Cow::Borrowed("file"),
+        reason,
+    }
+}
+
+#[cfg(unix)]
+fn check_perms(file: &File, path: &Path, check_dirs: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = file.metadata().map_err(|e| io_error(path, &e))?;
     let mode = meta.permissions().mode();
     if (mode & 0o077) != 0 {
-        return Err(Error::Acquisition {
-            source: Cow::Borrowed("file"),
-            reason: format!(
-                "{} is too permissive (mode {:o}); expected 0600 or stricter",
-                path.display(),
-                mode & 0o777
-            ),
-        });
+        return Err(rejected(format!(
+            "{} is too permissive (mode {:o}); expected 0600 or stricter",
+            path.display(),
+            mode & 0o777
+        )));
+    }
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_owner(meta.uid(), euid, &path.display().to_string(), "file")?;
+    if check_dirs {
+        check_directories(path, &meta, euid)?;
+    }
+    Ok(())
+}
+
+/// The owner must be the effective user or root.
+#[cfg(unix)]
+fn check_owner(owner: u32, euid: u32, what: &str, kind: &str) -> Result<()> {
+    if owner == euid || owner == 0 {
+        Ok(())
+    } else {
+        Err(rejected(format!(
+            "{kind} {what} is owned by uid {owner}; expected uid {euid} (the process user) or root"
+        )))
+    }
+}
+
+/// Check one directory on the key file's path.
+#[cfg(unix)]
+fn check_directory(dir: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(dir).map_err(|e| io_error(dir, &e))?;
+    check_owner(meta.uid(), euid, &dir.display().to_string(), "directory")?;
+    let mode = meta.permissions().mode();
+    let writable_by_others = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if writable_by_others && !sticky {
+        return Err(rejected(format!(
+            "directory {} is writable by group or others (mode {:o}), so the key file could be replaced",
+            dir.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Check every directory on the resolved path, plus the directory that
+/// holds the path as given (where a symlink to the key would live), and
+/// make sure the resolved path still leads to the opened file.
+#[cfg(unix)]
+fn check_directories(path: &Path, opened: &std::fs::Metadata, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let resolved = std::fs::canonicalize(path).map_err(|e| io_error(path, &e))?;
+    let current = std::fs::metadata(&resolved).map_err(|e| io_error(path, &e))?;
+    if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
+        return Err(rejected(format!(
+            "{} changed while it was being checked",
+            path.display()
+        )));
+    }
+    for dir in resolved.ancestors().skip(1) {
+        check_directory(dir, euid)?;
+    }
+    let given_parent = std::path::absolute(path)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    if let Some(parent) = given_parent {
+        if Some(parent.as_path()) != resolved.parent() {
+            check_directory(&parent, euid)?;
+        }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // matches the Unix sibling's signature.
-fn check_perms(_file: &File, _path: &Path) -> Result<()> {
+fn check_perms(_file: &File, _path: &Path, _check_dirs: bool) -> Result<()> {
     // Windows ACL inspection is non-trivial and platform-specific. For 1.0
     // we trust the OS-level access controls. Users who need additional
     // verification on Windows should layer it on top of FileFetch.
@@ -337,11 +463,21 @@ mod tests {
         std::fs::set_permissions(evil.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let handle = File::open(good.path()).unwrap();
+        let second = File::open(good.path()).unwrap();
         // Replace the path's target after opening.
         std::fs::rename(evil.path(), good.path()).unwrap();
 
-        let raw = read_checked(handle, good.path(), true).unwrap();
+        let file_checks = Checks {
+            file: true,
+            dirs: false,
+        };
+        let raw = read_checked(handle, good.path(), file_checks).unwrap();
         assert_eq!(raw.as_bytes(), b"checked-key");
+
+        // With the directory check (the default), the swap itself is
+        // noticed: the path no longer leads to the file that was opened.
+        let err = read_checked(second, good.path(), Checks::ALL).unwrap_err();
+        assert!(format!("{err}").contains("changed while it was being checked"));
 
         // A fresh fetch sees the swapped-in, too-permissive file and
         // rejects it.
@@ -349,6 +485,87 @@ mod tests {
             .fetch(&FetchContext::new("k"))
             .unwrap_err();
         assert!(matches!(err, Error::Acquisition { .. }));
+    }
+
+    /// A key file in a directory that others can write is rejected: they
+    /// could replace it. `skip_directory_check` accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn directory_writable_by_others_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kv_test_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("key.bin");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = FileFetch::new(&file)
+            .fetch(&FetchContext::new("k"))
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("writable by group or others"),
+            "{err}"
+        );
+        assert_eq!(
+            FileFetch::new(&file)
+                .skip_directory_check()
+                .fetch(&FetchContext::new("k"))
+                .unwrap()
+                .len(),
+            6
+        );
+
+        // Sticky world-writable (like /tmp) is fine: others cannot rename
+        // or delete files they do not own.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(FileFetch::new(&file).fetch(&FetchContext::new("k")).is_ok());
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(FileFetch::new(&file).fetch(&FetchContext::new("k")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner check accepts the process user and root only.
+    #[cfg(unix)]
+    #[test]
+    fn owner_must_be_process_user_or_root() {
+        assert!(check_owner(1000, 1000, "f", "file").is_ok());
+        assert!(check_owner(0, 1000, "f", "file").is_ok());
+        let err = check_owner(1001, 1000, "/k", "file").unwrap_err();
+        assert!(format!("{err}").contains("owned by uid 1001"));
+    }
+
+    /// A symlink in a directory others can write is rejected even when the
+    /// target directory is private: the link itself could be re-pointed.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_in_open_directory_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("kv_test_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let private = base.join("private");
+        let open = base.join("open");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = private.join("key.bin");
+        std::fs::write(&target, b"secret").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = open.join("key.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(FileFetch::new(&link).fetch(&FetchContext::new("k")).is_ok());
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            FileFetch::new(&link)
+                .fetch(&FetchContext::new("k"))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

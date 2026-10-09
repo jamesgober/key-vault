@@ -35,6 +35,32 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  # `no_std` + `alloc`: build the library for a bare-metal target (no OS,
+  # no getrandom backend, no 64-bit atomics) and run the vault without
+  # `std` on the host.
+  no-std:
+    name: no_std
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: thumbv7em-none-eabihf
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-std-${{ matrix.rust }}
+      # `+toolchain` so the matrix toolchain (which has the target) is used
+      # rather than the one pinned in rust-toolchain.toml.
+      - run: cargo +${{ matrix.rust }} build --lib --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo +${{ matrix.rust }} clippy --lib --no-default-features --target thumbv7em-none-eabihf -- -D warnings
+      - run: cargo +${{ matrix.rust }} test --no-default-features --test no_std_vault
+
   # Supply-chain checks. REPS §Dependency Management requires both
   # `cargo audit` (RustSec advisory database) and `cargo deny check`
   # (license / source / version policy) in CI. We use

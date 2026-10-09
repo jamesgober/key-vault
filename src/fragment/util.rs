@@ -4,7 +4,6 @@
 //! These are all crate-private; they are not part of the public API.
 
 use crate::Result;
-use crate::error::Error;
 
 /// Inclusive uniform sample from `[min, max]` using the OS CSPRNG.
 ///
@@ -29,12 +28,7 @@ pub(crate) fn sample_range(min: usize, max: usize) -> Result<usize> {
     Ok(min + reduced_usize)
 }
 
-/// Single 64-bit draw from the OS CSPRNG.
-pub(crate) fn random_u64() -> Result<u64> {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).map_err(|_| Error::Internal("OS RNG failed"))?;
-    Ok(u64::from_le_bytes(buf))
-}
+pub(crate) use crate::rng::random_u64;
 
 /// In-place Fisher-Yates shuffle backed by [`random_u64`].
 ///

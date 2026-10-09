@@ -75,6 +75,7 @@ impl SecurityMonitor for LogMonitor {
             failures_in_window = ctx.failures_in_window,
             window_ms = window_ms,
             lockout_triggered = ctx.lockout_triggered,
+            scope = ?ctx.scope,
             "threshold breach",
         );
     }

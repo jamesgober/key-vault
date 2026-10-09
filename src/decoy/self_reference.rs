@@ -25,8 +25,9 @@ use crate::fetcher::RawKey;
 /// from decoy directly.
 ///
 /// No decoy is used unless one is passed to
-/// [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy);
-/// the `decoy-*` Cargo features do not enable one.
+/// [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy),
+/// or the `decoy-self-ref` feature (on by default) is on and the vault is
+/// built with [`KeyVaultBuilder::from_features`](crate::KeyVaultBuilder::from_features).
 ///
 /// # Why not just shuffle key bytes?
 ///
@@ -70,7 +71,7 @@ impl DecoyStrategy for SelfReferenceDecoy {
         // entropy to index into a key of any practical size).
         let rand_byte_count = output_len.saturating_mul(4);
         let mut rand_buf = vec![0u8; rand_byte_count];
-        getrandom::getrandom(&mut rand_buf).map_err(|_| Error::Internal("OS RNG failed"))?;
+        crate::rng::fill(&mut rand_buf)?;
 
         let key_len = key_bytes.len();
         // `out` holds bytes copied from the key. Keep it in a zeroizing

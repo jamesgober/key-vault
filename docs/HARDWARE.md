@@ -102,7 +102,7 @@ let handle = vault.register("session", raw).unwrap();
 These are explicitly **out of scope for 1.0** but tracked in
 `.dev/ROADMAP.md` for future minor releases.
 
-### Phase 1.1 — TPM 2.0 first integration
+### Later 1.x — TPM 2.0 first integration
 
 - TPM-backed sealing via `tss-esapi`. The vault would accept a TPM
   handle + PCR policy at registration and unseal during `with_key`.

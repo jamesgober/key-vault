@@ -53,12 +53,15 @@ zero-on-drop byte buffer — until the caller's scoped callback returns.
 | `src/codex/` | `Codex` trait + 4 implementations | external |
 | `src/monitor/` | `SecurityMonitor` trait + `NoMonitor` / `LogMonitor` / `CompositeMonitor` | external |
 | `src/audit/` | `AuditSink` trait + `AuditEvent` + `AccessKind` + `NoAudit` / `LogAudit` | external |
-| `src/tee/` | TEE detection per architecture | external |
+| `src/tee/` | TEE detection per architecture (`std` only) | external |
+| `src/clock.rs` | `Clock` trait, `StdClock` | external |
+| `src/rng.rs` | Randomness through `getrandom`, `register_rng!` | external (macro) |
 | `src/handle.rs` | `KeyHandle`, `KeyId`, the constant-time equality contract | external |
 | `src/error.rs` | `Error` enum, `Result<T>` alias | external |
 | `src/metadata.rs` | `KeyMetadata`, `AlgorithmHint` | external |
-| `src/memory/` | `LockedBytes`, `mlock` / `VirtualLock` wrappers | `pub(crate)` |
-| `src/normalize.rs` | BLAKE3 key normalisation helper | `pub(crate)` |
+| `src/memory/` | `LockedBytes`, the page table (lock + dump exclusion), `GuardedRegion` (page protection), OS shims | `pub(crate)` |
+| `src/normalize.rs` | Plain and keyed BLAKE3 normalisation helpers | `pub(crate)` |
+| `src/sync.rs` | `Mutex` (std or spin lock), `no_std` registry cell | `pub(crate)` |
 
 ---
 
@@ -73,29 +76,36 @@ cheap (atomic refcount). Reads are lock-free through `ArcSwap`; writes
 
 ```rust
 struct VaultInner {
-    keys: ArcSwap<HashMap<KeyId, KeyEntry>>,
+    keys: ArcSwap<HashMap<KeyId, KeyEntry>>,   // no_std: spin-locked Arc<BTreeMap>
     writer: Mutex<()>,
     config: VaultConfig,
+    fragmenter: Fragmenter,          // Standard (static dispatch) or Arc<dyn FragmentStrategy>
+    normalizer: Normalizer,          // off, plain BLAKE3, or keyed BLAKE3 (key in locked memory)
     codex: Option<Arc<dyn Codex>>,
-    fragmenter: StandardFragmenter,
     monitor: Arc<dyn SecurityMonitor>,
     audit: Arc<dyn AuditSink>,
-    master_hash: Option<Zeroizing<[u8; 32]>>,
-    failure_tracker: Mutex<HashMap<String, VecDeque<Instant>>>,
-    locked_out: AtomicBool,
+    clock: Arc<dyn Clock>,           // StdClock, or the caller's without std
+    master: Option<MasterVerifier>,  // random hash key + keyed digest, locked
+    master_backoff: Mutex<Backoff>,
+    failure_tracker: Mutex<BTreeMap<String, VecDeque<Duration>>>,  // clock time
+    locked_out: AtomicBool,                            // vault-wide lockout
+    key_locks: Mutex<BTreeMap<String, Option<Duration>>>,  // per-key lockout
+    key_locks_active: AtomicUsize,                     // lets with_key skip key_locks
 }
 
 struct KeyEntry {
     name: String,
-    fragments: Arc<Fragments>,
+    fragments: Fragments,            // shares an Arc'd store; may own a protected region
     metadata: KeyMetadata,
 }
 ```
 
 **Hot path** (`with_key`): load the `ArcSwap` snapshot, look up the
-entry, clone the `Arc<Fragments>`, drop the snapshot, defragment into
-the thread-local scratch buffer (page-locked, zeroed after every call),
-run the user closure, optionally emit an audit event.
+entry, check the per-key lockout (one atomic load when no key is locked
+out), take a reference to the fragments, drop the snapshot, open the
+protected region if there is one, defragment into the thread-local
+scratch buffer (page-locked, dump-excluded, zeroed after every call),
+close the region, run the user closure, optionally emit an audit event.
 
 **Write path** (`register` / `rotate` / `unregister`): fragment the new
 key outside any lock, then take the writer mutex, load the current map,
@@ -130,11 +140,22 @@ correctly.
 
 ### `src/memory/` — Layer 2 + 7
 
-`LockedBytes` wraps a `Vec<u8>`, calls `mlock`/`VirtualLock` on
-construction, and unmlocks + volatile-zeroes the bytes on drop. The
-Unix and Windows backends live in `unix.rs` and `windows.rs`
-respectively; `mod.rs` exposes a single `LockedBytes` type that
-selects the right backend via `#[cfg(unix)]` / `#[cfg(windows)]`.
+`LockedBytes` takes a block from the page pool (`pool.rs`) when it is
+2048 bytes or smaller: pool pages are mapped by the crate, locked and
+excluded from dumps once, and kept for the life of the process.
+Larger buffers own an exact-size heap buffer, and a page-protected
+key's buffers point into its `GuardedRegion`. A heap buffer takes a
+reference on every page it touches in a process-wide page table; a page
+is locked (`mlock` / `VirtualLock`) and excluded from dumps
+(`MADV_DONTDUMP` / `MADV_NOCORE` / WER) when its count goes from 0 to 1,
+and released when it returns to 0. On drop the bytes are zeroed first,
+then the references are released. The Unix and Windows backends live in
+`unix.rs` and `windows.rs`.
+
+`GuardedRegion` (`guarded.rs`) is a private mapping per protected key:
+locked (not on Windows), excluded from dumps, `PROT_NONE` /
+`PAGE_NOACCESS` except while a `RegionAccess` guard is alive, zeroed and
+unmapped on drop.
 
 `LockedBytes::is_locked()` reports whether mlock was actually
 permitted (containers and unprivileged contexts may have

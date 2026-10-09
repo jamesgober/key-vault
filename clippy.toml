@@ -47,6 +47,8 @@ doc-valid-idents = [
     "HiveDB",
     "CSPRNG",
     "OSes",
+    "DragonFly",
+    "FreeBSD",
     # OS-level disk encryption + credential stores
     "FileVault",
     "BitLocker",

@@ -19,6 +19,8 @@
 | `x86_64-apple-darwin` | 1 | Full CI: stable + 1.85, fmt + clippy + test + doc |
 | `aarch64-apple-darwin` | 1 | Full CI: stable + 1.85, fmt + clippy + test + doc |
 | `aarch64-unknown-linux-gnu` | 2 | Compiles on the matrix; no runtime CI runner available |
+| `thumbv7em-none-eabihf` (`no_std`) | 2 | CI builds and lints the library without `std` on stable + 1.85; the vault's `no_std` code paths run on the Linux host |
+| `x86_64-unknown-freebsd` | 3 | Checked locally before releases; no CI runner |
 
 Tier-1 targets run the full test + bench suite on every push. Tier-2
 compiles but does not run tests under CI; promote when runner capacity
@@ -26,7 +28,7 @@ allows.
 
 ---
 
-## Layer 2 (page locking) — per platform
+## Layer 2 (page locking and dump exclusion) — per platform
 
 ### Linux
 
@@ -47,6 +49,19 @@ allows.
   `LimitMEMLOCK=infinity`. For container workloads add
   `--ulimit memlock=-1` (Docker) or the equivalent
   `securityContext.capabilities.add: ["IPC_LOCK"]` (Kubernetes).
+- Since 1.1, buffers up to 2048 bytes come from a pool of `mmap`'d
+  pages that are locked and excluded once and kept for the life of the
+  process; larger buffers use the heap and the reference count above.
+- Dump exclusion (1.1): `madvise(MADV_DONTDUMP)` on every page that
+  holds key material (pool pages when mapped, heap pages through the
+  reference count, with `MADV_DODUMP` when the last buffer on a heap
+  page is gone). Visible as
+  `dd` in the mapping's `VmFlags` in `/proc/<pid>/smaps`; the unit
+  tests check it. Core dumps written by the kernel (and by
+  `systemd-coredump`, which reads them from the kernel) leave these
+  pages out. `gcore` and debuggers read memory directly and do not.
+- Android uses the same calls. FreeBSD and DragonFly use
+  `MADV_NOCORE` / `MADV_CORE`.
 
 ### macOS
 
@@ -57,6 +72,9 @@ allows.
 - No `/proc/self/status` analogue, so the `mlock_verified` test is
   cfg-gated to Linux only. Functional behaviour is the same; what
   changes is the in-tree proof, not the syscall.
+- No dump exclusion: macOS has no per-page way to keep memory out of a
+  core dump. Core dumps are off by default on macOS (`ulimit -c 0`);
+  keep them off on machines that hold keys.
 
 ### Windows
 
@@ -68,9 +86,48 @@ allows.
   limit. The crate does not call it — downstream consumers with very
   large vaults may need to raise the limit from a privileged
   bootstrap step.
+- Dump exclusion (1.1): `WerRegisterExcludedMemoryBlock` on every page
+  that holds key material, so Windows Error Reporting crash dumps leave
+  them out. The function is looked up at run time (it exists from
+  Windows 10 1709); on older systems the exclusion is skipped. WER
+  keeps at most 512 excluded blocks per process; pages beyond that are
+  not excluded until earlier ones are released. Dumps taken with
+  Task Manager, procdump, a debugger or `MiniDumpWriteDump` are not
+  affected.
 - BitLocker / TPM-backed full-disk encryption is the right
   complementary layer here. `VirtualLock` covers swap; BitLocker
-  covers hibernation files and crash dumps.
+  covers hibernation files, the page file and any dump that is
+  written.
+
+## Layer 10 (page protection) — per platform
+
+Opt-in with `KeyVaultBuilder::with_page_protection(true)` (1.1).
+
+| | Linux | macOS | Windows |
+|-|-------|-------|---------|
+| Mapping | `mmap` anonymous | `mmap` anonymous | `VirtualAlloc` |
+| Between reads | `PROT_NONE` | `PROT_NONE` | `PAGE_NOACCESS` |
+| While read | `PROT_READ` | `PROT_READ` | `PAGE_READONLY` |
+| Locked while inaccessible | yes (`mlock`) | yes (`mlock`) | **no**: `PAGE_NOACCESS` drops a `VirtualLock` |
+| Dump exclusion | `MADV_DONTDUMP` | none | WER (one block per key) |
+| Page size per key | 4 KiB | 16 KiB (Apple Silicon), 4 KiB (Intel) | 4 KiB (64 KiB of address space) |
+
+On Windows a protected key can be paged out while it is inaccessible;
+keep the page file encrypted (BitLocker on the system drive, or
+`fsutil behavior set EncryptPagingFile 1`) if you turn page protection
+on there. The unit tests check the mapping state (`/proc/self/maps`,
+`VirtualQuery`) and that reading a protected key in a child process
+crashes it.
+
+## `no_std` targets
+
+Without `std` the crate builds for bare metal (`thumbv7em-none-eabihf`
+in CI). There is no OS: no swap, no core dump, no page protection, so
+`LockedBytes` is plain zero-on-drop memory there. The application
+supplies the clock (`build_with_clock`) and, where `getrandom` has no
+backend, the RNG (`register_rng!`). On hosted targets (Linux, macOS,
+Windows) built without `std`, locking, dump exclusion and page
+protection still work.
 
 ### What no platform protects
 
@@ -89,8 +146,8 @@ allows.
 | Fetcher | Linux | macOS | Windows | Notes |
 |---------|:-----:|:-----:|:-------:|-------|
 | `EnvFetch` | ✅ | ✅ | ✅ | Always available (feature `fetcher-env`) |
-| `FileFetch` | ✅ | ✅ | ✅ | Feature `fetcher-file`. Reads a plaintext file. Unix permission check (`0o600`, read from the open handle) is `#[cfg(unix)]`-gated; Windows skips the check (use NTFS ACLs) |
-| `KeychainFetch` | ✅ | ✅ | ✅ | Via the `keyring` crate (feature `fetcher-keychain`). Linux → Secret Service over D-Bus (GNOME Keyring / KWallet); macOS → Keychain Services; Windows → Credential Manager |
+| `FileFetch` | ✅ | ✅ | ✅ | Feature `fetcher-file`. Reads a plaintext file. Unix checks (mode `0o600`, owner, directories on the path) are `#[cfg(unix)]`-gated; Windows skips them (use NTFS ACLs) |
+| `KeychainFetch` | ✅ | ✅ | ✅ | Via the `keyring` crate (feature `fetcher-keychain`). Linux → Secret Service over D-Bus (GNOME Keyring / KWallet), pure Rust; macOS → Keychain Services; Windows → Credential Manager. Before 1.1 no store feature was enabled and `keyring` used its in-memory mock on every platform |
 | `TpmFetch` | not implemented | not implemented | not implemented | `fetch` always returns `Error::Acquisition`. Nothing in the crate detects or talks to a TPM |
 
 ### Linux keychain specifics
@@ -162,6 +219,10 @@ The Tier-1 targets run a six-cell matrix:
 Each cell runs `cargo fmt --check`, `cargo clippy -D warnings`,
 `cargo test --all-features`, and `cargo doc -D warnings`.
 
+A `no_std` job (stable and 1.85.0) builds and lints the library for
+`thumbv7em-none-eabihf` and runs `tests/no_std_vault.rs` against the
+`no_std` build.
+
 A separate `supply-chain` job runs `cargo audit` and `cargo deny check`
 on Linux only — REPS-required and feeds the
 [RustSec advisory database](https://rustsec.org) into the gate.
@@ -180,10 +241,12 @@ gotchas if you cross-compile from one host to another:
   Security framework — cross-compiling against the system framework
   requires the macOS SDK headers. Easiest path: build natively on
   macOS or use a Cirrus / GitHub Actions macOS runner.
-- **From any host to musl Linux**: `keyring` pulls in `dbus` which
-  expects glibc; leave the `fetcher-keychain` feature off (it is not
-  a default feature) for static musl targets. Keep `std` enabled: the
-  crate requires it.
+- **From any host to musl Linux**: since 1.1 the Linux keychain
+  backend is pure Rust (`zbus`), so `fetcher-keychain` no longer needs
+  `libdbus`. A Secret Service daemon is still needed at run time.
+- **To bare metal**: build with `default-features = false` and register
+  an RNG with `register_rng!` if `getrandom` has no backend for the
+  target.
 
 ---
 

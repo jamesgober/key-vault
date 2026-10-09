@@ -147,7 +147,7 @@ impl TeeCapabilities {
     /// Returns `true` if at least one probe positively confirmed a TEE.
     ///
     /// `Unknown` does not count. See the module docs for how weak some of
-    /// the individual signals are; key-vault 1.0.x has no hardware-backed
+    /// the individual signals are; key-vault has no hardware-backed
     /// fetcher to switch to.
     #[must_use]
     pub fn any_detected(self) -> bool {

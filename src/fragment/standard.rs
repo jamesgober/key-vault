@@ -273,7 +273,7 @@ impl FragmentStrategy for StandardFragmenter {
 
     fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
         let n_chunks = fragments.chunk_count();
-        let layout = fragments.layout().as_bytes();
+        let layout = fragments.layout_bytes();
         let total_len = fragments.total_len();
         if layout.len() != n_chunks * 4 {
             return Err(Error::Defragment(alloc::string::ToString::to_string(
@@ -434,7 +434,7 @@ mod tests {
         // identical chunk counts is astronomically small. Treat a match
         // as a strong signal of broken randomness rather than coincidence.
         let same_count = a.chunk_count() == b.chunk_count();
-        let same_layout = same_count && a.layout().as_bytes() == b.layout().as_bytes();
+        let same_layout = same_count && a.layout_bytes() == b.layout_bytes();
         assert!(
             !(same_count && same_layout),
             "two consecutive fragmentations produced the same layout"

@@ -5,7 +5,7 @@
 </h1>
 
 <p align="center">
-    <i>Performance contract verification for <code>key-vault</code> 1.0.0.</i>
+    <i>Performance contract verification for <code>key-vault</code> 1.0.0, updated for 1.1.0.</i>
     <br>
     <i>Companion to <a href="./SECURITY.md">SECURITY.md</a> and <a href="./API.md">API.md</a>.</i>
 </p>
@@ -22,13 +22,12 @@ typical key sizes and stays under 500ns at 256 bytes. Construction is
 sub-microsecond. Concurrent read throughput scales out to the host's
 physical core count without lock contention.
 
-The slow operations are the ones that touch `mlock` / `VirtualLock`
-under the hood — `fragment` and (by extension) `register` and
-`rotate`. They sit in the **single-digit-microsecond per byte** range
-because every chunk gets its own page-locked allocation. This is the
-documented trade-off of Layer 2 (page locking) plus Layer 3
-(fragmentation) plus Layer 7 (zero-on-drop): you pay setup cost so
-**access** cost stays cheap.
+The slow operations are `fragment` and (by extension) `register` and
+`rotate`. Before 1.1 every chunk was a separate heap allocation whose
+page was locked and released with system calls; since 1.1 small chunks
+come from a pool of pre-locked pages, which made `register` and
+`rotate` 4-8x faster (1 µs for a 16-byte key). The 1.1 comparison is in
+"Opt-in layers (1.1)" under §4.
 
 ---
 
@@ -183,9 +182,9 @@ against 10 concurrent rotations; readers never block on the
 ### Fragment strategies (`fragment_strategies.rs`)
 
 `fragment` / `defragment` driven via `FragmentStrategy` trait
-directly. (The vault itself routes everything through
-`StandardFragmenter` today; the other strategies are usable but
-caller-driven.)
+directly. Since 1.1 any of them can be the vault's fragmenter
+(`KeyVaultBuilder::with_fragmenter`); see "Opt-in layers (1.1)" for the
+vault-level numbers.
 
 | Strategy | fragment 16 B | fragment 256 B | defragment 16 B | defragment 256 B |
 |----------|--------------|----------------|-----------------|------------------|
@@ -256,6 +255,10 @@ timing.)
 | `KeyVaultBuilder::with_decoy(...)` | Adds decoy chunks to every `fragment`. Cost is in fragment/register, not defragment/with_key. | no decoy |
 | `KeyVaultBuilder::with_audit_sink(...)` | Routes every op through the sink. `NoAudit` (default) is a single virtual call per op; custom sinks pay whatever the sink does. | `NoAudit` |
 | `KeyVaultBuilder::with_monitor(...)` | Routes failure / anomaly events. Zero cost on the success path. | `NoMonitor` |
+| `KeyVaultBuilder::with_page_protection(true)` (1.1) | Two protection changes per `with_key` (~1.5 µs on Linux) and one page per key. Register maps a page per key. | off |
+| `KeyVaultBuilder::with_key_lockout(..)` (1.1) | One atomic load per `with_key` while no key is locked out (always paid, ~0 ns); a mutex + map lookup while any key is locked out. | off |
+| `KeyVaultBuilder::with_keyed_normalization()` (1.1) | Keyed instead of plain BLAKE3 at register time; nothing on `with_key`. | off |
+| `KeyVaultBuilder::with_fragmenter(..)` (1.1) | The default `StandardFragmenter` is dispatched statically; any other strategy costs one virtual call per `with_key` plus its own defragment time. | standard |
 
 ### Where the time goes
 
@@ -314,20 +317,58 @@ unavoidable as long as sinks consume owned event records; an
 release if the trade-off becomes load-bearing for a downstream
 consumer.
 
-### What we *did not* tune for 0.10
+### Opt-in layers (1.1)
 
-- **Layer 10 page-protection toggling** (`PROT_NONE` between accesses)
-  is **not implemented** (as of 1.0.2 there is no `mprotect` /
-  `VirtualProtect` call anywhere in the crate). If it is added it would
-  cost an `mprotect` syscall per `with_key`, roughly 2-5 µs depending on
-  platform, and would be opt-in.
-- **Zero-allocation hot path** (`dhat`-verified) is deferred to
-  Phase 0.11 (security hardening), which is where the static
-  allocation profile lives alongside the fuzz work.
-- **`mlock` syscall pooling**. Each fragment chunk currently mlocks
-  its own page. A page-pool allocator could amortize this across
-  many registrations. Deferred — measured the cost honestly here so
-  we know the budget.
+Measured on Linux (WSL2, 4 pinned cores of a busy 32-core host),
+1.0.2 and 1.1.0 benchmarked in alternating rounds; each number is the
+best of three rounds. Absolute numbers on a quiet machine are lower;
+compare the columns.
+
+| Benchmark | 1.0.2 | 1.1.0 |
+|-----------|-------|-------|
+| `with_key/no_codex` 16 / 32 / 64 / 256 B | 34.6 / 42.0 / 56.5 / 167 ns | 33.9 / 41.2 / 55.4 / 157 ns |
+| `with_key/with_codex` 32 / 256 B | 71.7 / 426 ns | 66.9 / 432 ns |
+| `register/no_codex` 16 / 32 / 64 / 256 B | 5.4 / 18.6 / 39.8 / 99.8 µs | 1.0 / 2.2 / 4.0 / 16.2 µs |
+| `rotate/no_codex` 16 / 32 B | 5.3 / 20.4 µs | 1.1 / 2.2 µs |
+| `one_shot/defragment` 16 / 256 B | 37.5 / 189 ns | 39.2 / 192 ns |
+| `vault_construction/default` | 119 ns | 119 ns |
+| `concurrent_reads` 1 / 16 / 64 threads | 142 µs / 1.25 ms / 7.41 ms | 146 µs / 1.28 ms / 7.43 ms |
+| `reads_during_rotation` (4 readers, 1 rotator) | 521 µs | 295 µs |
+
+`register` and `rotate` are 4-8x faster because small key buffers come
+from the page pool instead of locking and releasing heap pages one
+system call at a time. `with_key` is unchanged within noise; the new
+checks it makes when the options are off (per-key lockout, page
+protection) are one atomic load and one branch.
+
+Opt-in costs (1.1.0, same machine):
+
+| Benchmark | 32 B | 256 B |
+|-----------|------|-------|
+| `with_key` with page protection | 1.42 µs | 1.58 µs |
+| `register` with page protection | 9.0 µs | 24.5 µs |
+| `with_key` with `LayeredFragmenter` | 49 ns | 163 ns |
+| `register` with keyed normalization | 2.2 µs | — |
+
+Page protection costs two `mprotect` calls per `with_key` and one
+`mmap` + `mlock` + `madvise` + `mprotect` per registered key.
+`LayeredFragmenter` used to copy every chunk into a new locked buffer on
+each read; it now reads the chunks in place.
+
+### Page pool (1.1)
+
+Buffers of up to 2048 bytes come from pages the crate maps, locks and
+excludes from dumps once. Before 1.1 each small buffer sat on a general
+heap page that was locked (and, in 1.1, excluded) on first use and
+released when the last buffer on it was dropped, which cost system
+calls on every register / rotate / unregister. With the pool, steady
+state register and rotate make no system calls.
+
+### What is still not tuned
+
+- **Page protection** makes two `mprotect` / `VirtualProtect` calls per
+  `with_key`. Readers of the same key share one open window, but each
+  call still pays the pair when it is the only reader.
 
 ---
 
@@ -339,7 +380,7 @@ what to expect, not as defects to fix.
 
 | Operation | Cost | Why |
 |-----------|------|-----|
-| `register` (any size) | 6–105 µs | Every fragment chunk = one mlock + one allocation + Fisher-Yates shuffle of the layout. The cost scales linearly with key size and inversely with `with_chunk_range` max. |
+| `register` (any size) | see §3 | Every fragment chunk = one pool block (or heap allocation + page reference above 2048 bytes) + Fisher-Yates shuffle of the layout. The cost scales linearly with key size and inversely with `with_chunk_range` max. |
 | `rotate` | same as `register` | Rotation is "fragment new key" + "atomic ArcSwap swap-in". The fragmentation cost is the same; the swap is single-digit nanoseconds. |
 | `fragment` (one-shot) | 6–110 µs | Same fragmentation cost as `register`, minus the registry insert. |
 | `DynamicCodex::new` | ~10 µs | Generates a 256-byte involution via CSPRNG with no fixed points, then mlocks the table. One-time per vault. |

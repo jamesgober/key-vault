@@ -76,9 +76,18 @@ pub enum Error {
     /// recovery condition is met.
     LockedOut,
 
-    /// Acquiring or releasing OS-level memory page locks (mlock / VirtualLock)
-    /// failed. This typically means the process has hit its memlock rlimit and
-    /// the operator must raise it.
+    /// A master-key unlock attempt was refused without being checked
+    /// because the previous attempt failed too recently. Configured with
+    /// [`KeyVaultBuilder::with_master_unlock_backoff`](crate::KeyVaultBuilder::with_master_unlock_backoff).
+    RateLimited {
+        /// How long until the next attempt will be checked.
+        retry_after: core::time::Duration,
+    },
+    /// A memory-protection operation failed: mapping or protecting the
+    /// private region of a page-protected key
+    /// (`KeyVaultBuilder::with_page_protection`).
+    /// Page *locking* failures are not errors; they leave the buffer
+    /// unlocked.
     MemoryLock(String),
 
     /// The configuration passed to the [`KeyVaultBuilder`](crate::KeyVaultBuilder)
@@ -102,6 +111,11 @@ impl fmt::Display for Error {
             Self::Decoy(reason) => write!(f, "decoy generation failed: {reason}"),
             Self::Codex(reason) => write!(f, "codex transformation failed: {reason}"),
             Self::LockedOut => f.write_str("vault is locked out by security monitor threshold"),
+            Self::RateLimited { retry_after } => write!(
+                f,
+                "master unlock attempt refused; retry in {} ms",
+                retry_after.as_millis()
+            ),
             Self::MemoryLock(reason) => write!(f, "memory lock operation failed: {reason}"),
             Self::InvalidConfig(reason) => write!(f, "invalid vault configuration: {reason}"),
             Self::Internal(reason) => write!(f, "internal vault invariant violated: {reason}"),
@@ -109,8 +123,9 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+// `core::error::Error` is the same trait as `std::error::Error` (Rust
+// 1.81+), so this covers std builds too.
+impl core::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +159,9 @@ mod tests {
             Error::Decoy("x".to_string()),
             Error::Codex("x".to_string()),
             Error::LockedOut,
+            Error::RateLimited {
+                retry_after: core::time::Duration::from_millis(5),
+            },
             Error::MemoryLock("x".to_string()),
             Error::InvalidConfig("x".to_string()),
             Error::Internal("x"),

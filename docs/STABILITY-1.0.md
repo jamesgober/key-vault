@@ -94,13 +94,13 @@ The following feature names are frozen. New features may be added in
 `MINOR` releases; existing features may not be renamed or removed
 without a `MAJOR`.
 
-Frozen names do not mean every feature does something. In 1.0.x only
-`std`, the `fetcher-*` features and `monitor-tracing` change what is
-compiled. `mlock`, `zeroize`, `fragment-*`, `decoy-*`, `codex`,
-`codex-dynamic`, `monitor`, `audit`, `tee-detect`, `post-quantum` and the
-`preset-*` features are **reserved and have no effect**: page locking
-and zeroization are always on, and decoys / codex are configured on
-`KeyVaultBuilder`. See `docs/API.md` for the table.
+Since 1.1 the `fragment-*`, `decoy-*`, `codex*`, `monitor`, `audit`
+and `preset-*` features choose what `KeyVaultBuilder::from_features()`
+configures; they never change `KeyVaultBuilder::new()`. `mlock`,
+`zeroize`, `tee-detect` and `post-quantum` are deprecated no-ops (page
+locking and zeroization cannot be turned off) and stay so that existing
+feature lists keep building. Turning `std` off gives a `no_std` +
+`alloc` build. See `docs/API.md` for the table.
 
 ```toml
 default = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]

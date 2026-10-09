@@ -8,8 +8,9 @@
 //! This is **obfuscation**. The layout map that marks every decoy chunk is
 //! stored in the same process memory as the chunks, so anyone who can read
 //! process memory can separate them. No decoy is used unless one is passed
-//! to [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy);
-//! the `decoy-*` Cargo features are reserved and have no effect in 1.0.x.
+//! to [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy),
+//! or a `decoy-*` feature is on and the vault is built with
+//! [`KeyVaultBuilder::from_features`](crate::KeyVaultBuilder::from_features).
 //!
 //! Three implementations ship:
 //!

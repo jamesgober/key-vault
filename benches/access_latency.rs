@@ -15,7 +15,12 @@
 //! | Key access (defrag with codex) | <1µs |
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use key_vault::{DynamicCodex, KeyVaultBuilder, RawKey};
+use std::sync::Arc;
+
+use key_vault::{
+    DynamicCodex, FragmentStrategy, InterleavedFragmenter, KeyVaultBuilder, LayeredFragmenter,
+    RandomFragmenter, RawKey, StandardFragmenter,
+};
 
 /// Sizes (in bytes) that exercise the common key-length regime.
 /// 16/32/64 cover AES-128/AES-256 keys + typical MACs; 256 stretches
@@ -128,6 +133,90 @@ fn bench_with_key(c: &mut Criterion) {
     group.finish();
 }
 
+/// Opt-in layers added in 1.1: page protection (two protection changes
+/// per read), keyed normalization, and the layered fragmenter (which no
+/// longer copies chunks on every read).
+fn bench_opt_in(c: &mut Criterion) {
+    let mut group = c.benchmark_group("opt_in");
+
+    for &len in &[32usize, 256] {
+        group.throughput(Throughput::Bytes(len as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("with_key_page_protection", len),
+            &len,
+            |b, &len| {
+                let vault = KeyVaultBuilder::new()
+                    .normalize_with_blake3(false)
+                    .with_page_protection(true)
+                    .build();
+                let handle = vault.register("k", fresh_key(len)).expect("register");
+                b.iter(|| {
+                    let n = vault.with_key(handle, <[u8]>::len).expect("with_key");
+                    black_box(n);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("register_page_protection", len),
+            &len,
+            |b, &len| {
+                b.iter_batched(
+                    || {
+                        let vault = KeyVaultBuilder::new()
+                            .normalize_with_blake3(false)
+                            .with_page_protection(true)
+                            .build();
+                        (vault, fresh_key(len))
+                    },
+                    |(vault, key)| {
+                        black_box(vault.register("k", key).expect("register"));
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("with_key_layered", len),
+            &len,
+            |b, &len| {
+                let layered = LayeredFragmenter::new(vec![
+                    Arc::new(StandardFragmenter::new()) as Arc<dyn FragmentStrategy>,
+                    Arc::new(InterleavedFragmenter::new()) as Arc<dyn FragmentStrategy>,
+                    Arc::new(RandomFragmenter::new()) as Arc<dyn FragmentStrategy>,
+                ])
+                .expect("layered");
+                let vault = KeyVaultBuilder::new()
+                    .normalize_with_blake3(false)
+                    .with_fragmenter(layered)
+                    .build();
+                let handle = vault.register("k", fresh_key(len)).expect("register");
+                b.iter(|| {
+                    let n = vault.with_key(handle, <[u8]>::len).expect("with_key");
+                    black_box(n);
+                });
+            },
+        );
+    }
+
+    group.bench_function("register_keyed_normalization_32", |b| {
+        b.iter_batched(
+            || {
+                let vault = KeyVaultBuilder::new().with_keyed_normalization().build();
+                (vault, fresh_key(32))
+            },
+            |(vault, key)| {
+                black_box(vault.register("k", key).expect("register"));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 fn bench_rotate(c: &mut Criterion) {
     let mut group = c.benchmark_group("rotate");
 
@@ -185,5 +274,6 @@ criterion_group!(
     bench_with_key,
     bench_rotate,
     bench_one_shot_fragment_defragment,
+    bench_opt_in,
 );
 criterion_main!(benches);

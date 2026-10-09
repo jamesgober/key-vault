@@ -103,7 +103,9 @@ impl KeyMetadata {
         self.algorithm
     }
 
-    /// Time of registration, expressed as a `Duration` since the Unix epoch.
+    /// Time of registration, expressed as a `Duration` since the Unix epoch,
+    /// as reported by the vault's [`Clock`](crate::Clock) (`Duration::ZERO`
+    /// if the clock has no wall time).
     #[must_use]
     pub fn registered_since_epoch(&self) -> Duration {
         self.registered_since_epoch

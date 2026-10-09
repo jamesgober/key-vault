@@ -8,7 +8,6 @@ use zeroize::Zeroize;
 
 use super::DecoyStrategy;
 use crate::Result;
-use crate::error::Error;
 use crate::fetcher::RawKey;
 
 /// Decoy strategy that produces bytes via BLAKE3's extendable-output (XOF)
@@ -55,7 +54,7 @@ impl DecoyStrategy for KeyDerivedDecoy {
         // an attacker who knows the key bytes to recompute the decoy and
         // confirm a fragmentation.
         let mut nonce = [0u8; 32];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Internal("OS RNG failed"))?;
+        crate::rng::fill(&mut nonce)?;
 
         let mut hasher = blake3::Hasher::new();
         // `Hasher::update` returns `&mut Self` for chaining; we bind to `_`

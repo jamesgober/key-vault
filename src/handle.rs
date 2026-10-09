@@ -17,6 +17,7 @@
 
 use core::fmt;
 use core::num::NonZeroU64;
+#[cfg(target_has_atomic = "64")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use subtle::{Choice, ConstantTimeEq};
@@ -28,23 +29,19 @@ use subtle::{Choice, ConstantTimeEq};
 /// valid handle. Identifiers are allocated from a single process-global
 /// counter (crate-internal); they are unique within the lifetime of a process
 /// and **not** portable across runs.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyId(NonZeroU64);
 
 impl KeyId {
     /// Allocate the next identifier.
     ///
     /// Identifiers start at 1 and increase monotonically. The counter is
-    /// process-global; overflow is treated as an internal invariant
-    /// violation and the function will saturate at `u64::MAX` rather than
-    /// wrap. In practice no process will allocate 2⁶⁴ handles.
+    /// process-global and 64 bits wide; no process will allocate 2⁶⁴
+    /// handles, so it never wraps in practice (a wrapped 0 would be mapped
+    /// to 1).
     #[must_use]
     pub(crate) fn next() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-        // Saturating add prevents wrap-around producing duplicates. With a 64-bit
-        // counter incremented once per vault key registration the saturation
-        // arm is unreachable in any realistic process.
-        let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let raw = next_raw();
         let raw = if raw == 0 { 1 } else { raw };
         // SAFETY: `raw` is always at least 1 because the counter starts at 1
         // and we replaced any observed 0 with 1 above.
@@ -72,6 +69,26 @@ impl KeyId {
     pub(crate) fn get(self) -> NonZeroU64 {
         self.0
     }
+}
+
+/// Next value of the process-wide id counter (starts at 1).
+#[cfg(target_has_atomic = "64")]
+fn next_raw() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    // With a 64-bit counter incremented once per registration, wrapping
+    // is unreachable in any realistic process.
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Next value of the process-wide id counter, for targets without 64-bit
+/// atomics (for example `thumbv7em`).
+#[cfg(not(target_has_atomic = "64"))]
+fn next_raw() -> u64 {
+    static COUNTER: crate::sync::Mutex<u64> = crate::sync::Mutex::new(1);
+    let mut counter = COUNTER.lock();
+    let raw = *counter;
+    *counter = counter.wrapping_add(1);
+    raw
 }
 
 impl fmt::Debug for KeyId {

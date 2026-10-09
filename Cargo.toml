@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -43,79 +43,88 @@ name = "key_vault"
 path = "src/lib.rs"
 
 [features]
-# Feature status in 1.0.x
-# -----------------------
-# Only `std`, the `fetcher-*` features and `monitor-tracing` change what
-# gets compiled. Every other feature below is RESERVED: it is accepted so
-# existing feature lists keep building, but it has NO EFFECT in 1.0.x.
-# Page locking and zero-on-drop are always on; the fragmenter, decoy and
-# codex are chosen through `KeyVaultBuilder`, not through features. See
-# docs/API.md "Cargo features" for the full table.
+# Feature status in 1.1
+# ---------------------
+# `std` (default) builds the full crate. Without it the crate is
+# `no_std` + `alloc`; see README "no_std" for what that needs.
+#
+# The `fragment-*`, `decoy-*`, `codex*`, `monitor`, `audit` and `preset-*`
+# features choose what `KeyVaultBuilder::from_features()` configures.
+# They never change what `KeyVaultBuilder::new()` does, so turning one on
+# does not change existing vaults. `mlock`, `zeroize`, `tee-detect` and
+# `post-quantum` are deprecated no-ops (page locking and zeroization
+# cannot be turned off). See docs/API.md "Cargo features".
 default = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]
 
 # Core
-std = []                              # Standard library (default on, required)
-mlock = []                            # Reserved, no effect in 1.0.x (page locking is always on)
-zeroize = []                          # Reserved, no effect in 1.0.x (zero-on-drop is always on)
+std = ["dep:arc-swap", "blake3/std", "subtle/std"]  # Standard library (default on)
+mlock = []                            # Deprecated no-op: page locking is always on
+zeroize = []                          # Deprecated no-op: zero-on-drop is always on
 
-# Key fetchers (pluggable sources)
-fetcher-keychain = ["dep:keyring"]    # OS keychain (macOS, Windows, Linux) via `keyring`
-fetcher-file = []                     # Plaintext key file (no decryption; use disk encryption)
-fetcher-env = []                      # Environment variable
-fetcher-tpm = []                      # TpmFetch type only: not implemented, fetch() always errors
+# Key fetchers (pluggable sources). All require `std`.
+fetcher-keychain = [
+    "std",
+    "dep:keyring",
+    "keyring/apple-native",
+    "keyring/windows-native",
+    "keyring/async-secret-service",
+    "keyring/async-io",
+    "keyring/crypto-rust",
+]                                     # OS keychain (macOS, Windows, Linux Secret Service)
+fetcher-file = ["std"]                # Plaintext key file (no decryption; use disk encryption)
+fetcher-env = ["std"]                 # Environment variable
+fetcher-tpm = ["std"]                 # TpmFetch type only: not implemented, fetch() always errors
 fetcher-all = ["fetcher-keychain", "fetcher-file", "fetcher-env"]
 
-# Fragment strategies: reserved, no effect in 1.0.x. All four strategy
-# types are always compiled; the vault itself always uses StandardFragmenter.
-fragment-standard = []                # Reserved, no effect in 1.0.x
-fragment-interleaved = []             # Reserved, no effect in 1.0.x
-fragment-random = []                  # Reserved, no effect in 1.0.x
-fragment-layered = []                 # Reserved, no effect in 1.0.x
+# Fragment strategy chosen by KeyVaultBuilder::from_features(). When
+# several are on, the first of layered, random, interleaved, standard wins.
+fragment-standard = []                # StandardFragmenter (variable chunks + shuffle)
+fragment-interleaved = []             # InterleavedFragmenter (bytes scattered in a padded pool)
+fragment-random = []                  # RandomFragmenter (non-contiguous byte groups)
+fragment-layered = []                 # LayeredFragmenter over standard, interleaved and random
 fragment-all = ["fragment-standard", "fragment-interleaved", "fragment-random", "fragment-layered"]
 
-# Decoy strategies: reserved, no effect in 1.0.x. No decoy is used unless
-# one is passed to KeyVaultBuilder::with_decoy.
-decoy-random = []                     # Reserved, no effect in 1.0.x
-decoy-self-ref = []                   # Reserved, no effect in 1.0.x
-decoy-key-derived = []                # Reserved, no effect in 1.0.x
+# Decoy chosen by from_features() for the standard fragmenter. When several
+# are on, the strongest wins: self-ref, then key-derived, then random.
+decoy-random = []                     # RandomDecoy (weakest, fastest)
+decoy-self-ref = []                   # SelfReferenceDecoy (strongest)
+decoy-key-derived = []                # KeyDerivedDecoy (BLAKE3 XOF of key + nonce)
 decoy-all = ["decoy-random", "decoy-self-ref", "decoy-key-derived"]
 
-# Codex: reserved, no effect in 1.0.x. No codex is used unless one is
-# passed to KeyVaultBuilder::with_codex.
-codex = []                            # Reserved, no effect in 1.0.x
-codex-dynamic = ["codex"]             # Reserved, no effect in 1.0.x
+# Codex used by from_features(): a fresh DynamicCodex per vault.
+codex = []
+codex-dynamic = ["codex"]
 
-# Monitoring and audit: the traits and the vault hooks are always compiled.
-monitor = []                          # Reserved, no effect in 1.0.x
-monitor-tracing = ["monitor", "dep:tracing"]  # LogMonitor / LogAudit via the `tracing` crate
-audit = []                            # Reserved, no effect in 1.0.x
+# Monitoring and audit. With monitor-tracing, from_features() attaches
+# LogMonitor (`monitor`) and LogAudit (`audit`).
+monitor = []
+monitor-tracing = ["monitor", "std", "dep:tracing"]  # LogMonitor / LogAudit via `tracing`
+audit = []
 
-# TEE detection is always compiled.
-tee-detect = []                       # Reserved, no effect in 1.0.x
+tee-detect = []                       # Deprecated no-op: TEE detection is always compiled with std
+post-quantum = []                     # Deprecated no-op: informational only
 
-post-quantum = []                     # Reserved, no effect in 1.0.x
-
-# Convenience presets. In 1.0.x they only enable the features listed, so
-# `preset-paranoid` and `preset-fast` build the same code as
-# `preset-balanced`. In particular `preset-fast` does not turn off page
-# locking, and `preset-paranoid` does not turn on decoys or a codex.
+# Presets for from_features(). Page locking and zeroization stay on in
+# every preset.
 preset-balanced = ["std", "mlock", "zeroize", "fragment-standard", "decoy-self-ref"]
 preset-paranoid = ["std", "mlock", "zeroize", "fragment-layered", "decoy-all", "codex", "monitor", "audit", "tee-detect"]
 preset-fast = ["std", "fragment-standard", "decoy-random"]
 
 [dependencies]
 # Constant-time comparisons (security-critical)
-subtle = "2.5"
+subtle = { version = "2.5", default-features = false }
 
-# Lock-free read access to vault state
-arc-swap = "1.7"
+# Lock-free read access to vault state (std builds; no_std uses a spin lock)
+arc-swap = { version = "1.7", optional = true }
 
-# Cryptographically secure RNG
-getrandom = "0.2"
+# Cryptographically secure RNG. `custom` only takes effect on targets
+# getrandom has no backend for (bare metal): there the application must
+# register an RNG with `key_vault::register_rng!`, or linking fails.
+getrandom = { version = "0.2", features = ["custom"] }
 
 # Cryptographic hashing for key normalization. The `zeroize` feature lets
 # the vault wipe hasher state and digests that are derived from key bytes.
-blake3 = { version = "1.5", features = ["zeroize"] }
+blake3 = { version = "1.5", default-features = false, features = ["zeroize"] }
 
 # Wiping of secret-bearing buffers (always on).
 zeroize = { version = "1.7", features = ["derive"] }
@@ -126,15 +135,20 @@ keyring = { version = "3", optional = true }
 # Optional - tracing integration for monitor
 tracing = { version = "0.1", optional = true }
 
-# Unix syscall surface — mlock(2) / munlock(2) for memory page locking.
-# Target-gated so Windows builds don't pick this up.
+# Unix syscall surface: mlock, madvise, mmap and mprotect.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", default-features = false }
 
-# Windows syscall surface: VirtualLock / VirtualUnlock for memory page
-# locking, GetSystemInfo for the page size.
+# Windows syscall surface: VirtualLock / VirtualProtect / VirtualAlloc,
+# GetSystemInfo for the page size, GetProcAddress for the WER exclusion
+# API (looked up at run time).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

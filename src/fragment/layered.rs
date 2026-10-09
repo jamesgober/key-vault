@@ -7,12 +7,11 @@
 //!
 //! # Threat model
 //!
-//! Against an attacker who has both the chunks and the layout buffer (the
-//! worst-case Layer 3 / 4 break), `LayeredFragmenter` raises the work
-//! factor by an additional `log2(N)` bits of uncertainty about which
-//! strategy was used — plus the attacker has to know that we are even
-//! using a layered scheme. Against an attacker who has only the chunks,
-//! they cannot guess which sub-strategy was used and so cannot decode.
+//! Obfuscation, like the strategies it routes to. The 4-byte layout
+//! header records which sub-strategy produced the chunks, in the clear,
+//! so anyone who can read the layout buffer knows how to decode them. What
+//! layering adds is that the storage format differs from key to key, so a
+//! tool written for one strategy's format does not work on every key.
 //!
 //! Composition through **routing** (rather than chained transformations)
 //! avoids materializing the key between layers, which would itself create
@@ -25,9 +24,9 @@
 //! ```
 //!
 //! `strategy_index` indexes into the `sub_strategies` vector at
-//! construction time. `defragment` strips the prefix, hands the rest back
-//! to the indexed sub-strategy as the layout of a reconstructed
-//! `Fragments`.
+//! construction time. `defragment` hands the indexed sub-strategy a view
+//! of the same chunks whose layout starts after the prefix. Nothing is
+//! copied.
 
 use alloc::borrow::Cow;
 use alloc::format;
@@ -100,6 +99,28 @@ impl fmt::Debug for LayeredFragmenter {
     }
 }
 
+impl LayeredFragmenter {
+    /// Read the strategy index from the 4-byte layout header.
+    fn pick(&self, fragments: &Fragments) -> Result<usize> {
+        let layout = fragments.layout_bytes();
+        let header: [u8; 4] = layout
+            .get(0..4)
+            .and_then(|h| h.try_into().ok())
+            .ok_or_else(|| {
+                Error::Defragment(alloc::string::ToString::to_string(
+                    "layered layout shorter than 4-byte header",
+                ))
+            })?;
+        let pick = u32::from_le_bytes(header) as usize;
+        if pick >= self.sub_strategies.len() {
+            return Err(Error::Defragment(format!(
+                "layered layout strategy index {pick} out of range",
+            )));
+        }
+        Ok(pick)
+    }
+}
+
 impl FragmentStrategy for LayeredFragmenter {
     fn fragment(&self, key: &RawKey) -> Result<Fragments> {
         // Pick one sub-strategy uniformly at random.
@@ -112,62 +133,39 @@ impl FragmentStrategy for LayeredFragmenter {
         let pick = (random_u64()? % n) as usize;
         let sub_fragments = self.sub_strategies[pick].fragment(key)?;
 
-        // Unpack the sub-strategy's Fragments and wrap them with our own
-        // layout header. We hold ownership of the chunks so the move
-        // doesn't introduce any extra allocation.
-        let (chunks, sub_layout, total_len) = sub_fragments.into_parts();
-        let sub_layout_bytes = sub_layout.as_bytes();
-
-        let mut new_layout_bytes: Zeroizing<Vec<u8>> =
-            Zeroizing::new(Vec::with_capacity(4 + sub_layout_bytes.len()));
+        // Prefix the sub-strategy's layout with our 4-byte header.
         let pick_u32 = u32::try_from(pick)
             .map_err(|_| Error::Internal("LayeredFragmenter sub-strategy index exceeded u32"))?;
+        let sub_layout_bytes = sub_fragments.layout_bytes();
+        let mut new_layout_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(4 + sub_layout_bytes.len()));
         new_layout_bytes.extend_from_slice(&pick_u32.to_le_bytes());
         new_layout_bytes.extend_from_slice(sub_layout_bytes);
-
         let new_layout = LockedBytes::from_slice(&new_layout_bytes);
         drop(new_layout_bytes);
-        // Explicitly drop the old (sub-strategy's) layout buffer now;
-        // its destructor zeroes and unlocks.
-        drop(sub_layout);
 
+        let total_len = sub_fragments.total_len();
+        // Moves the chunk buffers (no copy); the sub-strategy's own layout
+        // buffer is zeroed as it drops.
+        let chunks = sub_fragments.into_chunks();
         Ok(Fragments::from_parts(chunks, new_layout, total_len))
     }
 
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey> {
-        let layout = fragments.layout().as_bytes();
-        if layout.len() < 4 {
-            return Err(Error::Defragment(alloc::string::ToString::to_string(
-                "layered layout shorter than 4-byte header",
-            )));
-        }
-        let pick_raw: [u8; 4] = layout[0..4]
-            .try_into()
-            .map_err(|_| Error::Defragment(alloc::string::ToString::to_string("layout slice")))?;
-        let pick = u32::from_le_bytes(pick_raw) as usize;
-        if pick >= self.sub_strategies.len() {
-            return Err(Error::Defragment(format!(
-                "layered layout strategy index {pick} out of range",
-            )));
-        }
+        // Wrap the output in `RawKey` before writing so a partial write
+        // is zeroed on drop if `defragment_into` returns an error.
+        let mut out = RawKey::new(alloc::vec![0u8; fragments.total_len()]);
+        self.defragment_into(fragments, out.as_bytes_mut())?;
+        Ok(out)
+    }
 
-        // Reconstruct the sub-strategy's Fragments by stripping the header
-        // off our layout. The chunks are not moved — we only borrow them.
-        let sub_layout = LockedBytes::from_slice(&layout[4..]);
-        // To pass to the sub-strategy without consuming our chunks, we
-        // build a temporary Fragments that aliases our chunks. We can't
-        // alias a Vec<LockedBytes> directly (each LockedBytes is owned),
-        // so we route via a dedicated `defragment_with_chunks` shape:
-        // simpler to clone the chunk *bytes* into fresh LockedBytes and
-        // hand those off. The sub-strategy never holds onto them past its
-        // return.
-        let chunks_copy: Vec<LockedBytes> = fragments
-            .chunks()
-            .iter()
-            .map(|c| LockedBytes::from_slice(c.as_bytes()))
-            .collect();
-        let sub_fragments = Fragments::from_parts(chunks_copy, sub_layout, fragments.total_len());
-        self.sub_strategies[pick].defragment(&sub_fragments)
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> {
+        let pick = self.pick(fragments)?;
+        // Hand the sub-strategy a view of the same chunks with our header
+        // hidden. Nothing is copied: before 1.1 every call copied each
+        // chunk into a new locked buffer (one `mlock` per chunk).
+        let sub_fragments = fragments.view_skipping(4);
+        self.sub_strategies[pick].defragment_into(&sub_fragments, out)
     }
 
     fn describe(&self) -> Cow<'_, str> {

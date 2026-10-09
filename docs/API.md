@@ -19,7 +19,7 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 1.0.x.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 1.1.</i>
     <br>
     <i>For the threat model and what each layer does see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
@@ -35,7 +35,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-key-vault = "1.0"
+key-vault = "1.1"
 ```
 
 ### Install via terminal
@@ -50,30 +50,76 @@ cargo add key-vault
 
 ### Cargo features
 
-| Feature | Default | Effect in 1.0.x |
-|---------|---------|-----------------|
-| `std` | ✅ | Required: a build without `std` stops with a `compile_error!`. `no_std` is not supported. |
-| `fetcher-env` |   | Compiles `EnvFetch`. |
-| `fetcher-file` |   | Compiles `FileFetch` (plaintext key file). |
-| `fetcher-keychain` |   | Compiles `KeychainFetch` (pulls in `keyring`). |
-| `fetcher-tpm` |   | Compiles `TpmFetch`, which is **not implemented** and always returns an error. |
-| `fetcher-all` |   | `fetcher-keychain` + `fetcher-file` + `fetcher-env`. |
-| `monitor-tracing` |   | Compiles `LogMonitor` and `LogAudit` (pulls in `tracing`). |
-| `mlock` | ✅ | **Reserved, no effect.** Page locking is always on. |
-| `zeroize` | ✅ | **Reserved, no effect.** Zero-on-drop is always on (the `zeroize` crate is a required dependency since 1.0.2). |
-| `fragment-standard` | ✅ | **Reserved, no effect.** All fragmenter types are always compiled; the vault always uses `StandardFragmenter`. |
-| `fragment-interleaved`, `fragment-random`, `fragment-layered`, `fragment-all` |   | **Reserved, no effect.** |
-| `decoy-self-ref` | ✅ | **Reserved, no effect.** No decoy is used unless `KeyVaultBuilder::with_decoy` is called. |
-| `decoy-random`, `decoy-key-derived`, `decoy-all` |   | **Reserved, no effect.** |
-| `codex`, `codex-dynamic` |   | **Reserved, no effect.** No codex is used unless `KeyVaultBuilder::with_codex` is called. |
-| `monitor`, `audit` |   | **Reserved, no effect.** The monitor and audit hooks are always compiled. |
-| `tee-detect` |   | **Reserved, no effect.** TEE detection is always compiled. |
-| `post-quantum` |   | **Reserved, no effect.** |
-| `preset-balanced`, `preset-paranoid`, `preset-fast` |   | Only enable the features listed in `Cargo.toml`, so they build the same code. `preset-fast` does **not** turn off page locking; `preset-paranoid` does **not** turn on decoys or a codex. |
+Cargo features never change what `KeyVaultBuilder::new()` builds. The
+`fragment-*`, `decoy-*`, `codex*`, `monitor`, `audit` and `preset-*`
+features choose what [`KeyVaultBuilder::from_features()`](#keyvaultbuilder)
+configures, so turning one on changes nothing for existing vaults.
 
-Reserved features are kept so existing feature lists keep building
-(removing a feature is a breaking change). Wiring them to behavior, or
-deprecating them, is planned for 1.1.
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `std` | ✅ | The full crate. Without it the crate is `no_std` + `alloc`; see [`no_std`](#no_std). |
+| `fetcher-env` |   | Compiles `EnvFetch`. Implies `std`. |
+| `fetcher-file` |   | Compiles `FileFetch` (plaintext key file). Implies `std`. |
+| `fetcher-keychain` |   | Compiles `KeychainFetch` with `keyring`'s native stores (Keychain Services, Credential Manager, Secret Service over pure-Rust D-Bus). Implies `std`. |
+| `fetcher-tpm` |   | Compiles `TpmFetch`, which is **not implemented** and always returns an error. Implies `std`. |
+| `fetcher-all` |   | `fetcher-keychain` + `fetcher-file` + `fetcher-env`. |
+| `monitor-tracing` |   | Compiles `LogMonitor` and `LogAudit` (pulls in `tracing`). Implies `monitor` and `std`. |
+| `fragment-standard` | ✅ | `from_features()`: `StandardFragmenter` (when no other `fragment-*` feature is on). |
+| `fragment-interleaved` |   | `from_features()`: `InterleavedFragmenter`. |
+| `fragment-random` |   | `from_features()`: `RandomFragmenter`. |
+| `fragment-layered` |   | `from_features()`: `LayeredFragmenter` over standard, interleaved and random. |
+| `fragment-all` |   | All four; layered wins. |
+| `decoy-self-ref` | ✅ | `from_features()`: `SelfReferenceDecoy` on the standard fragmenter. |
+| `decoy-key-derived` |   | `from_features()`: `KeyDerivedDecoy` (when `decoy-self-ref` is off). |
+| `decoy-random` |   | `from_features()`: `RandomDecoy` (when neither of the above is on). |
+| `decoy-all` |   | All three; self-reference wins. |
+| `codex`, `codex-dynamic` |   | `from_features()`: a fresh `DynamicCodex` per vault. |
+| `monitor` |   | With `monitor-tracing`, `from_features()` attaches `LogMonitor`. |
+| `audit` |   | With `monitor-tracing`, `from_features()` attaches `LogAudit`. |
+| `preset-balanced` |   | The default set: standard fragmenter + self-reference decoys. |
+| `preset-paranoid` |   | Layered fragmenter + self-reference decoys + `DynamicCodex` (+ `LogMonitor` / `LogAudit` if `monitor-tracing` is on). |
+| `preset-fast` |   | Standard fragmenter + `RandomDecoy` when used with `default-features = false`. |
+| `mlock` | ✅ | **Deprecated, no effect.** Page locking is always on and cannot be turned off. |
+| `zeroize` | ✅ | **Deprecated, no effect.** Zero-on-drop is always on. |
+| `tee-detect` |   | **Deprecated, no effect.** TEE detection is always compiled with `std`. |
+| `post-quantum` |   | **Deprecated, no effect.** It was informational only. |
+
+**When several features of one kind are on,** the fragmenter is the first
+of layered, random, interleaved, standard, and the decoy is the strongest
+of self-reference, key-derived, random. Features from every crate in a
+build are merged, so this rule makes sure one crate asking for a stronger
+setting is not undone by another. Decoys apply only to the standard
+fragmenter (alone, or as the layered fragmenter's standard sub-strategy).
+No preset turns off page locking, dump exclusion or zeroization.
+
+The deprecated features are kept so existing feature lists keep
+building; removing a feature is a breaking change.
+
+### `no_std`
+
+```toml
+[dependencies]
+key-vault = { version = "1.1", default-features = false }
+```
+
+Without `std` the crate is `#![no_std]` and needs `alloc`. What changes:
+
+- Build the vault with [`KeyVaultBuilder::build_with_clock`](#keyvaultbuilder)
+  and a [`Clock`](#clock). `build()` does not exist without `std`, so a
+  missing clock is a compile error.
+- Randomness comes from `getrandom`. On targets it has no backend for
+  (bare metal), register your RNG with [`register_rng!`](#register_rng);
+  without it, linking fails with an undefined `__getrandom_custom`.
+- Spin locks replace `std::sync`, the registry is a `BTreeMap`, and the
+  `with_key` scratch buffer is allocated per call.
+- The fetchers, `monitor-tracing`, the `tee` module and
+  `AuditEvent::thread_id` need `std`.
+- On bare metal there is no swap and no core dump: page locking and dump
+  exclusion do not apply, and `with_page_protection` does not exist. On a
+  hosted Unix or Windows target they work without `std`.
+
+CI builds the library for `thumbv7em-none-eabihf` and runs
+`tests/no_std_vault.rs` against the `no_std` build.
 
 <a href="#top">↑ TOP</a>
 
@@ -177,8 +223,9 @@ The crate-wide error type. `#[non_exhaustive]`; future variants additive.
 | `Defragment(String)` | Reassembly failed (layout/chunk mismatch, corruption). |
 | `Decoy(String)` | A `DecoyStrategy` cannot produce the requested output. |
 | `Codex(String)` | A `Codex` rejected an input (e.g. conflicting swap pairs in `StaticCodex::from_swaps`). |
-| `LockedOut` | A `SecurityMonitor` threshold lockout is in effect. |
-| `MemoryLock(String)` | mlock/VirtualLock operation failed at the OS layer. |
+| `LockedOut` | A lockout is in effect: vault-wide, or (1.1) per key for the key you asked for. |
+| `RateLimited { retry_after }` | (1.1) A master-unlock attempt was refused, unchecked, by the backoff. `retry_after: Duration` says when the next attempt will be checked. |
+| `MemoryLock(String)` | (Page protection) The OS refused to map or protect a key's private region. Page *locking* failures are not errors. |
 | `InvalidConfig(String)` | Builder produced an internally inconsistent configuration. |
 | `Internal(&'static str)` | Crate invariant violated; please file an issue. |
 
@@ -315,26 +362,26 @@ audit trails and monitors can label events meaningfully.
 Source: `src/fetcher/mod.rs`
 
 Container for raw key material exchanged between `KeyFetch` impls, the
-vault, and the fragmenter. **`RawKey` exposes no method that returns
-`&[u8]` to outside callers** — only its `len()` is observable from
-outside the crate. `Debug` redacts contents.
+vault, and the fragmenter. `Debug` redacts contents.
 
 **Constructors:**
 
-- `RawKey::new(bytes: Vec<u8>) -> Self` — wrap an existing buffer.
+- `RawKey::new(bytes: Vec<u8>) -> Self` — wrap an existing buffer (moved,
+  not copied).
 
 **Read accessors:**
 
 - `len(&self) -> usize` — length in bytes.
 - `is_empty(&self) -> bool` — whether the buffer is zero-length.
+- `expose_secret(&self) -> &[u8]` — (1.1) the key bytes. For custom
+  `FragmentStrategy` / `DecoyStrategy` implementations and for reading
+  what `KeyVault::defragment` returns. Copies you make of the slice are
+  yours to wipe.
 
 `Debug` prints `RawKey { len, bytes: "<redacted>" }`.
 
-**`Drop`** (0.9+) volatile-zeroes the internal `Vec<u8>` before the
-underlying allocation is freed. `write_volatile` per byte + a `SeqCst`
-compiler fence; same pattern as `LockedBytes`. The drop guarantee
-applies to every `RawKey`, including the temporary buffers returned
-by `KeyVault::defragment` and the ones handed to `with_key` closures.
+**`Drop`** zeroizes the whole allocation, including spare capacity
+beyond the length.
 
 **Example:**
 
@@ -344,6 +391,7 @@ use key_vault::RawKey;
 let key = RawKey::new(b"my application key".to_vec());
 assert_eq!(key.len(), 18);
 assert!(!key.is_empty());
+assert_eq!(key.expose_secret(), b"my application key");
 let rendered = format!("{key:?}");
 assert!(rendered.contains("<redacted>"));
 ```
@@ -379,28 +427,44 @@ assert_eq!(ctx.key_name, "db-primary");
 
 Source: `src/fragment/mod.rs`
 
-Opaque token returned by `FragmentStrategy::fragment` and consumed by
-`FragmentStrategy::defragment`. Holds the chunks and the locked layout
-buffer; storage layout is intentionally a black box from the public-API
-side.
+The fragmented form of a key, produced by `FragmentStrategy::fragment`
+and consumed by `FragmentStrategy::defragment`. Holds the chunks and the
+layout buffer, each in locked, dump-excluded, zero-on-drop memory. Anyone
+holding a `Fragments` can rebuild the key with the strategy that made it,
+so treat it like the key.
+
+**Constructors:**
+
+- `Fragments::from_chunks(chunks: impl IntoIterator<Item = impl AsRef<[u8]>>, layout: &[u8], total_len: usize) -> Self`
+  — (1.1) for custom strategies. Copies each chunk and the layout into
+  locked buffers. The layout format is the strategy's own.
 
 **Public accessors:**
 
 - `chunk_count(&self) -> usize` — number of chunks (real + decoy if
   configured).
+- `chunk(&self, index: usize) -> Option<&[u8]>` — (1.1) one chunk's bytes.
+- `layout_bytes(&self) -> &[u8]` — (1.1) the layout map.
+- `total_len(&self) -> usize` — (1.1) length of the key the chunks
+  reassemble into.
 
-`Debug` prints `Fragments { chunks: N, total_len: M, contents: "<opaque>" }`.
+`Debug` prints `Fragments { chunks: N, total_len: M, contents: "<opaque>", .. }`.
 
 **Example:**
 
 ```rust
-use key_vault::{KeyVaultBuilder, RawKey};
+use key_vault::{Fragments, KeyVaultBuilder, RawKey};
 
 # fn main() -> Result<(), key_vault::Error> {
 let vault = KeyVaultBuilder::new().normalize_with_blake3(false).build();
 let raw = RawKey::new(vec![0u8; 32]);
 let fragments = vault.fragment(&raw)?;
 assert!(fragments.chunk_count() >= 4); // 32 / 8 (max chunk size) = 4
+assert_eq!(fragments.total_len(), 32);
+
+// A custom strategy builds its own:
+let mine = Fragments::from_chunks([&b"lo"[..], b"hel"], &[3, 0], 5);
+assert_eq!(mine.chunk(1), Some(&b"hel"[..]));
 # Ok(())
 # }
 ```
@@ -414,86 +478,103 @@ Source: `src/vault/mod.rs`
 The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 [`KeyVaultBuilder`](#keyvaultbuilder).
 
-**Named-key registry (0.9+):**
+**Named-key registry:**
 
 - `register(name: impl Into<String>, key: RawKey) -> Result<KeyHandle>`
   — fragment a key and insert it under `name`. Returns the opaque
-  handle. Errors on duplicate name (`Error::InvalidConfig`) or
-  when the vault is locked out. Safe under concurrency: of several
-  simultaneous `register` calls with the same name, exactly one
-  succeeds (fixed in 1.0.2).
+  handle. Errors on duplicate name (`Error::InvalidConfig`), when the
+  vault is locked out, or (page protection on) when the private mapping
+  cannot be created (`Error::MemoryLock`). Of several simultaneous
+  `register` calls with the same name, exactly one succeeds.
 - `unregister(handle: KeyHandle) -> Result<()>` — remove. The
-  underlying `Fragments` (and its `LockedBytes` chunks) drop and
-  zeroize when the last `Arc` reference goes away.
+  underlying storage drops and zeroizes when the last reference goes
+  away. Works on a locked-out key.
 - `with_key<F, T>(handle, f: F) -> Result<T>` where
   `F: FnOnce(&[u8]) -> T` — scoped byte access. The slice handed to
-  `f` points into a page-locked, thread-local scratch buffer and is
-  valid only during the call; the buffer is zeroed when `f` returns,
-  panics, or defragmentation fails. Copies `f` makes are not wiped.
+  `f` points into a page-locked, dump-excluded scratch buffer (per
+  thread with `std`, per call without) and is valid only during the
+  call; the buffer is zeroed when `f` returns, panics, or
+  defragmentation fails. Copies `f` makes are not wiped. Returns
+  `Error::LockedOut` if the vault or this key is locked out.
 - `rotate(handle, new_key: RawKey) -> Result<()>` — atomic swap.
   Concurrent readers see either the old or the new fragmentation,
   never a torn read. Returns `Error::KeyNotFound` if a concurrent
-  `unregister` removed the key first (before 1.0.2 it could return
-  `Ok` in that case).
+  `unregister` removed the key first, `Error::LockedOut` if the vault
+  or this key is locked out.
 - `contains(handle: KeyHandle) -> bool`
 - `metadata(handle: KeyHandle) -> Option<KeyMetadata>` — non-secret
   per-key metadata.
 - `handle_for_name(name: &str) -> Option<KeyHandle>` — lookup.
 - `key_count() -> usize` — number of registered keys.
 
-**Master-key emergency unlock (0.9+):**
+**Master-key emergency unlock:**
 
-- `unlock_with_master(attempt: &[u8]) -> Result<()>` — verify the
-  caller's bytes against the stored BLAKE3 digest in constant time
-  (via `subtle::ConstantTimeEq`). On match, clears the lockout flag
-  and failure tracker. On mismatch, reports the failure under the
-  reserved name `"<master>"` and returns `Error::Acquisition`.
-  There is no rate limit or backoff; throttle it yourself if it is
-  reachable from untrusted input. The digest is unsalted, fast BLAKE3,
-  so use a high-entropy master credential.
+- `unlock_with_master(attempt: &[u8]) -> Result<()>` — compare
+  `BLAKE3-keyed(k, attempt)` with the stored verifier in constant time
+  (`k` is a random key per builder, held in locked memory; 1.1). On
+  match, clears every lockout and the failure tracker. On mismatch,
+  reports the failure under the reserved name `"<master>"` (vault-wide
+  threshold only), starts or extends the backoff if configured, and
+  returns `Error::Acquisition`. During the backoff delay it returns
+  `Error::RateLimited { retry_after }` without checking. Attempts are
+  serialized.
 - `has_master_key() -> bool` — whether a master credential was
   registered at build time.
 
 **One-shot fragment / defragment:**
 
 - `fragment(&self, key: &RawKey) -> Result<Fragments>` — pipeline:
-  optional BLAKE3 normalize → optional codex encode → fragmenter.fragment.
-  Returns `Error::LockedOut` when the vault is in lock-out state.
+  optional normalization → optional codex encode → fragmenter.fragment.
+  Never page-protected. Returns `Error::LockedOut` when the vault is
+  locked out.
 - `defragment(&self, fragments: &Fragments) -> Result<RawKey>` —
-  inverse: fragmenter.defragment → optional codex decode. Returns
-  `Error::LockedOut` when the vault is in lock-out state.
+  inverse: fragmenter.defragment → optional codex decode. Read the
+  result with `RawKey::expose_secret`.
 
 **Lockout + monitor controls:**
 
-- `is_locked_out(&self) -> bool` — `true` if a threshold breach has
-  put the vault in lock-out state. **Lockout is advisory and
-  vault-wide:** only failures the caller reports through
-  `report_failure` (and wrong master credentials) count, and crossing
-  the threshold for one key name locks out every key.
-- `clear_lockout(&self)` — operator escape hatch. Resets the lockout
-  flag and clears the failure tracker.
+- `is_locked_out(&self) -> bool` — `true` if the vault-wide threshold
+  has been crossed. **Lockout is advisory:** only failures the caller
+  reports through `report_failure` (and wrong master credentials)
+  count, and crossing the vault-wide threshold for one key name locks
+  out every key.
+- `is_key_locked_out(&self, handle: KeyHandle) -> bool` — (1.1) `true`
+  if the per-key threshold has locked out this key.
+- `clear_key_lockout(&self, name: &str) -> bool` — (1.1) clear one
+  key's lockout and its failure count; `true` if it was locked out.
+- `clear_lockout(&self)` — clear the vault-wide flag, every per-key
+  lockout and the failure tracker.
 - `report_failure(&self, key_name: &str, note: Option<&'static str>)`
   — caller-driven failure reporting. Forwards to the configured
-  monitor and feeds the threshold detector.
+  monitor and feeds both thresholds.
 - `report_anomalous_access(&self, key_name: &str, note: Option<&'static str>)`
   — caller-driven anomaly reporting (no state change).
-- `config(&self) -> &VaultConfig` — snapshot of the configuration.
+- `config(&self) -> &VaultConfig` — the configuration.
 
 **Example:**
 
 ```rust
+use std::time::Duration;
 use key_vault::{KeyVault, KeyVaultBuilder, RawKey};
 
 # fn main() -> Result<(), key_vault::Error> {
 let vault: KeyVault = KeyVaultBuilder::new()
     .normalize_with_blake3(false)
+    .with_key_lockout(3, Duration::from_secs(60), None)
     .build();
 
 let raw = RawKey::new(b"my application key".to_vec());
 let fragments = vault.fragment(&raw)?;
 let recovered = vault.defragment(&fragments)?;
-assert_eq!(recovered.len(), raw.len());
-assert!(!vault.is_locked_out());
+assert_eq!(recovered.expose_secret(), b"my application key");
+
+let h = vault.register("db", RawKey::new(vec![1; 32]))?;
+for _ in 0..3 {
+    vault.report_failure("db", Some("decrypt failed"));
+}
+assert!(vault.is_key_locked_out(h));
+assert!(!vault.is_locked_out()); // only that key
+vault.clear_key_lockout("db");
 # Ok(())
 # }
 ```
@@ -504,43 +585,71 @@ assert!(!vault.is_locked_out());
 
 Source: `src/vault/mod.rs`
 
-Fluent builder for [`KeyVault`](#keyvault).
+Fluent builder for [`KeyVault`](#keyvault). `Clone`.
 
 **Constructors:**
 
-- `KeyVaultBuilder::new() -> Self` — default-on configuration:
-  normalization enabled, default-range `StandardFragmenter`, no decoy,
-  no codex.
+- `KeyVaultBuilder::new() -> Self` — normalization on, default-range
+  `StandardFragmenter`, no decoy, no codex, every lockout and backoff
+  off, no page protection. Features never change this.
 - `KeyVaultBuilder::default()` — same as `new()`.
+- `KeyVaultBuilder::from_features() -> Result<Self>` — (1.1) a builder
+  configured by the enabled Cargo features (see
+  [Cargo features](#cargo-features)). Errors only if the RNG fails while
+  building a codex table.
 
 **Builder methods:**
 
-- `normalize_with_blake3(self, enabled: bool) -> Self` — toggle BLAKE3
-  input normalization. Default `true`.
-- `with_chunk_range(self, min: usize, max: usize) -> Self` — customize
-  the fragmenter chunk-size range. Replaces any previously-set decoy.
+- `normalize_with_blake3(self, enabled: bool) -> Self` — toggle
+  normalization. Default `true`. `false` also turns keyed normalization
+  off.
+- `with_keyed_normalization(self) -> Self` — (1.1) keyed BLAKE3 under a
+  random key per built vault. **Effective keys change every run.**
+- `with_normalization_key(self, key: RawKey) -> Self` — (1.1) keyed
+  BLAKE3 under a key derived from `key` (`derive_key` mode); stable
+  across processes with the same `key`.
+- `with_fragmenter<F: FragmentStrategy + 'static>(self, f: F) -> Self` —
+  (1.1) choose the fragmentation strategy. `with_decoy` decoys are not
+  used with a non-standard strategy (`Debug` shows `decoy_ignored: true`).
+- `with_chunk_range(self, min: usize, max: usize) -> Self` — select a
+  `StandardFragmenter` with this chunk-size range. Replaces any
+  previously set fragmenter and decoy.
 - `with_decoy<D: DecoyStrategy + 'static>(self, decoy: D) -> Self` —
-  attach a Layer-4 decoy strategy. Without it no decoys are stored.
+  attach a Layer-4 decoy strategy to the standard fragmenter.
 - `with_codex<C: Codex + 'static>(self, codex: C) -> Self` — attach a
-  Layer-5 codex. Without it no codex is applied.
+  Layer-5 codex.
 - `with_monitor<M: SecurityMonitor + 'static>(self, monitor: M) -> Self`
   — attach a Layer-8 monitor.
 - `with_failure_threshold(self, max: u32, window: Duration) -> Self` —
-  configure the threshold detector. `max = 0` disables lockout.
+  vault-wide lockout. `max = 0` (default) disables it.
+- `with_key_lockout(self, max: u32, window: Duration, lock_for: Option<Duration>) -> Self`
+  — (1.1) per-key lockout. `max = 0` (default) disables it; `lock_for =
+  None` keeps the lockout until cleared.
 - `with_master_key(self, master: RawKey) -> Self` — register a
-  master-key credential at build time. Stores the BLAKE3 digest of
-  `master` (zeroized when the builder or vault drops); plaintext drops
-  and zeroes immediately. Used by `KeyVault::unlock_with_master` for
-  emergency unlock.
+  master-key credential. Stores a random 32-byte hash key and
+  `BLAKE3-keyed(key, master)` in locked memory; the plaintext is wiped
+  immediately.
+- `with_master_unlock_backoff(self, base: Duration, max: Duration) -> Self`
+  — (1.1) refuse master attempts for `base`, `2 * base`, ... (capped at
+  `max`) after each failure. `base = 0` (default) disables it.
+- `with_page_protection(self, enabled: bool) -> Self` — (1.1, Unix and
+  Windows only) give each registered key its own mapping that is
+  `PROT_NONE` / `PAGE_NOACCESS` except while it is read. Costs about
+  1.5 µs per `with_key` and one page per key; see
+  [SECURITY.md](SECURITY.md#layer-10-page-protection) for the Windows
+  page-file note.
 - `with_audit_sink<A: AuditSink + 'static>(self, sink: A) -> Self`
-  — attach a Layer-9 audit sink. Every public op emits an
-  `AuditEvent` through it. Default is `NoAudit`.
-- `build(self) -> KeyVault` — finalize. Infallible.
+  — attach a Layer-9 audit sink. Default is `NoAudit`.
+- `build(self) -> KeyVault` — finalize with `StdClock`. `std` only.
+- `build_with_clock<C: Clock + 'static>(self, clock: C) -> KeyVault` —
+  (1.1) finalize with your own [`Clock`](#clock). The only way to build
+  without `std`.
 
 **Example:**
 
 ```rust
-use key_vault::{DynamicCodex, KeyVaultBuilder, SelfReferenceDecoy};
+use std::time::Duration;
+use key_vault::{DynamicCodex, KeyVaultBuilder, RandomFragmenter, SelfReferenceDecoy};
 
 # fn main() -> Result<(), key_vault::Error> {
 let vault = KeyVaultBuilder::new()
@@ -548,8 +657,18 @@ let vault = KeyVaultBuilder::new()
     .with_chunk_range(2, 6)
     .with_decoy(SelfReferenceDecoy)
     .with_codex(DynamicCodex::new()?)
+    .with_key_lockout(5, Duration::from_secs(60), Some(Duration::from_secs(300)))
     .build();
 # let _ = vault;
+
+let other = KeyVaultBuilder::new()
+    .with_fragmenter(RandomFragmenter::new())
+    .with_page_protection(true)
+    .build();
+# let _ = other;
+
+let from_features = KeyVaultBuilder::from_features()?.build();
+# let _ = from_features;
 # Ok(())
 # }
 ```
@@ -564,11 +683,65 @@ Source: `src/vault/mod.rs`
 
 **Fields:**
 
-- `pub key_normalization: bool` — whether BLAKE3 normalization is on.
-- `pub max_failures_before_lockout: u32` — threshold count. `0` =
+- `pub key_normalization: bool` — normalization on. Default `true`.
+- `pub keyed_normalization: bool` — (1.1) keyed BLAKE3 in use.
+- `pub max_failures_before_lockout: u32` — vault-wide threshold. `0` =
   disabled (default).
-- `pub failure_window: Duration` — sliding-window size for the
-  failure counter. Default: 60 seconds.
+- `pub failure_window: Duration` — vault-wide window. Default 60 s.
+- `pub key_lockout_threshold: u32` — (1.1) per-key threshold. `0` =
+  disabled (default).
+- `pub key_lockout_window: Duration` — (1.1) per-key window. Default 60 s.
+- `pub key_lockout_duration: Option<Duration>` — (1.1) per-key lockout
+  length; `None` = until cleared.
+- `pub master_backoff_base: Duration` — (1.1) first backoff delay;
+  `Duration::ZERO` = disabled (default).
+- `pub master_backoff_max: Duration` — (1.1) backoff cap.
+- `pub page_protection: bool` — (1.1) page protection on. Default
+  `false`.
+
+<hr>
+
+### `Clock`
+
+Source: `src/clock.rs`
+
+(1.1) Time source for failure windows, per-key lockout expiry,
+master-unlock backoff, and metadata / audit timestamps.
+
+```rust
+pub trait Clock: Send + Sync {
+    /// Monotonic time since an arbitrary fixed point.
+    fn now(&self) -> Duration;
+    /// Wall-clock time since the Unix epoch. Default: Duration::ZERO.
+    fn unix_time(&self) -> Duration { Duration::ZERO }
+}
+```
+
+`StdClock` (`std` only) implements it with `Instant` and `SystemTime`;
+`KeyVaultBuilder::build` uses it. Pass your own to `build_with_clock`
+(required without `std`, also handy for tests).
+
+<hr>
+
+### `register_rng!`
+
+Source: `src/rng.rs`
+
+(1.1) Register the random source on targets `getrandom` has no backend
+for (bare metal). Call it once in the binary crate with a
+`fn(&mut [u8]) -> bool` that fills the buffer from a hardware RNG (or a
+CSPRNG seeded from one) and returns `false` on failure. Without it,
+linking fails with an undefined `__getrandom_custom`; there is no
+fallback. On other targets it has no effect.
+
+```rust
+# mod trng { pub fn read(_: &mut [u8]) -> bool { true } }
+fn fill(buf: &mut [u8]) -> bool {
+    trng::read(buf)
+}
+key_vault::register_rng!(fill);
+# fn main() {}
+```
 
 <hr>
 
@@ -659,21 +832,28 @@ let raw = fetcher.fetch(&FetchContext::new("primary"))?;
 Source: `src/fetcher/file.rs` · Feature: `fetcher-file`
 
 Reads key bytes from a **plaintext** file on disk. There is no
-decryption: the file contents are the key. **On Unix, rejects files
-with permissions looser than `0o600` by default** (any bit in `0o077`
-set). The file is opened once and the mode is read from the open
-handle, so the check and the read always see the same file (1.0.2).
-The owner and parent directory are not checked. Windows trusts NTFS
-ACLs and performs no check.
+decryption: the file contents are the key. On Unix the file is opened
+once and every check uses the open handle or is tied back to it:
+
+- the mode must have no `0o077` bits (`0o600` or stricter);
+- the owner must be the process's effective user or root (1.1);
+- every directory on the resolved path, and the directory holding the
+  path you gave, must be owned by the process user or root and not be
+  writable by group or others unless it has the sticky bit (1.1). The
+  resolved path must still lead to the opened file.
+
+Windows trusts NTFS ACLs and performs no check.
 
 **Constructors:**
 
-- `FileFetch::new(path: impl Into<PathBuf>) -> Self` — strict perms on.
+- `FileFetch::new(path: impl Into<PathBuf>) -> Self` — all checks on.
 
 **Builder methods:**
 
-- `allow_loose_perms(self) -> Self` — disable the Unix permission gate
-  (not recommended outside of tests).
+- `skip_directory_check(self) -> Self` — (1.1) keep the mode and owner
+  checks, skip the directory check.
+- `allow_loose_perms(self) -> Self` — disable every Unix check (not
+  recommended outside of tests).
 
 **Read accessors:**
 
@@ -683,8 +863,7 @@ ACLs and performs no check.
 **Threat profile.** Higher than `EnvFetch` (POSIX permissions confine
 access). Lower than `KeychainFetch` (bytes live on disk in cleartext).
 Pair with OS-level disk encryption (LUKS / FileVault / BitLocker) for
-encryption-at-rest. AEAD-encrypted file format is on the post-1.0
-backlog.
+encryption at rest.
 
 **Example:**
 
@@ -710,7 +889,12 @@ Reads from the OS native credential store via the
 
 - **macOS** — Keychain Services
 - **Windows** — Credential Manager
-- **Linux** — Secret Service (gnome-keyring, KWallet)
+- **Linux, FreeBSD, OpenBSD** — Secret Service over D-Bus (gnome-keyring,
+  KWallet), pure Rust, no `libdbus` needed
+
+Before 1.1, `keyring` was used without any store feature, so it fell
+back to its in-memory mock store and `KeychainFetch` never reached the
+OS keychain.
 
 **Constructors:**
 
@@ -719,14 +903,21 @@ Reads from the OS native credential store via the
 `service` is the application/namespace name; `account` is the entry
 identifier within that service. Both appear in failure messages.
 
+**Builder methods:**
+
+- `binary(self) -> Self` — (1.1) read the entry with `get_secret` and
+  return the stored bytes as they are, instead of a UTF-8 password. On
+  Windows a value stored with `set_password` is UTF-16, so store binary
+  keys with `set_secret`.
+
 `keyring::Error` variants are mapped to short, discriminant-only
 strings — platform-specific error details never appear in `Error`
 messages.
 
 **Threat profile.** The strongest built-in fetcher. The OS confines
-access to the user account (and on macOS to the signing identity).
-Secrets are read with `get_password`, so only UTF-8 values are
-supported; a binary secret fails with "stored value is not UTF-8".
+access to the user account (and on macOS to the signing identity). In
+the default (password) mode a binary secret fails with "stored value is
+not UTF-8", and the bytes carried by that error are zeroized.
 
 **Example:**
 
@@ -734,9 +925,12 @@ supported; a binary secret fails with "stored value is not UTF-8".
 use key_vault::{FetchContext, KeyFetch, KeychainFetch};
 
 # fn main() -> Result<(), key_vault::Error> {
-let fetcher = KeychainFetch::new("my-app", "primary-key");
-let raw = fetcher.fetch(&FetchContext::new("primary"))?;
-# let _ = raw;
+let password = KeychainFetch::new("my-app", "primary-key")
+    .fetch(&FetchContext::new("primary"))?;
+let binary = KeychainFetch::new("my-app", "aes-key")
+    .binary()
+    .fetch(&FetchContext::new("aes"))?;
+# let _ = (password, binary);
 # Ok(())
 # }
 ```
@@ -762,7 +956,7 @@ protection. Nothing in the crate detects or talks to a TPM
 use key_vault::{FetchContext, KeyFetch, TpmFetch};
 
 let err = TpmFetch.fetch(&FetchContext::new("k")).unwrap_err();
-// Not implemented in 1.0.x: fetch always fails.
+// Not implemented: fetch always fails.
 assert!(format!("{err}").contains("TPM"));
 ```
 
@@ -774,13 +968,20 @@ Source: `src/fragment/mod.rs`
 
 Splits a `RawKey` into a `Fragments` token and reassembles it.
 
-```rust
+```rust,ignore
 pub trait FragmentStrategy: Send + Sync {
     fn fragment(&self, key: &RawKey) -> Result<Fragments>;
     fn defragment(&self, fragments: &Fragments) -> Result<RawKey>;
+    /// Hot path used by `with_key`; default calls `defragment` and copies.
+    fn defragment_into(&self, fragments: &Fragments, out: &mut [u8]) -> Result<()> { .. }
     fn describe(&self) -> Cow<'_, str>;
 }
 ```
+
+Since 1.1 you can implement it outside the crate: read the key with
+`RawKey::expose_secret`, build the output with `Fragments::from_chunks`,
+and read it back with `Fragments::chunk` / `layout_bytes` / `total_len`.
+Select it for a vault with `KeyVaultBuilder::with_fragmenter`.
 
 **Contract:**
 
@@ -906,7 +1107,8 @@ Source: `src/fragment/layered.rs`
 Composition by random routing among sub-strategies. Each `fragment`
 call picks a sub-strategy uniformly at random; the picked index is
 prepended to the layout as a 4-byte LE header so `defragment` dispatches
-correctly.
+correctly. Since 1.1 `defragment` hands the sub-strategy a view of the
+same chunks instead of copying each one into a new locked buffer.
 
 **Constructors:**
 
@@ -1309,11 +1511,12 @@ Source: `src/audit/mod.rs`
 
 **Fields:**
 
-- `pub timestamp: Duration` — since UNIX_EPOCH.
+- `pub timestamp: Duration` — since the Unix epoch, from the vault's
+  `Clock`.
 - `pub key_name: String` — never key bytes. Empty for one-shot
   `fragment` / `defragment`; `"<master>"` for master-unlock attempts.
 - `pub kind: AccessKind` — discriminant of the operation.
-- `pub thread_id: std::thread::ThreadId`.
+- `pub thread_id: std::thread::ThreadId` — `std` builds only.
 - `pub note: Cow<'static, str>` — caller-supplied free-text label.
 
 <hr>
@@ -1404,7 +1607,9 @@ Source: `src/monitor/mod.rs`
 - `pub key_name: String`
 - `pub failures_in_window: u32`
 - `pub window: Duration`
-- `pub lockout_triggered: bool`
+- `pub lockout_triggered: bool` — this breach started the lockout.
+- `pub scope: LockoutScope` — (1.1) `LockoutScope::Vault` or
+  `LockoutScope::Key`. `LockoutScope` is `#[non_exhaustive]`.
 
 <hr>
 
@@ -1614,17 +1819,18 @@ impl KeyFetch for EnvironmentFetch {
 
 ## API Safety
 
-**Public-API guarantees in 1.0.x:**
+**Public-API guarantees in 1.1:**
 
 | Guarantee | Verification |
 |-----------|--------------|
-| Zero `unsafe` in public API | Code review; the only `unsafe` blocks are in `tee::x86_64::safe_cpuid_count` and the `mlock`/`VirtualLock` shims in `src/memory/`, all crate-private. |
+| Zero `unsafe` in public API | Code review; the `unsafe` blocks are crate-private: `tee::x86_64::safe_cpuid_count`, the OS shims and buffers in `src/memory/` (`mlock`, `madvise`, `mmap` / `mprotect`, `VirtualLock` / `VirtualProtect`, WER), and the `no_std` spin lock in `src/sync.rs`. Every block has a `SAFETY` comment. |
 | No key bytes leak via `Debug` | `KeyHandle` / `KeyId` / `RawKey` / `Fragments` all print `<redacted>` or `<opaque>`. 1024-handle sweep test in CI. |
 | No key bytes in `Error` variants | All variants carry only sanitized prose. |
 | Constant-time handle equality | `KeyHandle: subtle::ConstantTimeEq`; `PartialEq` routes through it. `Hash` consistent. |
 | Zero-on-drop | Every `LockedBytes` (fragments, layout buffer, codex table) zeroizes its bytes before unlocking and freeing. `RawKey` zeroizes its whole allocation including spare capacity. The `with_key` scratch buffer is zeroed after every call. |
-| mlock / VirtualLock | Applied to every `LockedBytes` allocation and the `with_key` scratch buffer, with per-page reference counting so a page stays locked while any buffer on it is alive. Soft-fails (records `is_locked = false`) when `RLIMIT_MEMLOCK` is exceeded. |
-| `RawKey` bytes not exposed | `RawKey::as_bytes()` is `pub(crate)`; outside callers see only `len()`. |
+| mlock / VirtualLock + dump exclusion | Applied to every `LockedBytes` allocation and the `with_key` scratch buffer, with per-page reference counting so a page stays locked and excluded while any buffer on it is alive. Soft-fails when `RLIMIT_MEMLOCK` is exceeded. |
+| Page protection (opt-in) | Protected keys' mappings are inaccessible between reads; tests check `/proc/self/maps` / `VirtualQuery` and that a direct read crashes a child process. |
+| `RawKey` bytes exposed only on request | `RawKey::expose_secret()` (1.1) is the only public accessor. |
 | Round-trip for every `FragmentStrategy` | 1000-iteration stress + per-strategy unit tests in CI. |
 | Codex involution property | 256-byte sweep verified for `StaticCodex`, `DynamicCodex`, `FnCodex`, `IdentityCodex`. |
 
@@ -1637,24 +1843,22 @@ per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 1.0.x
+### What's not in 1.1
 
-- **Layer 10 page protection** (`PROT_NONE` between accesses): not
-  implemented.
 - **TPM / HSM acquisition**: `TpmFetch` is a placeholder that always
   errors.
-- **Selecting the vault's fragmenter**: the vault always uses
-  `StandardFragmenter`; the other strategies are usable directly.
-- **Per-key lockout and master-unlock backoff**: lockout is
-  vault-wide and there is no rate limit; planned for 1.1.
-- **Keyed or slow key derivation**: normalization and the master
-  digest are unsalted BLAKE3; a change would be breaking (2.0).
+- **Keyed normalization by default** and **master-unlock backoff by
+  default**: both are available as options; making them the default
+  changes behavior and is planned for 2.0.
+- **A slow KDF** for normalization or the master verifier. Run
+  passphrases through Argon2 or scrypt before registering them.
+- **Windows ACL checks in `FileFetch`**: NTFS ACLs are trusted.
 - **`MetricsMonitor` / `WebhookMonitor`**: not provided. Build a
   custom `SecurityMonitor` impl.
 - **Master-key-as-KEK**: the master is an emergency-unlock
   credential only.
 - **Constant-time `with_key`**: reassembly time depends on the
-  chunk layout; only the master digest check and handle equality use
+  chunk layout; only the master check and handle equality use
   `subtle::ConstantTimeEq`.
 
 ### Stability
@@ -1664,14 +1868,21 @@ per-layer architecture and threat-model coverage.
 
 ### Cross-platform support
 
-- **Linux**: x86_64, aarch64. mlock via `libc`. AWS Nitro detection via
-  DMI sysfs.
-- **macOS**: x86_64, aarch64 (Apple Silicon). mlock via `libc`. Secure
-  Enclave detection via target triple.
-- **Windows**: x86_64. VirtualLock via `windows-sys`. No Apple SE / AWS
+- **Linux**: x86_64, aarch64. `mlock`, `MADV_DONTDUMP`, `mmap` /
+  `mprotect` via `libc`. AWS Nitro detection via DMI sysfs.
+- **macOS**: x86_64, aarch64 (Apple Silicon). `mlock`, `mmap` /
+  `mprotect` via `libc`; no per-page dump exclusion. Secure Enclave
+  detection via target triple.
+- **Windows**: x86_64. `VirtualLock`, `WerRegisterExcludedMemoryBlock`,
+  `VirtualAlloc` / `VirtualProtect` via `windows-sys`. No Apple SE / AWS
   Nitro detection.
+- **FreeBSD / DragonFly**: `MADV_NOCORE` for dump exclusion (compiled,
+  not tested in CI).
+- **`no_std`**: bare-metal targets such as `thumbv7em-none-eabihf`
+  (built in CI).
 
-CI exercises every combination on `stable` and pinned MSRV `1.85.0`.
+CI exercises Linux, macOS and Windows on `stable` and pinned MSRV
+`1.85.0`, plus the `no_std` build.
 
 ### Licensing
 
