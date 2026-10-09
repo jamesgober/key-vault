@@ -4,7 +4,7 @@
     <b>key-vault</b>
     <br>
     <sub>
-        <sup>ENTERPRISE-GRADE KEY MANAGEMENT VAULT</sup>
+        <sup>IN-MEMORY KEY VAULT</sup>
     </sub>
 </h1>
 
@@ -17,23 +17,23 @@
 </p>
 
 <p align="center">
-    <b>9-Layer Defense-in-Depth In-Memory Key Storage for Rust</b>
+    <b>Page-Locked, Zero-On-Drop In-Memory Key Storage for Rust</b>
     <br>
-    <i>Fragmentation + decoy bytes + codex transform + mlock + zeroize + constant-time + monitoring + audit + page protection.</i>
+    <i>mlock + zeroize + opaque handles + scoped access, with optional fragmentation, decoy and codex obfuscation, monitoring and audit hooks.</i>
 </p>
 
 <br>
 
 <p>
-    <strong>key-vault</strong> is an enterprise-grade key management vault built to keep cryptographic key material safe in memory while your application is running. Built from the ground up with a <b>9-layer defense-in-depth philosophy</b>, it combines hardware-rooted acquisition, memory page locking, fragmentation with self-referential decoy bytes, codex transformation, zero-on-drop, constant-time operations, security event monitoring, and audit logging to make memory-resident keys hard to extract via memory analysis, scraping, or forensic recovery.
+    <strong>key-vault</strong> keeps cryptographic key material in process memory while your application runs. Keys live in page-locked (<code>mlock</code> / <code>VirtualLock</code>), zero-on-drop buffers. Callers get an opaque <code>KeyHandle</code> instead of a <code>Vec&lt;u8&gt;</code>, and the bytes are handed out only inside a scoped callback, from a buffer that is wiped when the callback returns.
 </p>
 
 <p>
-    Unlike libraries that hand you a <code>Vec&lt;u8&gt;</code> and trust you not to leak it, <strong>key-vault</strong> wraps key material in opaque <code>KeyHandle</code> references. The actual bytes never live contiguously in memory after the vault initializes; they're split into variable-size fragments scattered across non-contiguous mlock'd allocations, interleaved with self-referential decoy bytes that statistically match the key's entropy profile, optionally transformed through a codex layer, and reassembled only when explicitly requested in protected scopes. The temporary contiguous copy auto-zeroizes when dropped.
+    On top of that the vault splits each key into small shuffled fragments and can mix in decoy chunks and pass bytes through a codex. <b>These are obfuscation, not protection against a memory reader:</b> the layout map that reassembles the fragments and the codex table are stored in the same process memory, so anyone who can read that memory can rebuild every key. They make life harder for generic memory scans and heap-dump tooling; see the <a href="#threat-model">threat model</a>.
 </p>
 
 <p>
-    <strong>key-vault</strong> ships with multiple <b>fragment strategies</b> (standard, interleaved, random, layered composition), <b>decoy strategies</b> (random, self-referential, key-derived), pluggable <b>key fetchers</b> (TPM 2.0 hardware, OS keychains, encrypted files, environment variables), and an <b>extensible security monitor</b> for failure detection and anomaly alerting. Master key recovery, atomic key rotation, multi-key vaults, and <b>TEE detection</b> are built in. <b>Post-quantum</b> safe symmetric defaults (256-bit minimum) future-proof you against the next decade of cryptographic landscape changes.
+    Also included: atomic key rotation, named multi-key vaults, pluggable <b>key fetchers</b> (OS keychain, plaintext file, environment variable), caller-driven failure monitoring with an optional vault-wide lockout, audit hooks, master-key unlock, and informational TEE detection.
 </p>
 
 
@@ -42,26 +42,28 @@
 
 
 
-## 9-Layer Defense Architecture
+## Layers
 
-The complete defense stack:
+What each layer does in 1.0.x, plainly:
 
-| Layer | Defense | Defends Against |
-|-------|---------|-----------------|
-| **1** | **Secure Acquisition** (TPM, Keychain, etc.) | Untrusted key sources |
-| **2** | **Memory Page Locking** (mlock / VirtualLock) | Swap files, hibernation |
-| **3** | **Fragment Strategy** (variable chunks, shuffle) | Pattern recognition, memory scraping |
-| **4** | **Decoy Bytes** (self-referential filler) | Entropy/frequency analysis |
-| **5** | **Codex Transformation** (byte swap) | Memory dump analysis |
-| **6** | **Constant-Time Operations** | Timing side-channels |
-| **7** | **Zero-On-Drop** | Use-after-free leakage |
-| **8** | **Security Monitor** (failure detection) | Brute-force, anomalous access |
-| **9** | **Audit Logging** | Forensic trail, compliance |
-| **10** | (Bonus) Page Protection Toggling | Snapshot attacks |
+| Layer | What it is | Status in 1.0.x | Protects against | Does NOT protect against |
+|-------|-----------|-----------------|------------------|--------------------------|
+| **1** | Key acquisition (`KeyFetch`) | Keychain, plaintext file, env var. **`TpmFetch` is not implemented** (always errors) | Hardcoded keys | Anything once the key is in memory |
+| **2** | Page locking (`mlock` / `VirtualLock`) | On, best effort (fails silently at `RLIMIT_MEMLOCK`), per-page reference counted | Keys written to swap | Memory readers, core / crash dumps |
+| **3** | Fragmentation (1-8 byte shuffled chunks) | Always on (`StandardFragmenter`) | Scans for a contiguous key | Memory readers: the layout map is in the same memory |
+| **4** | Decoy chunks | **Off** unless `with_decoy` is called | Statistical scans for key-like regions | Memory readers: the layout map marks every decoy |
+| **5** | Codex (byte substitution table) | **Off** unless `with_codex` is called | Scans for the raw key bytes | Memory readers: the table is in the same memory. Not encryption |
+| **6** | Constant-time comparison | Master-key digest check, handle equality | Timing on the master check | Timing of key lookup and reassembly (not constant-time) |
+| **7** | Zero-on-drop (`zeroize`) | Every secret-bearing buffer the crate owns | Keys left in freed memory | Copies made by `std`, the OS or your own callback |
+| **8** | Failure monitor + lockout | **Advisory**: counts only failures you report; lockout is vault-wide | Repeated failures you report | Memory readers; it never sees decryption failures itself |
+| **9** | Audit hooks | One event per vault operation | Unnoticed API-level use | Tampering with your sink; reads below the API |
+| **10** | Page protection toggling (`PROT_NONE`) | **Not implemented** | | |
 
-**Full details:** see [docs/SECURITY.md](docs/SECURITY.md) for the comprehensive security architecture.
+Cargo features do not turn these layers on or off. Only `std`, the `fetcher-*` features and `monitor-tracing` change what is compiled; the other features (`mlock`, `zeroize`, `codex*`, `decoy-*`, `fragment-*`, `monitor`, `audit`, `tee-detect`, `post-quantum`, `preset-*`) are reserved and have **no effect in 1.0.x**. Decoys and the codex are enabled on the builder.
 
-**Visual walkthrough:** see [docs/TRANSFORMATION.md](docs/TRANSFORMATION.md) for a step-by-step trace of what happens to a key as it passes through all the layers.
+**Full details:** see [docs/SECURITY.md](docs/SECURITY.md) for each layer's limits.
+
+**Walkthrough:** see [docs/TRANSFORMATION.md](docs/TRANSFORMATION.md) for what happens to a key between `register` and `with_key`.
 
 <br>
 
@@ -93,31 +95,24 @@ key-vault = "1.0"
 
 ```rust
 use key_vault::{DynamicCodex, KeyVaultBuilder, RawKey, SelfReferenceDecoy};
-use key_vault::tee::detect_tee_capabilities;
 
-// Build a vault with the full default stack: Layer 2 (mlock/VirtualLock)
-// + Layer 3 (StandardFragmenter) + Layer 4 (SelfReferenceDecoy — the
-// strongest decoy) + Layer 5 (per-vault DynamicCodex involution)
-// + Layer 6 (ConstantTimeEq) + Layer 7 (zero-on-drop).
+// Page locking, zero-on-drop and fragmentation are always on. Decoys and
+// the codex are opt-in obfuscation and only apply when set here.
 let vault = KeyVaultBuilder::new()
-    .normalize_with_blake3(true) // default
+    .normalize_with_blake3(true) // default: store BLAKE3(key), 32 bytes
     .with_codex(DynamicCodex::new().expect("codex"))
     .with_decoy(SelfReferenceDecoy)
     .build();
 
-// Hand the vault some key material and get back an opaque, scattered,
-// mlock'd, zeroed-on-drop representation with decoy chunks mixed in.
-let raw = RawKey::new(b"my application key".to_vec());
-let frags = vault.fragment(&raw).expect("fragment");
+// Register a key and keep only the opaque handle.
+let handle = vault
+    .register("db-key", RawKey::new(b"my application key".to_vec()))
+    .expect("register");
 
-// Reassemble when you need to use it. With BLAKE3 normalization on,
-// the recovered bytes are the 32-byte hash of the input.
-let recovered = vault.defragment(&frags).expect("defragment");
-assert_eq!(recovered.len(), 32);
-
-// Snapshot the host's TEE capabilities at startup:
-let caps = detect_tee_capabilities();
-println!("{caps}");
+// Use the key inside a scoped callback. The slice is valid only for the
+// call; the buffer behind it is zeroed when the callback returns.
+let len = vault.with_key(handle, |key| key.len()).expect("with_key");
+assert_eq!(len, 32); // normalized: BLAKE3 digest of the input
 ```
 
 <hr>
@@ -125,23 +120,19 @@ println!("{caps}");
 
 ## Threat model
 
-key-vault is designed to defend against:
+key-vault helps against:
 
-- **Memory scraping by attackers with read access** — malware, forensic tools
-- **Forensic memory analysis** — swap files, hibernation files, crash dumps
-- **Statistical pattern recognition** — entropy analysis, frequency analysis
-- **Use-after-free leakage** — keys persisting after they should have been wiped
-- **Brute-force decryption attempts** — failed attempts trigger alerts
-- **Timing side-channels** — constant-time operations
-- **Insider threats / forensic compliance** — full audit trail
+- **Keys written to swap**: buffers are page-locked (best effort).
+- **Keys left in freed memory**: every buffer the crate owns is zeroized before it is freed.
+- **Accidental exposure**: redacted `Debug` output, sanitized errors, opaque handles, scoped access instead of long-lived byte copies.
+- **Generic memory scans and heap-dump tooling** that look for a contiguous key, a known key format, or a key-like region: fragmentation, normalization, and the opt-in decoys and codex make this harder. This is obfuscation.
 
-It does NOT defend against:
+key-vault does **NOT** protect against:
 
-- **Code execution within your process** — an attacker who can call your reassembly logic
-- **Hardware-level memory access (DMA attacks)** — use IOMMU + hardware mitigations
-- **Cold-boot attacks** — use full disk encryption + power-down protocol
-- **Side-channel attacks on cryptographic operations** — that's crypt-io's job
-- **Quantum computer attacks on asymmetric crypto** — use post-quantum algorithms (symmetric defaults are PQ-safe)
+- **Anyone who can read the process's memory**: a debugger, a same-user process with `ptrace` / `ReadProcessMemory`, a full core or crash dump, malware in the process, the kernel. The fragments, the layout map (which also marks the decoys) and the codex table are all in the same address space, so such an attacker can rebuild every key.
+- **Code running in your process**, which can call `with_key` like you do.
+- **Offline guessing of weak keys**: normalization and the master-key digest are fast, unsalted BLAKE3. Feed the vault high-entropy keys, or run passphrases through a slow KDF first.
+- **Hardware attacks** (DMA, cold boot) and **side channels in the crypto code** that uses the key.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
 
@@ -150,8 +141,8 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model.
 ## Documentation
 
 - **[docs/API.md](docs/API.md)** — Full public-API reference (every type, function, and method with examples)
-- **[docs/SECURITY.md](docs/SECURITY.md)** — Comprehensive 9-layer security architecture
-- **[docs/TRANSFORMATION.md](docs/TRANSFORMATION.md)** — Visual walkthrough of key transformation
+- **[docs/SECURITY.md](docs/SECURITY.md)** — Threat model and per-layer limits
+- **[docs/TRANSFORMATION.md](docs/TRANSFORMATION.md)** — Walkthrough of how a key is stored and read back
 - **[docs/release/](docs/release/)** — Per-version release notes
 - **[CHANGELOG.md](CHANGELOG.md)** — Full change log (Keep a Changelog format)
 

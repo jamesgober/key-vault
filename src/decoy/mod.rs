@@ -1,18 +1,23 @@
-//! Layer 4 — Decoy bytes.
+//! Layer 4: decoy chunks.
 //!
-//! Decoy strategies produce filler bytes that surround real key fragments in
-//! storage. The goal is statistical indistinguishability: an attacker
-//! scraping memory should not be able to tell which bytes are real and which
-//! are filler without the position map.
+//! Decoy strategies produce filler chunks that are stored and shuffled
+//! together with the real key fragments. The goal is that a scan which does
+//! not know the vault's layout cannot tell real chunks from filler by their
+//! byte statistics.
 //!
-//! Phase 0.4 ships three implementations covering the standard trade-off
-//! axis:
+//! This is **obfuscation**. The layout map that marks every decoy chunk is
+//! stored in the same process memory as the chunks, so anyone who can read
+//! process memory can separate them. No decoy is used unless one is passed
+//! to [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy);
+//! the `decoy-*` Cargo features are reserved and have no effect in 1.0.x.
 //!
-//! | Strategy                        | Output profile                | Strength            | Default? |
-//! |---------------------------------|-------------------------------|---------------------|----------|
-//! | [`RandomDecoy`]                 | Uniformly random              | Weakest, fastest    |          |
-//! | [`KeyDerivedDecoy`]             | BLAKE3-XOF (CSPRNG-like)      | Medium              |          |
-//! | [`SelfReferenceDecoy`]          | Drawn from the key itself     | Strongest           | ✅       |
+//! Three implementations ship:
+//!
+//! | Strategy                        | Output profile                | Statistical cover   |
+//! |---------------------------------|-------------------------------|---------------------|
+//! | [`RandomDecoy`]                 | Uniformly random              | Weakest, fastest    |
+//! | [`KeyDerivedDecoy`]             | BLAKE3-XOF (CSPRNG-like)      | Medium              |
+//! | [`SelfReferenceDecoy`]          | Drawn from the key itself     | Strongest           |
 //!
 //! The strongest built-in strategy ([`SelfReferenceDecoy`]) lifts bytes from
 //! the real key, so the filler is by definition drawn from the same

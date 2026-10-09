@@ -19,6 +19,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.2] - 2026-10-08
+
+No public API changes. `cargo semver-checks` against 1.0.1 reports no
+semver update required.
+
+### Security
+
+- **The documentation overstated what the crate protects against.**
+  README, `docs/SECURITY.md`, `docs/API.md`, `docs/TRANSFORMATION.md`
+  and the crate docs described fragmentation, decoys and the codex as
+  protection against process memory scrapers. They are obfuscation: the
+  layout buffer that reassembles the fragments (and marks every decoy
+  chunk) and the codex table are stored in the same process memory, so
+  anyone who can read that memory can rebuild every key. The docs now
+  have a threat model that says this, and each layer states what it
+  does and does not protect against.
+- **Layer 10 (page protection toggling) was documented but never
+  implemented.** There is no `mprotect` / `VirtualProtect` call in the
+  crate. It is now marked as not implemented everywhere it appeared.
+- **Page locks were released while other keys still used the page.**
+  `mlock` / `VirtualLock` work on whole pages and do not nest, and
+  fragments of different keys routinely share a page. Dropping any
+  fragment (on `rotate`, `unregister`, a one-shot `defragment`, or a
+  dropped codex) unlocked its whole page range, so pages backing other
+  live keys silently lost their lock. A process-wide per-page reference
+  count now locks a page when its first buffer arrives and unlocks it
+  only when its last buffer is dropped. On Linux, registering 200 pairs
+  of keys and unregistering one key of each pair took `VmLck` from
+  276 kB to 0 kB in 1.0.1; it now stays unchanged. New tests check the
+  count directly and check `VmLck` on Linux.
+- **The `with_key` scratch buffer is now page-locked** through the same
+  reference-counted table, so the plaintext copy that exists while the
+  callback runs is not paged out.
+- **More key-derived buffers are wiped.** The `zeroize` crate is now a
+  required dependency and is used for:
+  - `RawKey`: the whole allocation, including spare capacity beyond the
+    length. Before, only `0..len` was cleared, so bytes left after a
+    `truncate` survived.
+  - BLAKE3 normalization and the master-key digest: the hasher state
+    and output reader are zeroized (blake3's `zeroize` feature), and the
+    digest is written straight into a zeroizing buffer instead of
+    passing through a `blake3::Hash` copy.
+  - The master-key digest held by `KeyVaultBuilder` and `KeyVault`
+    (and every clone of the builder) is zeroized on drop. Before, it was
+    a plain `[u8; 32]`.
+  - `KeyDerivedDecoy` hasher state and output reader; the
+    `SelfReferenceDecoy` output buffer on early return; decoy output in
+    `StandardFragmenter` over its full capacity.
+  - Fragmenter temporaries (layout encodings, position lists, the
+    interleaved pool, random-fragment chunk buffers) on every exit
+    path, not only on success.
+  - `StaticCodex` / `DynamicCodex` construction tables on the stack.
+  - `FileFetch` read buffers on error and whenever they grow (the old
+    `std::fs::read` freed reallocated buffers unwiped), the rejected
+    value in `EnvFetch`'s non-UTF-8 error path, and the secret bytes
+    carried by `keyring`'s `BadEncoding` error in `KeychainFetch`.
+
+  Copies made inside `std`, the OS, `keyring` or the caller's own
+  `with_key` callback are outside the crate's control; the docs now say
+  so.
+
+### Fixed
+
+- **`register` could insert the same name twice.** The duplicate check
+  ran on one snapshot of the registry and the insert on a later one,
+  so concurrent registrations of the same name could all succeed.
+  Registry writers (`register`, `unregister`, `rotate`) are now
+  serialized by a writer lock and re-check under it. A new test runs 8
+  threads x 200 rounds on the same name; against 1.0.1 every round
+  registered the name 8 times.
+- **`rotate` could return `Ok` for a key that was unregistered at the
+  same moment.** Its `found` flag was set inside the `ArcSwap::rcu`
+  closure and never reset between retries, so if a concurrent
+  `unregister` won, `rotate` reported success and emitted a Rotate
+  audit event although the new key was never stored. It now returns
+  `Error::KeyNotFound` in that case. A new test parks `rotate` between
+  its existence check and its update while `unregister` runs; against
+  1.0.1 it returned `Ok` in 10 of 10 rounds.
+- **`FileFetch` checked one file and could read another.** It called
+  `metadata(path)` for the permission check and then `read(path)`, so
+  the path could be swapped (for example via a symlink) in between. It
+  now opens the file once and reads the mode from the open handle.
+- **`register` and `rotate` emitted an extra unnamed `OneShotFragment`
+  audit event.** They now emit only `Register` / `Rotate`.
+- **`TpmFetch`'s error message** told callers to use
+  `detect_tee_capabilities()` to probe for a TPM, which it cannot do.
+  The message now says TPM acquisition is not implemented.
+- `rustfmt` 1.99 formatting: lowercase hex literals in
+  `src/tee/x86_64.rs` and `tests/proptest_invariants.rs`.
+
+### Changed
+
+- **Documentation of Cargo features.** Only `std`, the four
+  `fetcher-*` features and `monitor-tracing` change what is compiled
+  (`default` and `fetcher-all` just enable others). The other 20 gate no
+  code: `mlock`, `zeroize`, `codex`, `codex-dynamic`, all `decoy-*`, all
+  `fragment-*`, `monitor`, `audit`, `tee-detect`, `post-quantum` and all
+  `preset-*`. They are now documented as reserved with no effect in
+  1.0.x (in `Cargo.toml`, `docs/API.md`, `docs/STABILITY-1.0.md` and the
+  crate docs). They are kept because removing a feature is a breaking
+  change. `preset-fast` does not turn off page locking and
+  `preset-paranoid` does not turn on decoys or a codex.
+- **`zeroize` is no longer an optional dependency**, and `blake3` is
+  now required at `>= 1.5` with its `zeroize` feature. The `zeroize`
+  Cargo feature still exists and has no effect.
+- **`FileFetch` is documented as reading plaintext.** Cargo.toml and
+  `docs/SECURITY.md` called it "encrypted file storage"; it has never
+  decrypted anything.
+- **`TpmFetch` is documented as not implemented** instead of
+  "detection-only" or "highest security (hardware-backed)". It always
+  returns an error, and nothing in the crate detects a TPM.
+- **Lockout is documented as advisory and vault-wide.** The vault only
+  counts failures the caller passes to `report_failure` (and wrong
+  master credentials); one key name crossing the threshold locks out
+  every key. Behavior is unchanged; per-key lockout is planned for 1.1.
+- **`unlock_with_master` is documented as having no rate limit**, and
+  normalization and the master digest as unsalted, fast BLAKE3 that
+  allows offline guessing of low-entropy inputs.
+- Other doc corrections: constant-time claims limited to the master
+  digest check and handle equality; TEE detection documented as
+  heuristic and informational; `EnvFetch` documented as leaving the
+  value in the environment; `KeychainFetch` documented as UTF-8 only;
+  stale "Phase 0.x" status text removed from the crate docs; the
+  crates.io description no longer claims TPM support or "9-layer"
+  defense.
+
+---
+
 ## [1.0.1] - 2026-10-08
 
 ### Fixed

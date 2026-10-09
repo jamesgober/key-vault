@@ -2,10 +2,19 @@
 //!
 //! [`detect_tee_capabilities`] inspects the host platform and returns a
 //! [`TeeCapabilities`] snapshot describing which trusted execution
-//! environments are *available* — not whether the current process is *running
-//! inside* one. The vault uses this at startup to choose between
-//! `KeyFetch` implementations and to surface availability through audit
-//! records.
+//! environments the platform *advertises*, not whether the current process
+//! is *running inside* one. Detection is informational: the vault never
+//! calls it on its own, and the result does not change vault behavior.
+//!
+//! `Detected` is a heuristic, not proof that a TEE is usable:
+//!
+//! - SGX: only the CPUID feature bit is checked, not whether SGX is enabled
+//!   in firmware or usable by this process.
+//! - Secure Enclave: reported as `Detected` for every `aarch64` macOS
+//!   build, without probing the hardware.
+//! - Nitro: inferred from the DMI system vendor being `Amazon EC2`, which
+//!   is true for EC2 instances in general, not only Nitro Enclave hosts.
+//! - TPMs are not detected at all.
 //!
 //! # What 1.0 promises
 //!
@@ -137,8 +146,9 @@ pub struct TeeCapabilities {
 impl TeeCapabilities {
     /// Returns `true` if at least one probe positively confirmed a TEE.
     ///
-    /// This is the convenience predicate for "should I prefer a hardware-backed
-    /// fetcher?". `Unknown` does not count.
+    /// `Unknown` does not count. See the module docs for how weak some of
+    /// the individual signals are; key-vault 1.0.x has no hardware-backed
+    /// fetcher to switch to.
     #[must_use]
     pub fn any_detected(self) -> bool {
         self.sgx.is_detected()

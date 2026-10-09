@@ -13,13 +13,23 @@
 //!
 //! The native credential stores enforce OS-level access control: secrets
 //! are scoped to the user account and (on macOS) to the requesting
-//! application's signing identity. They are the highest-security
-//! general-purpose backend short of dedicated hardware. Use this whenever
-//! you have the option.
+//! application's signing identity. This is the strongest built-in
+//! fetcher. Use it whenever you have the option.
+//!
+//! # Limits
+//!
+//! - Secrets are read with `keyring`'s `get_password`, so only UTF-8
+//!   values are accepted. A stored binary key fails with "stored value is
+//!   not UTF-8"; the bytes carried by that error are zeroized before the
+//!   error is dropped.
+//! - Buffers inside `keyring` and the platform credential APIs are
+//!   outside this crate's control and are not wiped.
 
 use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::{String, ToString};
+
+use zeroize::Zeroize;
 
 use super::{FetchContext, KeyFetch, RawKey};
 use crate::Result;
@@ -77,14 +87,21 @@ impl KeyFetch for KeychainFetch {
                     redact_keyring_error(&e),
                 ),
             })?;
-        let value = entry.get_password().map_err(|e| Error::Acquisition {
-            source: Cow::Borrowed("keychain"),
-            reason: format!(
-                "could not read keychain entry {}/{}: {}",
-                self.service,
-                self.account,
-                redact_keyring_error(&e),
-            ),
+        let value = entry.get_password().map_err(|mut e| {
+            // `BadEncoding` carries the raw secret bytes that failed UTF-8
+            // decoding. Wipe them before the error is dropped.
+            if let keyring::Error::BadEncoding(bytes) = &mut e {
+                bytes.zeroize();
+            }
+            Error::Acquisition {
+                source: Cow::Borrowed("keychain"),
+                reason: format!(
+                    "could not read keychain entry {}/{}: {}",
+                    self.service,
+                    self.account,
+                    redact_keyring_error(&e),
+                ),
+            }
         })?;
         Ok(RawKey::new(value.into_bytes()))
     }

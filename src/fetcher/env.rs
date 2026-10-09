@@ -15,14 +15,26 @@
 //! (Kubernetes Secrets mounted as env, AWS Secrets Manager → env via Lambda,
 //! systemd `EnvironmentFile=` with restricted permissions, etc.).
 //!
+//! **The value stays in the environment.** `EnvFetch` reads the variable
+//! but does not remove it, so the key remains readable through the
+//! process environment (and `/proc/<pid>/environ`) for the life of the
+//! process, and is inherited by child processes. Remove it yourself after
+//! fetching if that matters (`std::env::remove_var`, which is `unsafe` in
+//! multi-threaded programs; the OS may still keep a copy of the original
+//! environment block).
+//!
+//! Only UTF-8 values are accepted. A non-UTF-8 value is rejected and the
+//! copy this module read is zeroized before the error is returned.
+//!
 //! For higher-security deployments prefer
-//! [`KeychainFetch`](super::keychain::KeychainFetch) (when available) or a
-//! TEE-backed fetcher.
+//! [`KeychainFetch`](super::keychain::KeychainFetch) (when available).
 
 use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::String;
 use std::env;
+
+use zeroize::Zeroize;
 
 use super::{FetchContext, KeyFetch, RawKey};
 use crate::Result;
@@ -73,21 +85,29 @@ impl EnvFetch {
 
 impl KeyFetch for EnvFetch {
     fn fetch(&self, _ctx: &FetchContext) -> Result<RawKey> {
-        match env::var(&self.var_name) {
-            Ok(value) => Ok(RawKey::new(value.into_bytes())),
-            Err(env::VarError::NotPresent) => Err(Error::Acquisition {
+        // Same lookup as `env::var`, but done in two steps so the
+        // non-UTF-8 value can be wiped instead of being dropped inside a
+        // `VarError::NotUnicode`.
+        let Some(value) = env::var_os(&self.var_name) else {
+            return Err(Error::Acquisition {
                 source: Cow::Borrowed("env"),
                 reason: format!("environment variable {} is not set", self.var_name),
-            }),
-            Err(env::VarError::NotUnicode(_)) => Err(Error::Acquisition {
-                source: Cow::Borrowed("env"),
-                // We deliberately do NOT include the OsString in the message —
-                // it could expose key bytes that happen to be near-UTF-8.
-                reason: format!(
-                    "environment variable {} contained non-UTF-8 bytes",
-                    self.var_name
-                ),
-            }),
+            });
+        };
+        match value.into_string() {
+            Ok(value) => Ok(RawKey::new(value.into_bytes())),
+            Err(not_utf8) => {
+                not_utf8.into_encoded_bytes().zeroize();
+                Err(Error::Acquisition {
+                    source: Cow::Borrowed("env"),
+                    // We deliberately do NOT include the value in the
+                    // message: it could expose key bytes.
+                    reason: format!(
+                        "environment variable {} contained non-UTF-8 bytes",
+                        self.var_name
+                    ),
+                })
+            }
         }
     }
 

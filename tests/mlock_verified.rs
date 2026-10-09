@@ -62,3 +62,48 @@ fn vm_lck_grows_after_registering_many_keys() {
     drop(handles);
     drop(vault);
 }
+
+/// Unregistering some keys must not unlock pages that other live keys
+/// still use. Keys registered back to back put their small fragments on
+/// the same heap pages. In 1.0.1 every fragment called `munlock` on its
+/// whole page range when dropped, so unregistering the `a` keys took
+/// `VmLck` to 0 kB while all the `b` keys were still registered.
+#[test]
+fn vm_lck_stays_up_while_sibling_keys_are_live() {
+    let vault = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+    let mut a = Vec::with_capacity(200);
+    let mut b = Vec::with_capacity(200);
+    for i in 0..200u32 {
+        a.push(
+            vault
+                .register(format!("a{i}"), RawKey::new(vec![1u8; 32]))
+                .expect("register a"),
+        );
+        b.push(
+            vault
+                .register(format!("b{i}"), RawKey::new(vec![2u8; 32]))
+                .expect("register b"),
+        );
+    }
+    let with_both = read_vm_lck_kib();
+    if with_both == 0 {
+        eprintln!("mlock_verified: VmLck is 0 kB, RLIMIT_MEMLOCK likely 0; skipping");
+        return;
+    }
+
+    for h in a {
+        vault.unregister(h).expect("unregister a");
+    }
+    let after = read_vm_lck_kib();
+    assert!(
+        after > 0,
+        "VmLck dropped to 0 kB while {} keys are still registered (was {with_both} kB)",
+        b.len()
+    );
+    for h in &b {
+        assert_eq!(
+            vault.with_key(*h, <[u8]>::to_vec).expect("with_key"),
+            vec![2u8; 32]
+        );
+    }
+}

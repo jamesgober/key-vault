@@ -35,7 +35,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::util::{random_u64, zero_buffer};
+use zeroize::Zeroizing;
+
+use super::util::random_u64;
 use super::{FragmentStrategy, Fragments};
 use crate::Result;
 use crate::error::Error;
@@ -116,14 +118,14 @@ impl FragmentStrategy for LayeredFragmenter {
         let (chunks, sub_layout, total_len) = sub_fragments.into_parts();
         let sub_layout_bytes = sub_layout.as_bytes();
 
-        let mut new_layout_bytes: Vec<u8> = Vec::with_capacity(4 + sub_layout_bytes.len());
+        let mut new_layout_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(4 + sub_layout_bytes.len()));
         let pick_u32 = u32::try_from(pick)
             .map_err(|_| Error::Internal("LayeredFragmenter sub-strategy index exceeded u32"))?;
         new_layout_bytes.extend_from_slice(&pick_u32.to_le_bytes());
         new_layout_bytes.extend_from_slice(sub_layout_bytes);
 
         let new_layout = LockedBytes::from_slice(&new_layout_bytes);
-        zero_buffer(&mut new_layout_bytes);
         drop(new_layout_bytes);
         // Explicitly drop the old (sub-strategy's) layout buffer now;
         // its destructor zeroes and unlocks.

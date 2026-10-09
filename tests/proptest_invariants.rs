@@ -193,8 +193,8 @@ fn concurrent_reads_never_observe_torn_state() {
     use std::thread;
 
     let vault = Arc::new(KeyVaultBuilder::new().normalize_with_blake3(false).build());
-    let initial = vec![0xAAu8; 32];
-    let rotated = vec![0xBBu8; 32];
+    let initial = vec![0xaau8; 32];
+    let rotated = vec![0xbbu8; 32];
 
     let handle = vault
         .register("hot", RawKey::new(initial.clone()))

@@ -1,13 +1,19 @@
-//! Layer 8 — Security monitor.
+//! Layer 8: security monitor.
 //!
-//! A [`SecurityMonitor`] is the vault's outbound channel for anomaly events:
-//! repeated decryption failures, unusual access patterns, and threshold
-//! breaches. Monitor calls happen on the failure path only; the success path
-//! costs nothing.
+//! A [`SecurityMonitor`] is the vault's outbound channel for failure and
+//! anomaly events: failures and anomalies that the **caller reports**
+//! through [`KeyVault::report_failure`](crate::KeyVault::report_failure)
+//! and [`KeyVault::report_anomalous_access`](crate::KeyVault::report_anomalous_access),
+//! wrong master credentials, and threshold breaches. The vault does not
+//! detect decryption failures or unusual access on its own; it never sees
+//! what the caller does with a key.
 //!
-//! Built-in monitors (`NoMonitor`, `LogMonitor`, `MetricsMonitor`,
-//! `WebhookMonitor`, `CompositeMonitor`) arrive in Phase 0.8. This module
-//! currently defines the trait surface and the three event-context structs.
+//! The threshold lockout that goes with this layer is advisory and
+//! vault-wide; see [`KeyVault::is_locked_out`](crate::KeyVault::is_locked_out).
+//! It does nothing against an attacker who can read process memory.
+//!
+//! Built-in monitors: [`NoMonitor`] (default), [`CompositeMonitor`], and
+//! `LogMonitor` (behind the `monitor-tracing` feature).
 
 use alloc::borrow::Cow;
 use alloc::string::String;

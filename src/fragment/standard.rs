@@ -17,7 +17,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::util::{fisher_yates, sample_range, zero_buffer, zero_buffer_owned};
+use zeroize::Zeroizing;
+
+use super::util::{fisher_yates, sample_range};
 use super::{FragmentStrategy, Fragments};
 use crate::Result;
 use crate::decoy::DecoyStrategy;
@@ -200,10 +202,11 @@ impl FragmentStrategy for StandardFragmenter {
         if let Some(ref decoy) = self.decoy {
             for _ in 0..n_decoy {
                 let size = sample_range(self.min_chunk, self.max_chunk)?;
-                let bytes = decoy.generate(key, size)?;
+                // Decoy output can be drawn from the key (self-reference,
+                // key-derived), so the temporary buffer is zeroized on
+                // drop, over its whole capacity.
+                let bytes = Zeroizing::new(decoy.generate(key, size)?);
                 decoy_chunks.push(LockedBytes::from_slice(&bytes));
-                // Zero the temporary plaintext decoy buffer before drop.
-                zero_buffer_owned(bytes);
             }
         }
 
@@ -226,7 +229,10 @@ impl FragmentStrategy for StandardFragmenter {
         // Step 5: walk the shuffled order, materializing chunks and the
         // layout buffer in lockstep.
         let mut chunks: Vec<LockedBytes> = Vec::with_capacity(total_chunks);
-        let mut layout_bytes: Vec<u8> = Vec::with_capacity(total_chunks * 4);
+        // The layout is the map from chunks back to the key; wipe the
+        // temporary copy on every exit path.
+        let mut layout_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(total_chunks * 4));
         // We need to pull decoy chunks out one at a time; convert to Option
         // so we can `.take()` each slot without moving the Vec.
         let mut decoy_slots: Vec<Option<LockedBytes>> =
@@ -249,7 +255,6 @@ impl FragmentStrategy for StandardFragmenter {
         }
 
         let layout = LockedBytes::from_slice(&layout_bytes);
-        zero_buffer(&mut layout_bytes);
         drop(layout_bytes);
         drop(real_pairs);
         drop(decoy_slots);

@@ -1,816 +1,281 @@
 # Security Architecture
 
-> **9-Layer Defense-in-Depth + 1 Bonus Layer**
->
-> This document is the full security architecture for `key-vault`. Every layer is documented with what it defends against, what it does NOT defend against, performance impact, and how it composes with other layers.
+> What each layer of `key-vault` does in 1.0.x, what it protects against, and what it does not. This document was rewritten for 1.0.2 to match the code; earlier versions overstated several layers.
 
 ---
 
-## Why layers
+## Threat model
 
-No single defense is bulletproof. A sophisticated attacker with unlimited time and access can defeat any one technique. Real-world security comes from layered defenses where:
+`key-vault` keeps secret keys in process memory for a running application. The question every layer answers is: who could get at those bytes, and how?
 
-1. Each layer adds friction
-2. Layers are independent (defeating one doesn't defeat the others)
-3. Multiple layers must fail simultaneously for total compromise
-4. The cost of attack exceeds the value of the target
+### What it helps with
 
-The 0.1% of elite attackers may still win. The other 99.9% — opportunistic attackers, automated tools, forensic recovery — get stopped at one of the layers.
+| Threat | What helps | How much |
+|--------|------------|----------|
+| Keys written to swap | Layer 2 (page locking) | Real, but best effort: locking can fail silently against `RLIMIT_MEMLOCK` (Linux/macOS) or the minimum working-set size (Windows). Check `ulimit -l`. |
+| Keys left in freed memory | Layer 7 (zero-on-drop) | Real for every buffer the crate allocates. Not for copies made by `std`, the OS, `keyring`, or your own code. |
+| Keys leaking through logs, `Debug`, error messages | Redacted `Debug` impls, sanitized errors, opaque `KeyHandle` | Real. |
+| Long-lived plaintext copies in application code | `with_key` hands out a slice only for the duration of a callback | Real, as long as the callback does not copy the bytes somewhere long-lived. |
+| Casual memory scans, heap dumps searched with generic tools (looking for a contiguous key, a known format, or a high-entropy run) | Layers 3, 4, 5 (fragmentation, decoys, codex), BLAKE3 normalization | **Obfuscation only.** Raises the effort for tools that do not know this crate. See below. |
+| Timing differences in the master-credential check | Layer 6 (`subtle::ConstantTimeEq`) | Real for that comparison. |
 
----
+### What it does not protect against
 
-## The 9 layers (plus bonus)
+- **Anyone who can read the process's memory.** This includes a debugger, another process running as the same user with `ptrace` / `ReadProcessMemory`, a full core dump or Windows crash dump, malware injected into the process, and the kernel. Every piece needed to rebuild a key is in the same address space:
+  - the fragments (Layer 3),
+  - the layout buffer that records where each fragment belongs **and which chunks are decoys** (Layer 4 marks decoys with the offset `u32::MAX`),
+  - the codex lookup table (Layer 5).
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  LAYER 1: Secure Acquisition (TPM/HSM/Keychain)             │
-│  ├── Hardware-rooted trust where available                  │
-│  └── Untrusted input is never accepted                      │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 2: Memory Page Locking (mlock / VirtualLock)         │
-│  ├── Prevents swap to disk                                  │
-│  └── Reduces hibernation/coredump exposure                  │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 3: Fragment Strategy (key splicing + shuffling)      │
-│  ├── Variable chunk sizes (1-8 bytes typical)               │
-│  ├── Variable chunk counts (8-64 per scatter)               │
-│  └── Per-vault randomized layout                            │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 4: Decoy Bytes (nonsense filler)                     │
-│  ├── Self-referential (looks like real key material)        │
-│  ├── Key-derived (matches statistical profile)              │
-│  └── Defeats entropy/frequency analysis                     │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 5: Codex Transformation (byte swap)                  │
-│  ├── Per-vault or per-build transformation table            │
-│  ├── Involutional (encode == decode operation)              │
-│  └── Adds work for attacker even with memory access         │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 6: Constant-Time Operations                          │
-│  ├── No timing side-channels on key comparisons             │
-│  └── subtle::ConstantTimeEq for all equality checks         │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 7: Zero-On-Drop                                      │
-│  ├── zeroize crate overwrites memory on drop                │
-│  └── No persistence in freed memory                         │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 8: Security Monitor (failure detection)              │
-│  ├── Failed decryption attempts trigger alerts              │
-│  ├── Anomalous access patterns logged                       │
-│  └── Pluggable: webhook, metrics, logs, custom              │
-├─────────────────────────────────────────────────────────────┤
-│  LAYER 9: Audit Logging (access tracking)                   │
-│  ├── Every key access logged with context                   │
-│  ├── Caller identification, timestamp, thread               │
-│  └── Anomalies surface for forensic review                  │
-├─────────────────────────────────────────────────────────────┤
-│  BONUS LAYER 10: Page Protection Toggling                   │
-│  ├── PROT_NONE when not in use                              │
-│  ├── PROT_READ only during reassembly                       │
-│  └── Reduces vulnerability window                           │
-└─────────────────────────────────────────────────────────────┘
-```
+  An attacker with read access walks the vault's structures and rebuilds every key. Fragmentation, decoys and the codex only help against tools that do not understand this layout. They are obfuscation, not encryption, and not protection against a memory reader.
+- **Code running inside the process.** It can call `KeyVault::with_key` like your application does.
+- **Hardware attacks** (DMA, cold boot) and **side channels in the cryptographic code** that uses the key.
+- **Offline guessing of low-entropy keys.** BLAKE3 normalization and the master-key digest are unsalted, fast hashes, not password hashes. If the input is a passphrase, anyone who obtains the normalized value or the master digest can test guesses at BLAKE3 speed. Run passphrases through a slow KDF (Argon2, scrypt) before registering them.
 
 ---
 
-## Layer 1: Secure Acquisition
+## Layer summary (1.0.x)
+
+| Layer | What it is | Status | Protects against | Does not protect against |
+|-------|-----------|--------|------------------|--------------------------|
+| **1** | Key acquisition (`KeyFetch`) | Keychain, plaintext file, env var. `TpmFetch` **not implemented** | Hardcoding keys in source | Anything once the key is in memory |
+| **2** | Page locking (`mlock` / `VirtualLock`) | On, best effort, per-page reference counted (1.0.2) | Swap | Memory readers, core/crash dumps |
+| **3** | Fragmentation (`StandardFragmenter`) | Always on in the vault | Contiguous-key scans | Memory readers (layout map is in memory) |
+| **4** | Decoy chunks | **Off** unless `with_decoy` is called | Statistical scans for key-like regions | Memory readers (layout map marks decoys) |
+| **5** | Codex byte substitution | **Off** unless `with_codex` is called | Scans for the raw key bytes | Memory readers (table is in memory) |
+| **6** | Constant-time comparison | Master digest and handle equality | Timing on the master check | Timing of defragmentation or registry lookups (not constant-time) |
+| **7** | Zero-on-drop (`zeroize`) | On for every buffer the crate owns (extended in 1.0.2) | Freed-memory leakage | Copies outside the crate's control |
+| **8** | Failure monitor + lockout | **Advisory**, caller-reported, vault-wide | Repeated failures *that the caller reports* | Memory readers; failures the caller does not report |
+| **9** | Audit hooks | One event per operation | Undetected API-level use | Tampering with the sink; anything below the API |
+| **10** | Page protection toggling (`PROT_NONE`) | **Not implemented** | | |
+
+Cargo features do not switch layers on or off. In 1.0.x only `std`, the `fetcher-*` features and `monitor-tracing` change what is compiled. `mlock`, `zeroize`, `codex`, `codex-dynamic`, all `decoy-*`, all `fragment-*`, `monitor`, `audit`, `tee-detect`, `post-quantum` and all `preset-*` features are reserved and have no effect. `preset-fast` does not turn off page locking, and `preset-paranoid` does not turn on decoys or a codex.
+
+---
+
+## Layer 1: Key acquisition
 
 ### What it does
 
-Determines where keys come from. The root of trust for everything else.
-
-### Defends against
-
-- Untrusted user input becoming a key
-- Hardcoded keys in source code
-- Keys in environment variables read by other processes
-- Keys in files with weak permissions
-
-### Implementation
-
-The `KeyFetch` trait is the pluggable acquisition mechanism:
+The `KeyFetch` trait is where key bytes come from. Fetchers read a key once; the vault takes it from there.
 
 ```rust
 pub trait KeyFetch: Send + Sync {
     fn fetch(&self, ctx: &FetchContext) -> Result<RawKey>;
+    fn describe(&self) -> Cow<'_, str>;
 }
 ```
 
-Built-in fetchers (all feature-gated):
+### Built-in fetchers
 
-| Fetcher | Source | Security level |
-|---------|--------|---------------|
-| `TpmFetch` | TPM 2.0 hardware | Highest (hardware-backed) |
-| `KeychainFetch` | OS keychain | High (OS-protected) |
-| `FileFetch` | Encrypted file | Medium (encrypted at rest) |
-| `EnvFetch` | Environment variable | Low (process-readable) |
+| Fetcher | Feature | Source | Notes |
+|---------|---------|--------|-------|
+| `KeychainFetch` | `fetcher-keychain` | OS credential store via `keyring` | Strongest built-in. UTF-8 secrets only (`get_password`); a binary secret fails, and the bytes carried by that error are zeroized (1.0.2). |
+| `FileFetch` | `fetcher-file` | **Plaintext** file | No decryption of any kind. On Unix the file is opened once and the mode is read from the open handle, so the check and the read see the same file (1.0.2; before that a path swap between check and read was possible). Files with any `0o077` bit are rejected unless `allow_loose_perms()`. The owner and the parent directory are not checked. No permission check on Windows. |
+| `EnvFetch` | `fetcher-env` | Environment variable | The value **stays in the environment** (and `/proc/<pid>/environ`, and child processes). UTF-8 only; a non-UTF-8 value is zeroized before the error is returned (1.0.2). |
+| `TpmFetch` | `fetcher-tpm` | Nothing | **Not implemented.** `fetch` always returns `Error::Acquisition`. No TPM is detected or used anywhere in the crate. |
 
-### Performance
+### Limits
 
-- One-time cost at startup: 1ms - 100ms depending on source
-- Zero impact at runtime: keys are fetched once, then cached in fragmented form
-
-### Trade-offs
-
-- TPM: Highest security, slowest acquisition (~100ms), requires hardware
-- Keychain: Good security, fast (<10ms), requires OS support
-- File: Acceptable security with encryption, fast (<1ms)
-- Env: Lowest security, fastest (<1µs), suitable for development only
+Buffers inside `std` (file I/O, the environment block, UTF-16 conversion on Windows), the OS page cache and the platform credential APIs are outside this crate's control and are not wiped.
 
 ---
 
-## Layer 2: Memory Page Locking (mlock)
+## Key normalization (BLAKE3)
+
+With normalization on (the default), the key is replaced by `BLAKE3(key)` before it is stored. The 32-byte digest **is** the effective key: it is what `with_key` returns. This removes format cues (PEM headers, DER structure) from memory.
+
+It is an unkeyed, unsalted, fast hash. It does not make a weak key stronger, and the stored digest allows offline guessing of low-entropy inputs. Since 1.0.2 the hasher state and output reader are zeroized after use and the digest is written straight into a zeroize-on-drop buffer. Temporaries inside BLAKE3's compression function live on the stack and are not wiped.
+
+---
+
+## Layer 2: Page locking
 
 ### What it does
 
-Tells the OS "do not move these memory pages to disk." Pages stay in RAM, never written to swap or hibernation.
+Every `LockedBytes` buffer (fragments, layout maps, codex tables) and, since 1.0.2, the `with_key` scratch buffer, asks the OS to keep its pages in RAM: `mlock` on Linux/macOS, `VirtualLock` on Windows.
 
-### Defends against
+### Reference counting (1.0.2)
 
-- Swap file persistence (keys ending up on disk via OS paging)
-- Hibernation file exposure (partially — some platforms handle locked pages specially)
-- Forensic recovery from disk
-- Cold-boot attacks (reduces but doesn't eliminate)
+The OS locks whole pages, and locks do not nest: one `munlock` releases a page no matter how many buffers on it were locked. Fragments are small separate allocations, so fragments of different keys routinely share a page. In 1.0.1 and earlier, dropping any fragment (on `rotate`, `unregister` or a one-shot `defragment`) unlocked its whole page, including pages other live keys still used, and the lock was silently lost.
 
-### Does NOT defend against
+1.0.2 keeps a process-wide table counting, per page, how many live locked buffers touch it. A page is locked when its count goes from 0 to 1 and unlocked only when the count returns to 0.
 
-- Privileged code reading RAM directly
-- Hardware compromise (e.g., DMA attacks)
-- Kernel-level forensic tools
+### Protects against
 
-### Implementation
+- Key pages being written to swap.
 
-Linux/macOS: `mlock(addr, len)` and `munlock(addr, len)`
-Windows: `VirtualLock(addr, size)` and `VirtualUnlock(addr, size)`
+### Does not protect against
 
-Applied automatically to every fragment allocation. Pages are unlocked on drop after zeroize.
-
-### Performance
-
-- One-time cost: ~1µs per `mlock` call (rare path)
-- Zero runtime cost: doesn't affect read/write operations
-
-### Limitations
-
-- Locked memory counts against process limits (RLIMIT_MEMLOCK on Linux)
-- Linux requires CAP_IPC_LOCK or appropriate ulimit
-- Windows: works at page granularity
+- Memory readers of any kind.
+- Core dumps and Windows crash dumps: locked pages are still dumped. The crate does not use `MADV_DONTDUMP` or exclude memory from Windows dumps.
+- Hibernation: platform dependent.
+- Lock failures. If the OS refuses (resource limit), the buffer works unlocked and nothing is reported to the caller.
 
 ---
 
-## Layer 3: Fragment Strategy
+## Layer 3: Fragmentation
 
 ### What it does
 
-Splits the key into variable-size chunks at non-contiguous memory addresses. The original key never exists as contiguous bytes in memory after fragmentation.
+`StandardFragmenter` splits the (normalized, optionally codex-encoded) key into chunks of 1-8 bytes (configurable with `with_chunk_range`), shuffles them, and stores each chunk in its own `LockedBytes`. A separate `LockedBytes` layout buffer stores each chunk's original offset.
 
-### Defends against
+The vault always uses `StandardFragmenter`. `InterleavedFragmenter`, `RandomFragmenter` and `LayeredFragmenter` exist and can be used directly through the `FragmentStrategy` trait, but the builder cannot select them in 1.0.x, and the `fragment-*` features do nothing.
 
-- Memory scraping for high-entropy regions
-- Pattern matching for known key formats
-- Linear memory dumps
-- Adjacent memory leaks (a vulnerability finds the wrong chunk)
+### Protects against
 
-### Does NOT defend against
+- A scan that looks for the key as one contiguous run of bytes.
 
-- Reverse engineering of the reassembly logic
-- Targeted attacks that can trace allocations
+### Does not protect against
 
-### Implementation
-
-```
-ORIGINAL KEY:    0fx03mmqrhxhrk13
-                 ↓
-FRAGMENTS:       ["hxh", "03", "m", "fx", "k13", "qrr", "0m"]  (shuffled)
-                 ↓
-STORED AT:       0x7fa1b2c3 (allocation 1), 0x7fa1b400 (allocation 2), ...
-                 (non-contiguous addresses, mlock'd)
-```
-
-Variable chunk sizes: 1-8 bytes typical (configurable via `frag_min`, `frag_max`)
-Variable chunk counts: 8-64 chunks per scatter (depends on key length)
-Per-scatter random seed: each vault initialization gets fresh randomization
-
-### Strategies (shipped in 0.5.0)
-
-| Strategy                | Storage shape                              | Layout encoding                        | Defends best against    | Memory overhead |
-|-------------------------|--------------------------------------------|----------------------------------------|-------------------------|-----------------|
-| `StandardFragmenter`    | Many `LockedBytes`, each 1–8 contiguous key bytes, shuffled order | One u32 offset per chunk; `u32::MAX` sentinel for decoy chunks | Pattern recognition + linear scans | 1–2× key (with decoy) |
-| `RandomFragmenter`      | Many `LockedBytes` (default 1–4 bytes), each holding bytes drawn from **non-contiguous** key positions | Per chunk: `(size: u32, pos[0]..pos[size-1]: u32)` | Contiguous-format recognition (DER, PEM, ASCII-armor) | 5× key (4 bytes layout per real byte) |
-| `InterleavedFragmenter` | One large `LockedBytes` pool (default 4× key length), key bytes scattered at random positions, padding filled with CSPRNG bytes | `(pool_size: u32, pos[0]..pos[key_len-1]: u32)` | Byte-level statistical analysis | 4× key |
-| `LayeredFragmenter`     | Whatever the picked sub-strategy produces, with a 4-byte strategy-index header prepended to its layout | `(strategy_idx: u32, sub_strategy_layout)` | Sophisticated attackers who know one strategy but not which | Same as picked sub-strategy |
-
-#### Per-strategy threat focus
-
-- **`StandardFragmenter`** (the baseline): chunks are contiguous runs of
-  key bytes. The defense is "find a chunk, you got 1–8 bytes." When
-  combined with `SelfReferenceDecoy` (Layer 4), an attacker also can't
-  tell which chunks are real.
-
-- **`RandomFragmenter`**: each chunk's bytes are *non-contiguous in the
-  original key*. Even a successful chunk read reveals at most
-  `max_chunk` (default 4) bytes from random positions, with no
-  contiguous run. Defeats format-recognition attacks that need a
-  contiguous header.
-
-- **`InterleavedFragmenter`**: one large pool, key bytes at random
-  positions among CSPRNG-random padding. An attacker who reads the pool
-  cannot distinguish key bytes from padding without the layout map.
-  The trade-off: the pool is a single contiguous allocation, so a
-  partial-read attack against the pool yields a substring of the pool
-  (mostly padding, occasionally a key byte). Best paired with
-  `LayeredFragmenter` so the attacker doesn't even know they have a
-  pool.
-
-- **`LayeredFragmenter`**: each `fragment` call picks one sub-strategy
-  uniformly at random and delegates. The attacker has to guess which
-  sub-strategy was used to know what layout encoding to apply.
-  Composition through routing (rather than chained transformations)
-  avoids materializing the key between layers.
-
-#### Decoy compatibility
-
-- `StandardFragmenter::with_decoy` — full support; emits paired real and
-  decoy chunks recognized via the `u32::MAX` sentinel.
-- `RandomFragmenter` — no built-in decoy slot in 0.5.0. Combine with
-  `LayeredFragmenter` if you want decoy + non-contiguous scatter.
-- `InterleavedFragmenter` — no separate decoy: the pool padding itself
-  is CSPRNG noise that doubles as decoy.
-- `LayeredFragmenter` — inherits decoy behavior from whichever
-  sub-strategy was picked for a given fragmentation.
-
-### Performance
-
-- Fragmentation: ~100-500ns per key (one-time setup)
-- Reassembly (defrag): ~50-200ns per key access (hot path)
-- Memory overhead: ~2-4x key size due to fragments + decoy
+- Memory readers: the layout buffer that reassembles the key is in the same process memory. Small heap allocations are also usually close together, often on the same page, so "non-contiguous" does not mean "far apart".
 
 ---
 
-## Layer 4: Decoy Bytes
+## Layer 4: Decoy chunks
 
 ### What it does
 
-Fills the spaces around real fragments with "nonsense" bytes that look indistinguishable from real key material.
+When a `DecoyStrategy` is set with `KeyVaultBuilder::with_decoy`, `StandardFragmenter` adds one decoy chunk per real chunk and shuffles them together. **No decoy is used by default**, and the `decoy-*` features do not add one.
 
-### Defends against
+| Strategy | Output | Statistical cover |
+|----------|--------|-------------------|
+| `RandomDecoy` | CSPRNG bytes | Weakest |
+| `KeyDerivedDecoy` | BLAKE3 XOF of key + nonce | Medium |
+| `SelfReferenceDecoy` | Bytes sampled from the key | Strongest |
 
-- Entropy analysis (finding high-entropy regions in memory)
-- Frequency analysis (statistical patterns in byte distributions)
-- Pattern recognition (recognizing where key bytes are)
+### Protects against
 
-### Does NOT defend against
+- Statistical scans (entropy, byte histograms) that try to find key-like regions without knowing the vault's layout.
 
-- Knowing the fragmentation algorithm and reversing it
-- Attackers with code execution that can call defrag logic
+### Does not protect against
 
-### Implementation
-
-```
-KEY:           0fx03mmqrhxhrk13
-FRAGMENTS:     ["hxh", "03", "m", "fx", "k13", "qrr", "0m"]
-DECOY BYTES:   "x0", "x0", "mhx", "qx0", "fxh", "101", "qrr", "0hxq", "rrx", "0mx"
-                ↓ (interleaved)
-FINAL OUTPUT:  x0hxhmhx03qrr0fxh13mqrrx0mx01hxh...
-                ↑    ↑      ↑  ↑          ↑
-                decoy real   decoy real   decoy
-```
-
-Notice how the decoy bytes contain fragments OF the key (`hxh`, `0m`, `qrr`). An attacker can't determine which is real and which is decoy without the position map.
-
-### Strategies
-
-| Strategy | Approach | Strength |
-|----------|----------|----------|
-| `RandomDecoy` | Pure CSPRNG bytes | Weak — high entropy distinguishes from key bytes |
-| `KeyDerivedDecoy` | Hash of key material | Medium — same entropy profile as key |
-| `SelfReferenceDecoy` | Real key bytes as filler | Strong — indistinguishable from real fragments |
-
-### Performance
-
-- Decoy generation: ~50-100ns per key (one-time setup)
-- Storage overhead: configurable via `frag_len` (target output length)
+- Memory readers: the layout buffer marks every decoy chunk with the offset `u32::MAX`.
 
 ---
 
-## Layer 5: Codex Transformation
+## Layer 5: Codex
 
 ### What it does
 
-Applies a byte-level swap transformation to all bytes (real key + decoy) before storage. Adds an obfuscation layer that even a successful memory dump must defeat.
+When a codex is set with `KeyVaultBuilder::with_codex`, every byte of the key is passed through `Codex::encode` before fragmentation and `Codex::decode` after reassembly. The built-in codices (`StaticCodex`, `DynamicCodex`) are 256-byte substitution tables that are involutions (encode equals decode). **No codex is used by default**, and the `codex` / `codex-dynamic` features do not add one.
 
-### Defends against
+### Protects against
 
-- Memory dump analysis (attacker sees transformed bytes, not real ones)
-- Reverse engineering pattern attacks
-- "Read the memory and try it as a key" attacks
+- A scan for the raw key bytes, or a tool that reassembles fragments without knowing a codex was applied.
 
-### Does NOT defend against
+### Does not protect against
 
-- Attackers with the codex table (e.g., from reverse-engineered binary)
-- Cryptographic attacks (this is obfuscation, not encryption)
-- Sophisticated frequency analysis if transformation is naive
-
-### Implementation
-
-The `Codex` trait defines the transformation:
-
-```rust
-pub trait Codex: Send + Sync {
-    fn encode(&self, byte: u8) -> u8;
-    fn decode(&self, byte: u8) -> u8;
-}
-```
-
-**For involution-based codices (encode = decode):**
-
-```rust
-// Static lookup table — built into the binary
-pub struct StaticCodex([u8; 256]);
-
-impl StaticCodex {
-    /// Build from a list of swap pairs.
-    /// `[('h', '%'), ('k', '$'), ('0', '#')]` means:
-    ///   h ↔ % (encode h → %, encode % → h, decode same)
-    ///   k ↔ $
-    ///   0 ↔ #
-    /// Bytes not in swap pairs pass through unchanged.
-    pub fn from_swaps(swaps: &[(u8, u8)]) -> Self;
-
-    /// Generate a random involution.
-    /// Produces a permutation where applying it twice returns the original.
-    /// Used by DynamicCodex for per-vault randomization.
-    pub fn random_involution(rng: &mut impl RngCore) -> Self;
-}
-
-// User-provided closure
-pub struct FnCodex<F>(F);
-
-impl<F: Fn(u8) -> u8 + Send + Sync> Codex for FnCodex<F> {
-    fn encode(&self, byte: u8) -> u8 { (self.0)(byte) }
-    fn decode(&self, byte: u8) -> u8 { (self.0)(byte) }  // assumes involution
-}
-```
-
-### Example transformation
-
-```
-PRE-CODEX:    0fx03mmqrhxhrk13
-CODEX TABLE:  h ↔ %, k ↔ $, 0 ↔ #
-POST-CODEX:   #fx#3mmqr%x%r$13
-              ↑    ↑     ↑   ↑
-              0→#  0→#   h→% k→$
-```
-
-To decode: same operation. Apply codex.decode() (or codex.encode(), they're the same for involutions). Original key returns.
-
-### Variants
-
-| Codex | Description |
-|-------|-------------|
-| `IdentityCodex` | No transformation (default, max perf) |
-| `StaticCodex` | Build-time transformation table (private builds customize this) |
-| `DynamicCodex` | Per-vault randomized table |
-| `FnCodex` | User-provided closure |
-
-### Performance
-
-- Per-byte transformation: ~5-10ns (lookup table)
-- For a 256-bit key with full reassembly: ~80-160ns total
-- For 256-byte fragmented output (with decoy): ~1.3-2.6µs
-
-**Feature-gated.** Opt-in via `codex` feature. Default off for maximum performance.
-
-### Hive DB pattern
-
-Hive DB ships its own `HiveCodex` with a proprietary swap table:
-
-```rust
-// In hive-key-vault (private crate)
-pub struct HiveCodex;
-
-impl Codex for HiveCodex {
-    fn encode(&self, byte: u8) -> u8 {
-        // Proprietary transformation, never exposed
-    }
-    fn decode(&self, byte: u8) -> u8 {
-        self.encode(byte)  // Involution
-    }
-}
-```
+- Memory readers: the table is stored in a `LockedBytes` in the same process. A substitution table is not a cipher.
 
 ---
 
-## Layer 6: Constant-Time Operations
+## Layer 6: Constant-time comparison
+
+`subtle::ConstantTimeEq` is used for the master-credential digest check (`unlock_with_master`) and for `KeyHandle` equality.
+
+Not constant-time: the registry lookup by handle (a `HashMap`), `handle_for_name`, and defragmentation, whose time depends on chunk count and layout. Handle ids are not secret, so the handle comparison is hygiene, not a security property.
+
+---
+
+## Layer 7: Zero-on-drop
+
+### What is wiped
+
+Through the `zeroize` crate (always on since 1.0.2; the `zeroize` feature is reserved):
+
+- `LockedBytes` (fragments, layout maps, codex tables) on drop, before unlocking.
+- `RawKey` on drop: the **whole allocation including spare capacity** (1.0.2; before that only `0..len`, so bytes beyond the length after a `truncate` survived).
+- The `with_key` scratch buffer after every call, including on defragment errors and panics.
+- Normalization and master-digest hasher state, output readers and digests (1.0.2).
+- The master-credential digest held by the builder and the vault (1.0.2).
+- Decoy generator output and hasher state, codex construction tables, fragmenter temporaries (layout encodings, positions, pools) on every exit path (1.0.2).
+- `FileFetch` read buffers on error and on growth; rejected non-UTF-8 `EnvFetch` values; the bytes inside `keyring`'s `BadEncoding` error (1.0.2).
+
+### Not wiped (outside the crate's control)
+
+- Copies made inside `std`, the OS, `keyring` or the platform credential APIs while fetching.
+- Copies your callback makes (into a cipher's key schedule, a `Vec`, the stack).
+- Stack temporaries inside BLAKE3 and other dependencies.
+- A buffer you reallocated while filling it before handing it to `RawKey::new`.
+
+### Protects against
+
+- Key bytes surviving in freed heap memory that is later reused or dumped.
+
+### Does not protect against
+
+- Reading memory while the key is live.
+
+---
+
+## Layer 8: Failure monitor and lockout
 
 ### What it does
 
-Ensures that operations on key material take the same amount of time regardless of the key values. Defeats timing side-channel attacks.
+`SecurityMonitor` receives failure, anomaly and threshold-breach events. `with_failure_threshold(max, window)` turns on lockout: once `max` failures for one key name are reported within `window`, the whole vault refuses `register`, `with_key`, `rotate`, `fragment` and `defragment` until `clear_lockout` or a successful `unlock_with_master`.
 
-### Defends against
+### How it really works
 
-- Timing attacks on key comparison
-- Side-channel leakage through CPU branch prediction
-- Cache-timing attacks (partially — depends on implementation)
+- **Advisory.** The vault never detects failures itself. Only failures the caller passes to `report_failure` (and wrong master credentials) count. The vault never sees what you do with a key, so it cannot know a decryption failed.
+- **Vault-wide.** Failures reported for one key name lock out every key. Code that reports failures on untrusted input can be used to deny service. Per-key lockout is planned for 1.1.
+- **No master-unlock rate limit.** `unlock_with_master` has no backoff of its own; repeated wrong attempts count toward the threshold like any reported failure. Throttle it yourself if it is reachable from untrusted input.
+- Lockout does nothing against a memory reader.
 
-### Does NOT defend against
-
-- Power analysis
-- Electromagnetic emanation analysis
-- Most cache-timing attacks on cryptographic operations (that's the crypto library's job)
-
-### Implementation
-
-All key comparisons use `subtle::ConstantTimeEq`:
-
-```rust
-use subtle::ConstantTimeEq;
-
-if key_a.ct_eq(&key_b).into() {
-    // ...
-}
-```
-
-NEVER:
-
-```rust
-if key_a == key_b {  // VULNERABLE — early-exit on first mismatch
-    // ...
-}
-```
-
-### Performance
-
-- Constant-time comparison of 32 bytes: ~10-20ns
-- Compared to non-CT comparison: ~5ns difference (acceptable)
+Built-in monitors: `NoMonitor` (default), `CompositeMonitor`, `LogMonitor` (`monitor-tracing`).
 
 ---
 
-## Layer 7: Zero-On-Drop
+## Layer 9: Audit hooks
 
-### What it does
+Every vault operation (register, unregister, read, rotate, one-shot fragment/defragment, master-unlock attempt) emits an `AuditEvent` to the configured `AuditSink` (`NoAudit` by default). Events carry the key name, never key bytes.
 
-When key material leaves scope (function returns, struct drops), the memory is overwritten with zeros. Subsequent reads of that memory location yield zeros, not stale key bytes.
-
-### Defends against
-
-- Use-after-free leakage
-- Stale data in freed memory pools
-- Forensic recovery of recently-freed memory
-
-### Does NOT defend against
-
-- Memory access during the lifetime of the key
-- Hardware-level memory persistence (rare, mostly DRAM rowhammer territory)
-
-### Implementation
-
-The `zeroize` crate provides `Zeroize` and `ZeroizeOnDrop`:
-
-```rust
-use zeroize::{Zeroize, ZeroizeOnDrop};
-
-#[derive(Zeroize, ZeroizeOnDrop)]
-struct KeyMaterial {
-    bytes: Vec<u8>,
-}
-```
-
-Compiler optimizations might otherwise elide the overwrite (since the memory is about to be freed). `zeroize` uses volatile writes to prevent this.
-
-### Performance
-
-- Zeroize 32 bytes: ~5ns
-- Zeroize 4 KiB page: ~500ns
-- Runs only on drop, never on access path
+- Since 1.0.2, `register` and `rotate` no longer emit an extra unnamed `OneShotFragment` event.
+- Events are emitted after the operation completes. Two operations that run concurrently on different threads may reach the sink in either order.
+- The crate does not protect the audit trail from tampering; that is the sink's job.
 
 ---
 
-## Layer 8: Security Monitor
+## Layer 10: Page protection toggling
 
-### What it does
-
-Detects anomalous behavior and triggers configured response (logging, alerts, lockout).
-
-### Defends against
-
-- Brute-force decryption attempts (failed decrypts trigger alerts)
-- Anomalous access patterns (unusual caller, unusual time, unusual frequency)
-- Slow data exfiltration (sustained access from one source)
-
-### Does NOT defend against
-
-- One-shot successful attacks
-- Attacks below detection thresholds
-- Attacks that defeat the monitor itself
-
-### Implementation
-
-```rust
-pub trait SecurityMonitor: Send + Sync {
-    /// Called when a decryption attempt fails (wrong key, tampered data, etc.)
-    fn on_decryption_failure(&self, ctx: &FailureContext);
-
-    /// Called when access patterns look anomalous
-    fn on_anomalous_access(&self, ctx: &AccessContext);
-
-    /// Called when a threshold is breached (N failures in M seconds)
-    fn on_threshold_breach(&self, ctx: &ThresholdContext);
-}
-```
-
-Built-in implementations:
-
-- `NoMonitor` — disabled (default)
-- `LogMonitor` — logs events via `log-io` or `tracing`
-- `MetricsMonitor` — increments counters in `metrics-lib`
-- `WebhookMonitor` — POSTs to alert endpoint
-- `CompositeMonitor` — chains multiple
-
-### Thresholds
-
-Configurable per vault:
-
-```rust
-VaultConfig {
-    max_failures_before_alert: 5,          // After 5 failures, alert
-    max_failures_before_lockout: 10,       // After 10 failures, lock vault
-    failure_window_seconds: 60,            // Window for counting
-    anomaly_detection_enabled: true,
-}
-```
-
-### Performance
-
-- Success path (no failure): zero cost
-- Failure path: cost of the monitor call (typically <100µs for logging)
-
-### Hive DB pattern
-
-Hive DB plugs in its own monitor that:
-1. Triggers admin alerts via webhook
-2. Locks the affected vault
-3. Optionally takes the database offline pending investigation
+**Not implemented.** Earlier documentation described `PROT_NONE` / `PAGE_NOACCESS` toggling between accesses. There is no `mprotect` or `VirtualProtect` call anywhere in the crate. If it is added in a later release it will be opt-in, and it would still not stop an attacker who can call `mprotect` or read memory through the kernel.
 
 ---
 
-## Layer 9: Audit Logging
+## Concurrency (1.0.2)
 
-### What it does
+Reads are lock-free (`ArcSwap` snapshots). Writes are serialized by a writer mutex; each writer re-checks its precondition under the lock. This fixes two races in 1.0.1:
 
-Records every key access with context: who, what, when, where. Provides forensic trail for incident response.
-
-### Defends against
-
-- Undetected long-term access (everything is logged)
-- Insider threats (anomalies surface in audit logs)
-- Compliance violations (HIPAA, SOC 2, PCI-DSS require audit trails)
-
-### Does NOT defend against
-
-- Attacks that complete before logs are reviewed
-- Attacks that modify the audit log (use `audit-trail` with hash chaining)
-
-### Implementation
-
-Every successful key access produces an audit event:
-
-```rust
-AuditEvent {
-    timestamp: SystemTime,
-    vault_id: VaultId,
-    key_id: KeyId,
-    operation: AccessKind,        // Fetch, Defrag, Rotate, ...
-    caller: CallerContext,         // Module, function, file:line
-    thread_id: ThreadId,
-    success: bool,
-    metadata: HashMap<String, Value>,
-}
-```
-
-Routed through `log-io` if available, or a user-provided sink.
-
-### Performance
-
-- Per-access cost: ~50-100ns
-- Async log shipping (out of hot path)
-- Feature-gated via `audit` flag
+- Two concurrent `register` calls with the same name could both succeed, leaving two keys under one name.
+- `rotate` could return `Ok` (and emit a Rotate audit event) for a key that a concurrent `unregister` had already removed.
 
 ---
 
-## Bonus Layer 10: Page Protection Toggling
-
-### What it does
-
-Memory pages holding fragments are set to `PROT_NONE` (no read/write access) when not actively being read. Reset to `PROT_READ` briefly during reassembly. Returned to `PROT_NONE` after.
-
-### Defends against
-
-- Snapshot attacks (memory dump at an instant — sees only inaccessible pages)
-- Page-cache-only attacks (pages can't be read directly)
-
-### Does NOT defend against
-
-- Attackers who can call mprotect themselves
-- Hardware DMA attacks
-
-### Implementation
-
-- Linux/macOS: `mprotect(addr, len, PROT_NONE)` / `mprotect(addr, len, PROT_READ)`
-- Windows: `VirtualProtect(addr, size, PAGE_NOACCESS)` / `VirtualProtect(addr, size, PAGE_READONLY)`
-
-### Performance
-
-- Mprotect cost: ~1-2µs per call
-- Per-access overhead: ~2-4µs (toggle on + toggle off)
-
-**Significant performance impact.** Available as opt-in feature for highest-security use cases. Not recommended for hot paths.
-
----
-
-## Defense Composition
-
-How layers compose:
-
-```
-                     ATTACKER WITH MEMORY READ ACCESS
-                                  ↓
-                       Layer 10: PROT_NONE
-                          (can't read pages)
-                                  ↓
-                       Layer 2: mlock
-                          (can't read from swap)
-                                  ↓
-                  Layer 3+4: Fragments + Decoy
-                  (can't tell real from filler)
-                                  ↓
-                       Layer 5: Codex
-                  (bytes are transformed)
-                                  ↓
-                                  X
-                          ATTACKER STOPPED
-```
-
-For an attacker to succeed, they must:
-
-1. Bypass Layer 10 (page protection) — requires code execution OR
-2. Bypass Layer 2 (mlock) — requires kernel access AND
-3. Defeat Layer 3+4 (fragmentation + decoy) — requires reverse engineering of strategies AND
-4. Reverse Layer 5 (codex) — requires knowing the transformation table
-
-Each is a meaningful step. Together, they're exponentially harder than any single one.
-
----
-
-## Threat Model
-
-`key-vault` is designed for these threats:
-
-| Threat | Defense |
-|--------|---------|
-| Process memory scraper | Layers 2, 3, 4, 5, 10 |
-| Swap file forensics | Layer 2 |
-| Hibernation file analysis | Layer 2 |
-| Timing side-channels | Layer 6 |
-| Memory persistence | Layer 7 |
-| Brute-force | Layer 8 |
-| Insider threats | Layer 9 |
-| Sustained exfiltration | Layers 8, 9 |
-| Reverse engineering | Layers 5, 10 |
-
-`key-vault` is NOT designed for these threats:
-
-- Kernel-level rootkit with full memory access (use TEE if available)
-- Hardware DMA attacks (use IOMMU + hardware mitigations)
-- Cold-boot attacks (use full disk encryption + power-down protocol)
-- Side-channel attacks on crypto operations (that's `crypt-io`'s job)
-- Quantum computer attacks on asymmetric crypto (use post-quantum algorithms)
-
----
-
-## Performance Cost Summary
-
-Cumulative cost on the **hot path** (key access via defragmentation):
-
-| Layer | Cost | Cumulative |
-|-------|------|------------|
-| Layer 3: Defragment | 50-200ns | 200ns |
-| Layer 5: Codex (optional) | 80-160ns | 360ns |
-| Layer 6: Constant-time | 10-20ns | 380ns |
-| Layer 9: Audit (optional) | 50-100ns | 480ns |
-| **Total (full stack)** | | **~500ns** |
-
-For a 32-byte (256-bit) key access. Well within the sub-microsecond target.
-
-On the **startup path** (one-time):
-
-| Layer | Cost |
-|-------|------|
-| Layer 1: Acquisition | 1-100ms |
-| Layer 2: mlock setup | 10-100µs |
-| Layer 3: Fragmentation | 1-10µs |
-| Layer 4: Decoy generation | 1-10µs |
-| Layer 5: Codex init | 1-5µs |
-| **Total** | **~1-100ms** |
-
-Acceptable for application startup.
-
----
-
-## Configuration
-
-```toml
-# .vault.toml (or via builder API)
-
-[vault]
-key_normalization = "blake3"        # Hash input to fixed-size
-frag_min = 1                         # Min fragment length
-frag_max = 4                         # Max fragment length
-frag_level = 2                       # Strength level (1-5)
-frag_len = 256                       # Target output length
-frag_symbols = "#%$&"                # Symbol set for decoy bytes
-
-[security]
-mlock_enabled = true                 # Layer 2
-fragment_strategy = "standard"       # Layer 3
-decoy_strategy = "self-reference"    # Layer 4
-codex_enabled = false                # Layer 5 (opt-in)
-constant_time = true                 # Layer 6
-zeroize_on_drop = true               # Layer 7
-monitor = "log+webhook"              # Layer 8
-audit_enabled = true                 # Layer 9
-page_protection = false              # Layer 10 (opt-in, perf impact)
-
-[monitor]
-max_failures_before_alert = 5
-max_failures_before_lockout = 10
-failure_window_seconds = 60
-```
-
----
-
-## Verification methodology (shipped in 0.11.0)
-
-The 1.0 contract makes specific security claims. Each is backed by a
-runnable verification:
+## Verification
 
 | Claim | Verification | Location |
 |-------|--------------|----------|
-| Fragment round-trip is identity across arbitrary inputs | `proptest` sweeps over `StandardFragmenter`, `InterleavedFragmenter`, `RandomFragmenter`, plus the `with_chunk_range` variant | `tests/proptest_invariants.rs` |
-| Every codex implementation satisfies `decode(encode(b)) == b` for every byte | `proptest` full byte-range sweep for `IdentityCodex`, `StaticCodex`, `DynamicCodex` | `tests/proptest_invariants.rs` |
-| `SelfReferenceDecoy` only emits bytes drawn from the source key | `proptest` (cross-platform) + dedicated fuzz target | `tests/proptest_invariants.rs`, `fuzz/fuzz_targets/fuzz_decoy_strategies.rs` |
-| `KeyHandle::Debug` never reveals the internal id | `proptest` regex assertion + unit-test sweep over 1024 handles | `tests/proptest_invariants.rs`, `src/handle.rs` |
-| Concurrent readers never observe a torn read across rotation | 4-thread reader loop vs. 50 rotations, asserting byte uniformity | `tests/proptest_invariants.rs` |
-| Layer 2: `mlock` actually pins pages on Linux | `/proc/self/status` `VmLck` delta after 64 registrations | `tests/mlock_verified.rs` (cfg = `target_os = "linux"`) |
-| No panics / infinite loops / OOMs on arbitrary inputs | `cargo-fuzz` targets, one per fetcher / fragment strategy / decoy strategy / codex / vault end-to-end | `fuzz/fuzz_targets/*.rs` |
-| Hot-path allocation profile | `dhat`-based example binary measuring `with_key` × 100,000 | `examples/dhat_hot_path.rs` |
-| Constant-time `KeyHandle` equality | Built on `subtle::ConstantTimeEq` — same primitive `ring` / `aws-lc-rs` use | `src/handle.rs` (the dependency does the heavy lifting; we apply it) |
+| Fragment round-trip is identity | `proptest` sweeps over all strategies | `tests/proptest_invariants.rs` |
+| Codex involution holds for every byte | `proptest` full byte-range sweep | `tests/proptest_invariants.rs` |
+| `SelfReferenceDecoy` only emits key bytes | `proptest` + fuzz target | `tests/proptest_invariants.rs`, `fuzz/` |
+| `KeyHandle::Debug` never reveals the id | `proptest` + unit sweep | `tests/proptest_invariants.rs`, `src/handle.rs` |
+| No torn reads across rotation | 4-thread reader loop vs. rotations | `tests/proptest_invariants.rs`, `tests/registry_concurrent.rs` |
+| `mlock` pins pages on Linux | `VmLck` delta after registrations | `tests/mlock_verified.rs` |
+| A page stays locked while any buffer on it is alive | Two regions on one page: release one, count stays 1; two keys sharing a page: unregister one, the other's pages stay counted | `src/memory/mod.rs`, `src/vault/mod.rs` unit tests |
+| `RawKey` wipes its spare capacity | Truncated buffer inspected through the still-owned allocation after `wipe` | `src/fetcher/mod.rs` unit test |
+| Normalization output unchanged by the rewrite | Compared against `blake3::hash` | `src/normalize.rs` unit test |
+| Scratch buffer zeroed on error / panic | Buffer inspected after forced defragment error, codex panic, callback panic | `src/vault/mod.rs` unit tests |
+| One winner per name under concurrent `register` | 8 threads x 200 rounds on the same name | `tests/registry_races.rs` |
+| `rotate` fails cleanly against concurrent `unregister` | `rotate` parked between pre-check and update while `unregister` runs; plus a 4-thread stress loop | `src/vault/mod.rs` unit tests |
+| `FileFetch` checks and reads the same file | Path swapped after open; read returns the checked file | `src/fetcher/file.rs` unit test (Unix) |
+| No panics on arbitrary input | `cargo-fuzz` targets | `fuzz/fuzz_targets/*.rs` |
+| Zero-allocation hot path | `dhat` over 100,000 `with_key` calls | `examples/dhat_hot_path.rs` |
 
-### Running the verifications
+### Not verified by automation
 
-```bash
-# All cross-platform property tests run as part of the normal gate.
-cargo test --all-features
-
-# Linux-only mlock verification (skipped on macOS/Windows by cfg gate).
-cargo test --all-features --test mlock_verified
-
-# Hot-path allocation profile.
-cargo run --release --example dhat_hot_path
-# → produces dhat-heap.json
-
-# cargo-fuzz targets (Linux/macOS; nightly Rust).
-cd fuzz
-cargo +nightly fuzz run fuzz_fragment_standard -- -max_total_time=3600
-# Repeat per target. Roadmap requires 1 CPU-hour per target for 1.0 sign-off.
-```
-
-### What's not yet verified by automation
-
-- **Constant-time property of the full `with_key` call** (not just
-  `KeyHandle::eq`) — `dudect` is the gold standard; deferred to a
-  post-0.11 follow-up because dudect's runtime hookup is intrusive.
-- **`zeroize` actually overwrites memory after drop** — the `zeroize`
-  crate's own tests cover this for the primitive; an end-to-end test
-  reading freed memory through raw pointers requires `unsafe` outside
-  the crate's safety contract.
-- **Cold-boot resistance** — out of scope, requires hardware testing.
-
----
-
-## When to Disable Layers
-
-There are legitimate reasons to disable layers:
-
-| Layer | Reason to disable | Risk |
-|-------|------|------|
-| mlock | Memory-constrained system | Keys may swap to disk |
-| Codex | Maximum performance needed | One less obfuscation layer |
-| Monitor | Embedded system without log infrastructure | No anomaly detection |
-| Audit | Maximum performance needed | No forensic trail |
-| Page protection | Latency-sensitive hot path | Memory readable when active |
-
-Document the trade-off when disabling any layer. Never disable layers 1, 3, 4, 6, 7 — these have minimal performance cost and high security value.
+- That zeroized memory stays zero after it is freed (would require reading freed memory).
+- Constant-time behavior of `with_key` (it is not constant-time; see Layer 6).
+- That page locks hold under memory pressure on every platform. The refcount table is tested; the OS lock itself is only checked on Linux via `VmLck`.
+- Cold-boot and DMA resistance (out of scope).
 
 ---
 

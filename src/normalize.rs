@@ -1,32 +1,59 @@
 //! BLAKE3-based key normalization.
 //!
-//! Raw key material can carry format cues — DER envelopes, PEM markers,
-//! ASCII-armored data, the trailing zero of a C string — that an attacker
-//! can use to confirm "yes, this region is a key" even when fragmented and
-//! decoyed. Normalization runs the raw key through BLAKE3 to produce a
-//! fixed-size 32-byte output that has no such cues.
+//! Raw key material can carry format cues (DER envelopes, PEM markers,
+//! ASCII-armored data, the trailing zero of a C string) that make a
+//! region of memory easier to recognize as a key. Normalization runs the
+//! raw key through BLAKE3 to produce a fixed-size 32-byte value without
+//! such cues.
+//!
+//! The 32-byte output is the effective key: it is what the vault stores
+//! and what [`KeyVault::with_key`](crate::KeyVault::with_key) hands back.
+//! It is a plain, unkeyed and unsalted BLAKE3 hash, so it is **not** a
+//! password hash. For a low-entropy input (a passphrase) anyone who
+//! obtains the normalized value can test guesses offline at BLAKE3
+//! speed. Feed the vault high-entropy key material, or run passphrases
+//! through a slow KDF (Argon2, scrypt) before registering them.
 //!
 //! Whether normalization is applied is a per-vault choice
 //! ([`KeyVaultBuilder::normalize_with_blake3`](crate::KeyVaultBuilder::normalize_with_blake3)).
 //! When enabled, every key registered with the vault is normalized before
 //! being handed to the fragmenter.
 
-use alloc::vec::Vec;
+use zeroize::Zeroize;
 
 use crate::fetcher::RawKey;
+
+/// Length of the normalized key, in bytes.
+const NORMALIZED_LEN: usize = 32;
 
 /// Run `key` through BLAKE3 and return a new `RawKey` containing the
 /// 32-byte hash output.
 ///
 /// The input key bytes are not modified; the caller owns the original.
-/// Future phases will route the original through the same locked/zeroed
-/// path so the plaintext does not linger on the call stack.
+///
+/// The digest is written straight into the returned `RawKey` (the first
+/// 32 bytes of BLAKE3's extendable output are the regular BLAKE3 hash), so
+/// there is no intermediate `blake3::Hash` copy. The hasher and output
+/// reader, which hold state derived from the key, are zeroized before they
+/// go out of scope. Temporaries inside BLAKE3's compression function live
+/// on the stack and cannot be wiped from here.
 #[must_use]
 pub(crate) fn blake3_normalize(key: &RawKey) -> RawKey {
-    let hash = blake3::hash(key.as_bytes());
-    let mut out: Vec<u8> = Vec::with_capacity(32);
-    out.extend_from_slice(hash.as_bytes());
-    RawKey::new(out)
+    let mut out = RawKey::new(alloc::vec![0u8; NORMALIZED_LEN]);
+    blake3_into(key.as_bytes(), out.as_bytes_mut());
+    out
+}
+
+/// Write the BLAKE3 hash of `input` into `out` (`out.len()` bytes of the
+/// extendable output; 32 bytes gives the standard hash), then zeroize the
+/// hasher and output reader.
+pub(crate) fn blake3_into(input: &[u8], out: &mut [u8]) {
+    let mut hasher = blake3::Hasher::new();
+    let _ = hasher.update(input);
+    let mut reader = hasher.finalize_xof();
+    reader.fill(out);
+    reader.zeroize();
+    hasher.zeroize();
 }
 
 #[cfg(test)]
@@ -37,6 +64,8 @@ pub(crate) fn blake3_normalize(key: &RawKey) -> RawKey {
     clippy::cast_sign_loss
 )]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     fn raw(bytes: &[u8]) -> RawKey {
@@ -47,6 +76,21 @@ mod tests {
     fn output_is_thirty_two_bytes() {
         let normalized = blake3_normalize(&raw(b"hello world"));
         assert_eq!(normalized.len(), 32);
+    }
+
+    #[test]
+    fn output_matches_plain_blake3_hash() {
+        // The 1.0.2 rewrite must not change the normalized value: it is
+        // the effective key callers see through `with_key`.
+        for input in [
+            &b""[..],
+            b"hello world",
+            &[0xa5; 1000][..],
+            &[7u8; 5000][..],
+        ] {
+            let normalized = blake3_normalize(&raw(input));
+            assert_eq!(normalized.as_bytes(), blake3::hash(input).as_bytes());
+        }
     }
 
     #[test]
@@ -77,5 +121,19 @@ mod tests {
             let normalized = blake3_normalize(&raw(&bytes));
             assert_eq!(normalized.len(), 32, "len mismatch for input size {size}");
         }
+    }
+
+    #[test]
+    fn hasher_state_is_wiped_by_zeroize() {
+        // `blake3_into` relies on `Hasher::zeroize` (blake3's `zeroize`
+        // feature) clearing the chaining values and buffered block that
+        // were derived from the key. After it, the hasher no longer
+        // reflects the absorbed input.
+        let mut hasher = blake3::Hasher::new();
+        let _ = hasher.update(b"secret key material");
+        assert_ne!(hasher.finalize(), blake3::hash(b""));
+        hasher.zeroize();
+        assert_eq!(hasher.count(), 0);
+        assert_ne!(hasher.finalize(), blake3::hash(b"secret key material"));
     }
 }

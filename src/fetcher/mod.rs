@@ -1,8 +1,24 @@
-//! Layer 1 — Secure Acquisition.
+//! Layer 1: key acquisition.
 //!
 //! The [`KeyFetch`] trait abstracts the source of raw key material. It is the
-//! seam through which keys enter the vault: a TPM, an OS keychain, an encrypted
-//! file, an environment variable, or a custom user-provided source.
+//! seam through which keys enter the vault: an OS keychain, a key file, an
+//! environment variable, or a custom user-provided source. Fetchers only
+//! read keys; they add no protection to the key once it is in memory.
+//!
+//! Built-in fetchers in 1.0.x (each behind its own feature):
+//!
+//! - `KeychainFetch` (`fetcher-keychain`): OS credential store. UTF-8
+//!   secrets only.
+//! - `FileFetch` (`fetcher-file`): reads a **plaintext** file. No
+//!   decryption.
+//! - `EnvFetch` (`fetcher-env`): reads an environment variable. The value
+//!   stays in the process environment.
+//! - `TpmFetch` (`fetcher-tpm`): **not implemented**. `fetch` always
+//!   returns an error.
+//!
+//! Copies made inside `std` or the `keyring` crate while reading (I/O
+//! buffers, the OS environment block, UTF-16 conversion buffers, platform
+//! credential APIs) are outside this crate's control and are not wiped.
 //!
 //! Implementations of [`KeyFetch`] are responsible for:
 //!
@@ -16,14 +32,15 @@
 //! key registration; the vault keeps the post-fragmentation representation in
 //! memory after that. Re-acquiring a key is the caller's decision.
 //!
-//! Concrete implementations land in later phases. This module currently defines
-//! only the trait surface, the [`FetchContext`] passed to it, and the
-//! [`RawKey`] container that wraps the returned bytes.
+//! This module defines the trait surface, the [`FetchContext`] passed to
+//! it, and the [`RawKey`] container that wraps the returned bytes.
 
 use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+
+use zeroize::Zeroize;
 
 use crate::Result;
 
@@ -75,16 +92,17 @@ impl FetchContext {
 /// Container for raw key material returned by a [`KeyFetch`] implementation.
 ///
 /// `RawKey` deliberately exposes no method that returns a borrowed `&[u8]` to
-/// outside the crate. The only consumers of the inner bytes are the
-/// fragmentation pipeline and (eventually) the zero-on-drop wrapper introduced
-/// in Phase 0.3. From outside `key-vault` you can construct a `RawKey`, hand it
-/// to the vault, and never see it again.
+/// outside the crate. The only consumer of the inner bytes is the
+/// fragmentation pipeline. From outside `key-vault` you can construct a
+/// `RawKey`, hand it to the vault, and never see it again.
 ///
-/// # Layout
+/// # Wiping
 ///
-/// In this phase `RawKey` stores the bytes in a plain [`Vec<u8>`]. Phase 0.3
-/// will swap this for `Zeroizing<Vec<u8>>` from the `zeroize` crate without a
-/// public API change.
+/// On drop the whole allocation is overwritten with zeros, including any
+/// spare capacity beyond the length (bytes left there by an earlier
+/// `truncate`, for example). The `Vec` you pass to [`RawKey::new`] is moved,
+/// not copied. Copies you made before that (the original `String`, a
+/// buffer that was reallocated while you filled it) are yours to wipe.
 pub struct RawKey {
     bytes: Vec<u8>,
 }
@@ -149,24 +167,21 @@ impl fmt::Debug for RawKey {
     }
 }
 
+impl RawKey {
+    /// Overwrite the whole allocation with zeros and set the length to 0.
+    ///
+    /// `Vec::zeroize` writes zeros over every initialized byte *and* over
+    /// the spare capacity, with volatile writes the compiler cannot remove.
+    /// Before 1.0.2 only `0..len` was cleared, so bytes beyond the length
+    /// (for example after the caller truncated a longer buffer) survived.
+    fn wipe(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
 impl Drop for RawKey {
     fn drop(&mut self) {
-        // Volatile-zero every byte before the underlying Vec frees its
-        // allocation. Without the volatile + fence pair the compiler is
-        // free to elide the writes since the buffer is about to drop.
-        if !self.bytes.is_empty() {
-            // SAFETY: `self.bytes.as_mut_ptr()` is the start of a valid
-            // `self.bytes.len()`-byte allocation we own. Writes are
-            // within the buffer's bounds and only touch initialized
-            // bytes.
-            unsafe {
-                let ptr = self.bytes.as_mut_ptr();
-                for i in 0..self.bytes.len() {
-                    core::ptr::write_volatile(ptr.add(i), 0u8);
-                }
-            }
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        }
+        self.wipe();
     }
 }
 
@@ -228,6 +243,31 @@ mod tests {
         let one = RawKey::new(alloc::vec![1, 2, 3]);
         assert!(!one.is_empty());
         assert_eq!(one.len(), 3);
+    }
+
+    #[test]
+    fn raw_key_wipe_clears_spare_capacity() {
+        // Fill 64 bytes, keep 8: bytes 8..64 are still in the allocation
+        // as spare capacity.
+        let mut v = alloc::vec![0xa5u8; 64];
+        v.truncate(8);
+        let cap = v.capacity();
+        assert!(cap >= 64);
+        let ptr = v.as_ptr();
+        let mut key = RawKey::new(v);
+
+        key.wipe();
+
+        // SAFETY: `key` still owns the allocation (it is not dropped yet),
+        // so `ptr..ptr + cap` is live. Every byte in it was initialized by
+        // the `vec!` above and then overwritten by `wipe`.
+        let whole = unsafe { core::slice::from_raw_parts(ptr, cap) };
+        assert!(
+            whole.iter().all(|&b| b == 0),
+            "key bytes survived in the spare capacity"
+        );
+        assert!(key.is_empty());
+        drop(key);
     }
 
     #[test]

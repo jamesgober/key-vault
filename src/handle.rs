@@ -105,10 +105,10 @@ impl fmt::Debug for KeyId {
 /// # Equality
 ///
 /// `KeyHandle` implements both `PartialEq` and
-/// [`subtle::ConstantTimeEq`]. The latter is the equality check the vault
-/// uses internally: it compares both inner identifiers in constant time
-/// regardless of input values, eliminating timing side-channels even
-/// though the underlying ids are not themselves secret.
+/// [`subtle::ConstantTimeEq`]; `PartialEq` goes through the constant-time
+/// comparison. Handle ids are not secret, so this is hygiene rather than a
+/// security property, and the vault's registry lookup by handle (a
+/// `HashMap`) is not constant-time.
 #[derive(Clone, Copy, Eq)]
 pub struct KeyHandle {
     id: KeyId,

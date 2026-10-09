@@ -4,6 +4,8 @@ use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use zeroize::Zeroize;
+
 use super::DecoyStrategy;
 use crate::Result;
 use crate::error::Error;
@@ -65,17 +67,13 @@ impl DecoyStrategy for KeyDerivedDecoy {
         let mut reader = hasher.finalize_xof();
         reader.fill(&mut out);
 
-        // Scrub the nonce. The key bytes themselves belong to `key` and are
-        // not our responsibility to wipe.
-        // SAFETY: nonce is a fixed-size stack array we own; we write within
-        // bounds.
-        unsafe {
-            let ptr = nonce.as_mut_ptr();
-            for i in 0..nonce.len() {
-                core::ptr::write_volatile(ptr.add(i), 0u8);
-            }
-        }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Scrub everything derived from the key: the output reader and the
+        // hasher hold chaining values computed from the key bytes. The key
+        // bytes themselves belong to `key`. The returned `out` is wiped by
+        // the caller (the vault zeroizes decoy output after copying it).
+        reader.zeroize();
+        hasher.zeroize();
+        nonce.zeroize();
 
         Ok(out)
     }

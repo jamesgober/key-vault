@@ -4,6 +4,8 @@ use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use super::DecoyStrategy;
 use crate::Result;
 use crate::error::Error;
@@ -11,17 +13,20 @@ use crate::fetcher::RawKey;
 
 /// Decoy strategy that draws bytes from the real key at random positions.
 ///
-/// **Threat profile.** `SelfReferenceDecoy` is the **strongest** of the three
-/// built-in strategies and the recommended default. The decoy bytes are
-/// literally drawn from the key's own byte distribution, so any statistical
-/// analysis of memory regions (byte-value histogram, entropy estimate,
-/// chi-squared distinguisher) will report identical profiles for real
-/// fragments and decoy fragments. An attacker has no statistical signal to
-/// separate them.
+/// **Threat profile.** Of the three built-in strategies this one gives the
+/// best statistical cover. The decoy bytes are drawn from the key's own
+/// byte distribution, so byte-value histograms, entropy estimates and
+/// similar distinguishers see the same profile for real and decoy chunks.
 ///
-/// The only way for an attacker to recover the key, given this strategy, is
-/// to (a) obtain the position map (separately mlock'd) and (b) reverse the
-/// fragmentation. Statistical attacks alone do not work.
+/// This is obfuscation against scans that do not understand the vault's
+/// layout. It does **not** protect against anyone who can read the
+/// process's memory: the layout map, which marks every decoy chunk, sits
+/// in the same process memory as the chunks, and reading it tells real
+/// from decoy directly.
+///
+/// No decoy is used unless one is passed to
+/// [`KeyVaultBuilder::with_decoy`](crate::KeyVaultBuilder::with_decoy);
+/// the `decoy-*` Cargo features do not enable one.
 ///
 /// # Why not just shuffle key bytes?
 ///
@@ -68,7 +73,9 @@ impl DecoyStrategy for SelfReferenceDecoy {
         getrandom::getrandom(&mut rand_buf).map_err(|_| Error::Internal("OS RNG failed"))?;
 
         let key_len = key_bytes.len();
-        let mut out = Vec::with_capacity(output_len);
+        // `out` holds bytes copied from the key. Keep it in a zeroizing
+        // wrapper until it is handed back, so an early return wipes it.
+        let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(output_len));
         for i in 0..output_len {
             let raw: [u8; 4] = rand_buf[i * 4..i * 4 + 4]
                 .try_into()
@@ -79,30 +86,13 @@ impl DecoyStrategy for SelfReferenceDecoy {
             out.push(key_bytes[idx]);
         }
 
-        // Scrub the temporary randomness buffer.
-        for b in &mut rand_buf {
-            // SAFETY-equivalent: we still own rand_buf and the slice is
-            // valid; volatile-zero defeats dead-store elimination.
-            //
-            // Note: we are not inside an `unsafe` block — `write_volatile`
-            // is unsafe but we are taking the safe `iter_mut` path here for
-            // clarity. To actually defeat dead-store elimination we need
-            // the volatile write; see below.
-            let _ = b;
-        }
-        // Real volatile-zero pass for the randomness buffer.
-        // SAFETY: rand_buf points to a valid `rand_byte_count`-element
-        // allocation we just constructed; we write within bounds.
-        unsafe {
-            let ptr = rand_buf.as_mut_ptr();
-            for i in 0..rand_buf.len() {
-                core::ptr::write_volatile(ptr.add(i), 0u8);
-            }
-        }
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        drop(rand_buf);
+        // Scrub the temporary randomness buffer (it encodes which key
+        // positions were sampled).
+        rand_buf.zeroize();
 
-        Ok(out)
+        // Hand the bytes back without wiping them; the caller owns and
+        // wipes the returned buffer.
+        Ok(core::mem::take(&mut *out))
     }
 
     fn describe(&self) -> Cow<'_, str> {

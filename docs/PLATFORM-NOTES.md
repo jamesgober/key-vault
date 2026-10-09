@@ -30,8 +30,10 @@ allows.
 
 ### Linux
 
-- `libc::mlock(addr, len)` on construction; `libc::munlock(addr, len)`
-  on drop. Both syscalls are best-effort: when `RLIMIT_MEMLOCK = 0`
+- `libc::mlock` on construction and `libc::munlock` on drop, applied to
+  whole pages through a per-page reference count (1.0.2): a page is
+  unlocked only when the last live buffer on it is dropped. Both
+  syscalls are best-effort: when `RLIMIT_MEMLOCK = 0`
   (unprivileged containers, Docker default), the call fails and
   `LockedBytes::is_locked()` returns `false`. The buffer still works
   as a plain zero-on-drop wrapper — no key material leaks, just no
@@ -87,9 +89,9 @@ allows.
 | Fetcher | Linux | macOS | Windows | Notes |
 |---------|:-----:|:-----:|:-------:|-------|
 | `EnvFetch` | ✅ | ✅ | ✅ | Always available (feature `fetcher-env`) |
-| `FileFetch` | ✅ | ✅ | ✅ | Always available (feature `fetcher-file`). Unix permission check (`0o600`) is `#[cfg(unix)]`-gated; Windows skips the chmod check (use NTFS ACLs) |
+| `FileFetch` | ✅ | ✅ | ✅ | Feature `fetcher-file`. Reads a plaintext file. Unix permission check (`0o600`, read from the open handle) is `#[cfg(unix)]`-gated; Windows skips the check (use NTFS ACLs) |
 | `KeychainFetch` | ✅ | ✅ | ✅ | Via the `keyring` crate (feature `fetcher-keychain`). Linux → Secret Service over D-Bus (GNOME Keyring / KWallet); macOS → Keychain Services; Windows → Credential Manager |
-| `TpmFetch` | detection only | detection only | detection only | The detection path works everywhere; the *acquisition* path returns `Error::Acquisition("detection-only")` until full integration lands post-1.0 |
+| `TpmFetch` | not implemented | not implemented | not implemented | `fetch` always returns `Error::Acquisition`. Nothing in the crate detects or talks to a TPM |
 
 ### Linux keychain specifics
 

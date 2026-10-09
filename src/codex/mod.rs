@@ -1,17 +1,27 @@
-//! Layer 5 — Codex transformation.
+//! Layer 5: codex transformation.
 //!
-//! A [`Codex`] applies a byte-wise transformation to every byte (real key
-//! material **and** decoy) before it is stored in fragments. The transformation
-//! is an involution: applying it twice returns the original byte. Encoding and
-//! decoding therefore call the same operation.
+//! A [`Codex`] applies a byte-wise substitution to the (normalized) key
+//! before it is fragmented. The built-in codices are involutions: applying
+//! the transformation twice returns the original byte. Decoy chunks are
+//! generated from the already-encoded key and are not passed through the
+//! codex separately.
+//!
+//! # What it is and is not
+//!
+//! The codex is **obfuscation, not encryption**. A substitution table is
+//! not a cipher, and the table itself ([`StaticCodex`], [`DynamicCodex`]) is
+//! stored in the same process memory as the fragments it encodes. Anyone
+//! who can read process memory can read the table and undo the codex. It
+//! only means that a scan for the raw key bytes, or a tool that reassembles
+//! fragments without knowing about the codex, finds transformed bytes.
 //!
 //! # When to use
 //!
-//! The codex layer is off by default ([`IdentityCodex`]). It is feature-gated
-//! behind the `codex` Cargo feature and adds approximately 5–10 ns per byte to
-//! the access path. Enabling it raises the work required for an attacker who
-//! has already defeated layers 2–4 (mlock, fragmentation, decoy): the bytes
-//! they recover are not the bytes the application uses.
+//! The vault uses no codex unless one is passed to
+//! [`KeyVaultBuilder::with_codex`](crate::KeyVaultBuilder::with_codex).
+//! The `codex` and `codex-dynamic` Cargo features are reserved and have no
+//! effect in 1.0.x; the codex types are always compiled. A table codex adds
+//! a few nanoseconds per byte to the access path.
 //!
 //! # Involution requirement
 //!

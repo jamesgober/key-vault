@@ -317,10 +317,10 @@ consumer.
 ### What we *did not* tune for 0.10
 
 - **Layer 10 page-protection toggling** (`PROT_NONE` between accesses)
-  is still off by default. Enabling it would add an `mprotect`
-  syscall per `with_key` — roughly **2-5 µs** depending on platform —
-  in exchange for stronger memory-scraping resistance. It will land
-  behind a feature flag in a follow-up phase, not as the default.
+  is **not implemented** (as of 1.0.2 there is no `mprotect` /
+  `VirtualProtect` call anywhere in the crate). If it is added it would
+  cost an `mprotect` syscall per `with_key`, roughly 2-5 µs depending on
+  platform, and would be opt-in.
 - **Zero-allocation hot path** (`dhat`-verified) is deferred to
   Phase 0.11 (security hardening), which is where the static
   allocation profile lives alongside the fuzz work.

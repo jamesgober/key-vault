@@ -3,8 +3,6 @@
 //!
 //! These are all crate-private; they are not part of the public API.
 
-use alloc::vec::Vec;
-
 use crate::Result;
 use crate::error::Error;
 
@@ -59,27 +57,4 @@ pub(crate) fn fisher_yates<T>(slice: &mut [T]) -> Result<()> {
         i -= 1;
     }
     Ok(())
-}
-
-/// Volatile-zero a byte slice and emit a `SeqCst` compiler fence. Used to
-/// scrub intermediate plaintext buffers (layout encodings, decoy temp
-/// buffers) before their `Vec` storage is dropped.
-pub(crate) fn zero_buffer(buf: &mut [u8]) {
-    // SAFETY: `buf.as_mut_ptr()` is the start of a valid `buf.len()`-byte
-    // slice; we write within bounds and only once per element.
-    unsafe {
-        let ptr = buf.as_mut_ptr();
-        for i in 0..buf.len() {
-            core::ptr::write_volatile(ptr.add(i), 0u8);
-        }
-    }
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
-
-/// Volatile-zero an owned `Vec<u8>` and drop it. Convenience wrapper used
-/// when a decoy strategy hands back a fresh plaintext `Vec` that we
-/// immediately copy into a [`LockedBytes`](crate::memory::LockedBytes).
-pub(crate) fn zero_buffer_owned(mut buf: Vec<u8>) {
-    zero_buffer(&mut buf);
-    drop(buf);
 }

@@ -26,6 +26,8 @@
 
 use alloc::vec::Vec;
 
+use zeroize::Zeroize;
+
 use super::Codex;
 use crate::Result;
 use crate::error::Error;
@@ -108,9 +110,12 @@ impl StaticCodex {
             used[b as usize] = true;
         }
 
-        Ok(Self {
+        let codex = Self {
             table: LockedBytes::from_slice(&table),
-        })
+        };
+        // The stack copy of the table is equivalent to the transformation.
+        table.zeroize();
+        Ok(codex)
     }
 
     /// Generate a random involution with no fixed points.
@@ -167,9 +172,14 @@ impl StaticCodex {
             i += 2;
         }
 
-        Ok(Self {
+        let codex = Self {
             table: LockedBytes::from_slice(&table),
-        })
+        };
+        // The stack table and the shuffled permutation both describe the
+        // transformation; wipe them now that the locked copy exists.
+        table.zeroize();
+        perm.zeroize();
+        Ok(codex)
     }
 }
 

@@ -1,37 +1,52 @@
-//! [`FileFetch`] — file-based [`KeyFetch`] backend.
+//! [`FileFetch`]: file-based [`KeyFetch`] backend.
 //!
-//! Reads key bytes from a file on disk. On Unix the file's permission bits
-//! are checked: by default we reject files that are readable by group or
-//! world (any mode bit in `0o077` set). On Windows we trust the platform's
-//! NTFS ACLs and do not perform a separate permission check.
+//! Reads key bytes from a file on disk. **The file is read as plaintext.**
+//! `FileFetch` performs no decryption of any kind: the file contents are
+//! returned verbatim as the key. For encryption at rest, rely on OS-level
+//! disk encryption (LUKS / FileVault / BitLocker) or decrypt the file
+//! yourself and pass the result to [`RawKey::new`].
 //!
-//! # On-disk format
+//! # Permission check
 //!
-//! `FileFetch` does **not** perform AEAD decryption in this release. The
-//! file contents are read verbatim and returned as the key. For
-//! encryption-at-rest pair this fetcher with OS-level disk encryption
-//! (LUKS / FileVault / BitLocker) or a sealed-key file format from
-//! another crate. AEAD-encrypted file support is on the post-1.0 backlog.
+//! On Unix the file is opened once and the permission bits are read from
+//! the open handle (`fstat`), so the check and the read always refer to
+//! the same file even if the path is swapped (for example by a symlink
+//! replacement) in between. By default files readable or writable by group
+//! or others (any bit in `0o077`) are rejected. The check does not look at
+//! the file's owner or at the parent directory's permissions.
+//!
+//! On Windows there is no permission check: NTFS ACLs are trusted as is.
 //!
 //! # Threat profile
 //!
-//! Higher security than [`EnvFetch`](super::env::EnvFetch) because file
-//! permissions confine access to one user account on POSIX systems. Lower
-//! security than [`KeychainFetch`](super::keychain::KeychainFetch) since
-//! the bytes live on disk in cleartext and persist across reboots.
+//! Higher security than [`EnvFetch`](super::env::EnvFetch) on POSIX
+//! systems because file permissions confine access to one user account.
+//! Lower security than [`KeychainFetch`](super::keychain::KeychainFetch)
+//! since the bytes live on disk in cleartext and persist across reboots.
+//!
+//! # Wiping
+//!
+//! The read buffer is allocated by this module and wiped on every error
+//! path and whenever it has to grow. Copies inside the OS page cache or
+//! the kernel are outside this crate's control.
 
 use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::String;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+
+use zeroize::Zeroizing;
 
 use super::{FetchContext, KeyFetch, RawKey};
 use crate::Result;
 use crate::error::Error;
 
-/// `KeyFetch` implementation that reads bytes from a file on disk.
+/// `KeyFetch` implementation that reads a plaintext key file from disk.
 ///
-/// By default Unix permission bits stricter than `0o600` are rejected; call
+/// By default, on Unix, files with any group or other permission bit set
+/// (anything looser than `0o600`) are rejected; call
 /// [`FileFetch::allow_loose_perms`] to disable that check (not recommended
 /// outside of tests).
 ///
@@ -86,18 +101,10 @@ impl FileFetch {
 
 impl KeyFetch for FileFetch {
     fn fetch(&self, _ctx: &FetchContext) -> Result<RawKey> {
-        if self.strict_perms {
-            check_perms(&self.path)?;
-        }
-        std::fs::read(&self.path).map_or_else(
-            |e| {
-                Err(Error::Acquisition {
-                    source: Cow::Borrowed("file"),
-                    reason: io_failure_message(&self.path, &e),
-                })
-            },
-            |bytes| Ok(RawKey::new(bytes)),
-        )
+        // Open once. The permission check and the read both use this
+        // handle, so they see the same file.
+        let file = File::open(&self.path).map_err(|e| io_error(&self.path, &e))?;
+        read_checked(file, &self.path, self.strict_perms)
     }
 
     fn describe(&self) -> Cow<'_, str> {
@@ -105,13 +112,70 @@ impl KeyFetch for FileFetch {
     }
 }
 
-#[cfg(unix)]
-fn check_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).map_err(|e| Error::Acquisition {
+/// Check permissions on the open `file` (if `strict`) and read it to the
+/// end.
+fn read_checked(mut file: File, path: &Path, strict: bool) -> Result<RawKey> {
+    if strict {
+        check_perms(&file, path)?;
+    }
+    read_to_end_wiping(&mut file, path)
+}
+
+/// Read `file` to the end into a buffer that is wiped on every error and
+/// on every growth step.
+///
+/// `std::fs::read` / `read_to_end` grow their `Vec` by reallocating,
+/// which frees the old allocation with key bytes still in it. Here the
+/// buffer is sized from the file length up front (plus one byte, so
+/// end-of-file is seen without growing), and if the file turns out to be
+/// longer the old buffer is copied into a larger one and zeroized.
+fn read_to_end_wiping(file: &mut File, path: &Path) -> Result<RawKey> {
+    let hint = file
+        .metadata()
+        .ok()
+        .and_then(|m| usize::try_from(m.len()).ok())
+        .unwrap_or(0);
+    read_wiping(file, hint, path)
+}
+
+/// Read `reader` to the end, starting with a buffer of `hint + 1` bytes.
+/// See [`read_to_end_wiping`].
+fn read_wiping<R: Read>(reader: &mut R, hint: usize, path: &Path) -> Result<RawKey> {
+    let mut buf = Zeroizing::new(alloc::vec![0u8; hint.saturating_add(1)]);
+    let mut filled = 0usize;
+    loop {
+        if filled == buf.len() {
+            let new_len = buf.len().saturating_mul(2).max(64);
+            let mut bigger = Zeroizing::new(alloc::vec![0u8; new_len]);
+            bigger[..filled].copy_from_slice(&buf[..filled]);
+            // The old buffer is zeroized when it is dropped here.
+            buf = bigger;
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_error(path, &e)),
+        }
+    }
+    // Shrinking the length keeps the allocation; `RawKey` zeroizes the
+    // whole capacity on drop.
+    buf.truncate(filled);
+    Ok(RawKey::new(core::mem::take(&mut *buf)))
+}
+
+/// Build an `Error::Acquisition` for a file I/O failure.
+fn io_error(path: &Path, e: &std::io::Error) -> Error {
+    Error::Acquisition {
         source: Cow::Borrowed("file"),
-        reason: io_failure_message(path, &e),
-    })?;
+        reason: io_failure_message(path, e),
+    }
+}
+
+#[cfg(unix)]
+fn check_perms(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = file.metadata().map_err(|e| io_error(path, &e))?;
     let mode = meta.permissions().mode();
     if (mode & 0o077) != 0 {
         return Err(Error::Acquisition {
@@ -128,7 +192,7 @@ fn check_perms(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // matches the Unix sibling's signature.
-fn check_perms(_path: &Path) -> Result<()> {
+fn check_perms(_file: &File, _path: &Path) -> Result<()> {
     // Windows ACL inspection is non-trivial and platform-specific. For 1.0
     // we trust the OS-level access controls. Users who need additional
     // verification on Windows should layer it on top of FileFetch.
@@ -144,7 +208,11 @@ fn io_failure_message(path: &Path, e: &std::io::Error) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -227,6 +295,60 @@ mod tests {
         let fetcher = FileFetch::new(f.path());
         let raw = fetcher.fetch(&FetchContext::new("k")).unwrap();
         assert_eq!(raw.len(), 3);
+    }
+
+    #[test]
+    fn reads_files_of_many_sizes_exactly() {
+        for len in [0usize, 1, 31, 32, 33, 4095, 4096, 4097, 70_000] {
+            let contents: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let f = TempFile::new(&format!("sizes_{len}"), &contents);
+            let raw = FileFetch::new(f.path())
+                .allow_loose_perms()
+                .fetch(&FetchContext::new("k"))
+                .unwrap();
+            assert_eq!(raw.as_bytes(), &contents[..], "mismatch at len {len}");
+        }
+    }
+
+    #[test]
+    fn read_grows_past_a_wrong_length_hint() {
+        // A file can grow between `metadata()` and the read. Feed the
+        // reader a length hint of 0 and check the growth path returns
+        // every byte.
+        let contents: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+        let raw = read_wiping(&mut &contents[..], 0, Path::new("<memory>")).unwrap();
+        assert_eq!(raw.as_bytes(), &contents[..]);
+        let raw = read_wiping(&mut &contents[..], 10, Path::new("<memory>")).unwrap();
+        assert_eq!(raw.as_bytes(), &contents[..]);
+    }
+
+    /// The permission check and the read must refer to the same file. Open
+    /// a 0600 file, swap a world-readable file into its path, then check
+    /// and read through the handle: the result is the original file's
+    /// contents. The 1.0.1 code checked `metadata(path)` and then called
+    /// `read(path)`, so a swap between the two read the other file.
+    #[cfg(unix)]
+    #[test]
+    fn check_and_read_use_the_same_open_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let good = TempFile::new("swap_good", b"checked-key");
+        std::fs::set_permissions(good.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let evil = TempFile::new("swap_evil", b"swapped-in");
+        std::fs::set_permissions(evil.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let handle = File::open(good.path()).unwrap();
+        // Replace the path's target after opening.
+        std::fs::rename(evil.path(), good.path()).unwrap();
+
+        let raw = read_checked(handle, good.path(), true).unwrap();
+        assert_eq!(raw.as_bytes(), b"checked-key");
+
+        // A fresh fetch sees the swapped-in, too-permissive file and
+        // rejects it.
+        let err = FileFetch::new(good.path())
+            .fetch(&FetchContext::new("k"))
+            .unwrap_err();
+        assert!(matches!(err, Error::Acquisition { .. }));
     }
 
     #[test]

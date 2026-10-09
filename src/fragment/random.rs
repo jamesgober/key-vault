@@ -41,7 +41,9 @@
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
 
-use super::util::{fisher_yates, sample_range, zero_buffer};
+use zeroize::Zeroizing;
+
+use super::util::{fisher_yates, sample_range};
 use super::{FragmentStrategy, Fragments};
 use crate::Result;
 use crate::error::Error;
@@ -114,14 +116,16 @@ impl FragmentStrategy for RandomFragmenter {
 
         // Step 1: build a shuffled permutation of all original positions.
         // Each position appears exactly once.
-        let mut positions: Vec<u32> = (0..total_len as u32).collect();
+        // The permutation and the layout map chunks back to key
+        // positions; wipe them on every exit path.
+        let mut positions: Zeroizing<Vec<u32>> = Zeroizing::new((0..total_len as u32).collect());
         fisher_yates(&mut positions)?;
 
         // Step 2: walk the permutation, peeling off variable-size groups
         // and turning each group into a chunk. Each chunk's bytes thus
         // come from non-contiguous, randomly-chosen original positions.
         let mut chunks: Vec<LockedBytes> = Vec::new();
-        let mut layout_bytes: Vec<u8> = Vec::new();
+        let mut layout_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
         let mut cursor = 0usize;
         while cursor < positions.len() {
             let remaining = positions.len() - cursor;
@@ -138,12 +142,11 @@ impl FragmentStrategy for RandomFragmenter {
             };
 
             // Build the chunk's bytes by reading from each picked position.
-            let mut chunk_bytes: Vec<u8> = Vec::with_capacity(size);
+            let mut chunk_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(size));
             for &pos in &positions[cursor..cursor + size] {
                 chunk_bytes.push(bytes[pos as usize]);
             }
             chunks.push(LockedBytes::from_slice(&chunk_bytes));
-            zero_buffer(&mut chunk_bytes);
             drop(chunk_bytes);
 
             // Append the layout entry: u32 size + size × u32 positions.
@@ -158,7 +161,6 @@ impl FragmentStrategy for RandomFragmenter {
         }
 
         let layout = LockedBytes::from_slice(&layout_bytes);
-        zero_buffer(&mut layout_bytes);
         drop(layout_bytes);
         drop(positions);
 

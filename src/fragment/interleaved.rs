@@ -34,7 +34,9 @@ use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::util::{fisher_yates, zero_buffer};
+use zeroize::{Zeroize, Zeroizing};
+
+use super::util::fisher_yates;
 use super::{FragmentStrategy, Fragments};
 use crate::Result;
 use crate::error::Error;
@@ -107,14 +109,18 @@ impl FragmentStrategy for InterleavedFragmenter {
         // by shuffling `[0, pool_size)` and taking the first key_len. For
         // small pools this is cheap; we cap pool_factor in the builder so
         // it can't blow up.
-        let mut all_positions: Vec<u32> = (0..pool_size as u32).collect();
+        // The chosen positions are where the key bytes sit in the pool;
+        // wipe them (including the truncated tail) on every exit path.
+        let mut all_positions: Zeroizing<Vec<u32>> =
+            Zeroizing::new((0..pool_size as u32).collect());
         fisher_yates(&mut all_positions)?;
+        all_positions[key_len..].zeroize();
         all_positions.truncate(key_len);
         let positions = all_positions;
 
         // Step 2: build the pool. Start with random padding, then overlay
         // key bytes at the chosen positions.
-        let mut pool: Vec<u8> = vec![0u8; pool_size];
+        let mut pool: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; pool_size]);
         getrandom::getrandom(&mut pool).map_err(|_| Error::Internal("OS RNG failed"))?;
         for (i, &pos) in positions.iter().enumerate() {
             pool[pos as usize] = bytes[i];
@@ -124,17 +130,16 @@ impl FragmentStrategy for InterleavedFragmenter {
         // We split here only because the public Fragments API takes a
         // Vec<LockedBytes>; conceptually it's one chunk.
         let chunk = LockedBytes::from_slice(&pool);
-        zero_buffer(&mut pool);
         drop(pool);
 
         // Step 4: encode the layout.
-        let mut layout_bytes: Vec<u8> = Vec::with_capacity(4 + key_len * 4);
+        let mut layout_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(4 + key_len * 4));
         layout_bytes.extend_from_slice(&(pool_size as u32).to_le_bytes());
-        for pos in &positions {
+        for pos in positions.iter() {
             layout_bytes.extend_from_slice(&pos.to_le_bytes());
         }
         let layout = LockedBytes::from_slice(&layout_bytes);
-        zero_buffer(&mut layout_bytes);
         drop(layout_bytes);
         drop(positions);
 

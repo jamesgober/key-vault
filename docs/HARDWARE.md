@@ -14,18 +14,19 @@
 
 | Hardware surface | 1.0 status | Notes |
 |------------------|------------|-------|
-| Intel SGX / TDX | Detection only | Reported by `tee::detect_tee_capabilities()` |
+| Intel SGX / TDX | Detection only | Reported by `tee::detect_tee_capabilities()`. SGX checks only the CPUID feature bit, not whether SGX is enabled or usable |
 | AMD SEV / SEV-SNP | Detection only | Reported by `tee::detect_tee_capabilities()` |
 | ARM TrustZone | Detection reports `Unknown` | Userspace cannot reliably probe TrustZone availability |
-| Apple Secure Enclave | Detection only | `Detected` on Apple Silicon |
-| AWS Nitro Enclaves | Detection only | Linux `/sys/devices/virtual/dmi/id/sys_vendor` check |
-| TPM 2.0 | Detection only via `TpmFetch` | The fetcher returns `Error::Acquisition("detection-only")` on a `fetch` call |
+| Apple Secure Enclave | Detection only | Reported `Detected` for every `aarch64` macOS build, without a hardware probe |
+| AWS Nitro Enclaves | Detection only | Linux `/sys/devices/virtual/dmi/id/sys_vendor` equals `Amazon EC2`, which is true on EC2 in general |
+| TPM 2.0 | **Not implemented** | `TpmFetch::fetch` always returns `Error::Acquisition`. Nothing in the crate detects or talks to a TPM |
 | Generic HSM (PKCS#11 / KMIP) | Not present | Use a custom `KeyFetch` implementation |
 
-The 1.0 contract for hardware is **detection, not acquisition**. The
-`KeyFetch` trait is the extension point — any caller can implement
-acquisition from a specific HSM or TEE today; the in-tree built-ins
-expose the detection result so application code can branch on it.
+The 1.0 contract for hardware is **detection, not acquisition**, and
+the detection results are heuristics (see the notes above). Detection
+never changes what the vault does. The `KeyFetch` trait is the
+extension point: any caller can implement acquisition from a specific
+HSM or TEE today.
 
 ---
 

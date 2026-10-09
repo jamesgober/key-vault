@@ -19,9 +19,9 @@
 </p>
 
 <p align="center">
-    <i>Complete public-API reference for <code>key-vault</code> 1.0.0.</i>
+    <i>Complete public-API reference for <code>key-vault</code> 1.0.x.</i>
     <br>
-    <i>For the 9-layer architecture see <a href="SECURITY.md">SECURITY.md</a>.
+    <i>For the threat model and what each layer does see <a href="SECURITY.md">SECURITY.md</a>.
     For a per-version change log see <a href="../CHANGELOG.md">CHANGELOG.md</a>.</i>
 </p>
 
@@ -35,7 +35,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-key-vault = "0.9"
+key-vault = "1.0"
 ```
 
 ### Install via terminal
@@ -50,20 +50,30 @@ cargo add key-vault
 
 ### Cargo features
 
-| Feature | Default | Effect |
-|---------|---------|--------|
-| `std` | ✅ | Standard-library types. Required: a build without `std` stops with a `compile_error!`. `no_std` is not supported. |
-| `mlock` | ✅ | `mlock` / `VirtualLock` page locking on `LockedBytes`. |
-| `zeroize` | ✅ | `zeroize` integration; zero-on-drop on every key buffer. |
-| `fragment-standard` | ✅ | `StandardFragmenter` (the default). |
-| `decoy-self-ref` | ✅ | `SelfReferenceDecoy` (the recommended default). |
-| `fetcher-keychain` |   | `KeychainFetch` via the `keyring` crate (0.7.0). |
-| `codex` |   | Marker for the codex layer (currently informational; codex types are always available). |
-| `monitor`, `audit` |   | Layer 8 / 9 integration (0.8.0). |
-| `tee-detect` |   | TEE-capability detection (always available; this flag is informational). |
-| `preset-balanced` |   | `std` + `mlock` + `zeroize` + `fragment-standard` + `decoy-self-ref`. |
-| `preset-paranoid` |   | All defaults + every fragmenter + all decoys + codex + monitor + audit + TEE detect. |
-| `preset-fast` |   | `std` + `fragment-standard` + `decoy-random` (no `mlock`, no zeroize). |
+| Feature | Default | Effect in 1.0.x |
+|---------|---------|-----------------|
+| `std` | ✅ | Required: a build without `std` stops with a `compile_error!`. `no_std` is not supported. |
+| `fetcher-env` |   | Compiles `EnvFetch`. |
+| `fetcher-file` |   | Compiles `FileFetch` (plaintext key file). |
+| `fetcher-keychain` |   | Compiles `KeychainFetch` (pulls in `keyring`). |
+| `fetcher-tpm` |   | Compiles `TpmFetch`, which is **not implemented** and always returns an error. |
+| `fetcher-all` |   | `fetcher-keychain` + `fetcher-file` + `fetcher-env`. |
+| `monitor-tracing` |   | Compiles `LogMonitor` and `LogAudit` (pulls in `tracing`). |
+| `mlock` | ✅ | **Reserved, no effect.** Page locking is always on. |
+| `zeroize` | ✅ | **Reserved, no effect.** Zero-on-drop is always on (the `zeroize` crate is a required dependency since 1.0.2). |
+| `fragment-standard` | ✅ | **Reserved, no effect.** All fragmenter types are always compiled; the vault always uses `StandardFragmenter`. |
+| `fragment-interleaved`, `fragment-random`, `fragment-layered`, `fragment-all` |   | **Reserved, no effect.** |
+| `decoy-self-ref` | ✅ | **Reserved, no effect.** No decoy is used unless `KeyVaultBuilder::with_decoy` is called. |
+| `decoy-random`, `decoy-key-derived`, `decoy-all` |   | **Reserved, no effect.** |
+| `codex`, `codex-dynamic` |   | **Reserved, no effect.** No codex is used unless `KeyVaultBuilder::with_codex` is called. |
+| `monitor`, `audit` |   | **Reserved, no effect.** The monitor and audit hooks are always compiled. |
+| `tee-detect` |   | **Reserved, no effect.** TEE detection is always compiled. |
+| `post-quantum` |   | **Reserved, no effect.** |
+| `preset-balanced`, `preset-paranoid`, `preset-fast` |   | Only enable the features listed in `Cargo.toml`, so they build the same code. `preset-fast` does **not** turn off page locking; `preset-paranoid` does **not** turn on decoys or a codex. |
+
+Reserved features are kept so existing feature lists keep building
+(removing a feature is a breaking change). Wiring them to behavior, or
+deprecating them, is planned for 1.1.
 
 <a href="#top">↑ TOP</a>
 
@@ -90,17 +100,19 @@ cargo add key-vault
 
 ## Quick Start
 
-The minimal, on-by-default stack: BLAKE3 normalization + `StandardFragmenter`
-+ `SelfReferenceDecoy` + `DynamicCodex` + mlock + zero-on-drop +
-constant-time handle equality.
+Always on: BLAKE3 normalization (unless disabled), `StandardFragmenter`,
+page locking and zero-on-drop. `SelfReferenceDecoy` and `DynamicCodex`
+below are opt-in obfuscation; they apply only because the builder sets
+them. None of this protects keys from code that can read the process's
+memory; see [SECURITY.md](SECURITY.md).
 
 ```rust
 use key_vault::{DynamicCodex, KeyVaultBuilder, RawKey, SelfReferenceDecoy};
 use key_vault::tee::detect_tee_capabilities;
 
 # fn main() -> Result<(), key_vault::Error> {
-// Build a vault wiring up Layers 2 (mlock), 3 (StandardFragmenter),
-// 4 (SelfReferenceDecoy), 5 (DynamicCodex), 6 (ConstantTimeEq), 7 (zero-on-drop).
+// Layers 2 (mlock), 3 (StandardFragmenter) and 7 (zero-on-drop) are always
+// on; 4 (decoy) and 5 (codex) are added here explicitly.
 let vault = KeyVaultBuilder::new()
     .normalize_with_blake3(true)            // default
     .with_codex(DynamicCodex::new()?)       // Layer 5
@@ -407,17 +419,22 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 - `register(name: impl Into<String>, key: RawKey) -> Result<KeyHandle>`
   — fragment a key and insert it under `name`. Returns the opaque
   handle. Errors on duplicate name (`Error::InvalidConfig`) or
-  when the vault is locked out.
+  when the vault is locked out. Safe under concurrency: of several
+  simultaneous `register` calls with the same name, exactly one
+  succeeds (fixed in 1.0.2).
 - `unregister(handle: KeyHandle) -> Result<()>` — remove. The
   underlying `Fragments` (and its `LockedBytes` chunks) drop and
   zeroize when the last `Arc` reference goes away.
 - `with_key<F, T>(handle, f: F) -> Result<T>` where
   `F: FnOnce(&[u8]) -> T` — scoped byte access. The slice handed to
-  `f` is valid only during the call; the temporary `RawKey` zeroes
-  on drop.
-- `rotate(handle, new_key: RawKey) -> Result<()>` — atomic swap via
-  `ArcSwap::rcu`. Concurrent readers see either the old or the new
-  fragmentation, never a torn read.
+  `f` points into a page-locked, thread-local scratch buffer and is
+  valid only during the call; the buffer is zeroed when `f` returns,
+  panics, or defragmentation fails. Copies `f` makes are not wiped.
+- `rotate(handle, new_key: RawKey) -> Result<()>` — atomic swap.
+  Concurrent readers see either the old or the new fragmentation,
+  never a torn read. Returns `Error::KeyNotFound` if a concurrent
+  `unregister` removed the key first (before 1.0.2 it could return
+  `Ok` in that case).
 - `contains(handle: KeyHandle) -> bool`
 - `metadata(handle: KeyHandle) -> Option<KeyMetadata>` — non-secret
   per-key metadata.
@@ -431,6 +448,9 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
   (via `subtle::ConstantTimeEq`). On match, clears the lockout flag
   and failure tracker. On mismatch, reports the failure under the
   reserved name `"<master>"` and returns `Error::Acquisition`.
+  There is no rate limit or backoff; throttle it yourself if it is
+  reachable from untrusted input. The digest is unsalted, fast BLAKE3,
+  so use a high-entropy master credential.
 - `has_master_key() -> bool` — whether a master credential was
   registered at build time.
 
@@ -446,7 +466,10 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 **Lockout + monitor controls:**
 
 - `is_locked_out(&self) -> bool` — `true` if a threshold breach has
-  put the vault in lock-out state.
+  put the vault in lock-out state. **Lockout is advisory and
+  vault-wide:** only failures the caller reports through
+  `report_failure` (and wrong master credentials) count, and crossing
+  the threshold for one key name locks out every key.
 - `clear_lockout(&self)` — operator escape hatch. Resets the lockout
   flag and clears the failure tracker.
 - `report_failure(&self, key_name: &str, note: Option<&'static str>)`
@@ -497,17 +520,18 @@ Fluent builder for [`KeyVault`](#keyvault).
 - `with_chunk_range(self, min: usize, max: usize) -> Self` — customize
   the fragmenter chunk-size range. Replaces any previously-set decoy.
 - `with_decoy<D: DecoyStrategy + 'static>(self, decoy: D) -> Self` —
-  attach a Layer-4 decoy strategy.
+  attach a Layer-4 decoy strategy. Without it no decoys are stored.
 - `with_codex<C: Codex + 'static>(self, codex: C) -> Self` — attach a
-  Layer-5 codex.
+  Layer-5 codex. Without it no codex is applied.
 - `with_monitor<M: SecurityMonitor + 'static>(self, monitor: M) -> Self`
   — attach a Layer-8 monitor.
 - `with_failure_threshold(self, max: u32, window: Duration) -> Self` —
   configure the threshold detector. `max = 0` disables lockout.
 - `with_master_key(self, master: RawKey) -> Self` — register a
   master-key credential at build time. Stores the BLAKE3 digest of
-  `master`; plaintext drops + zeroes immediately. Used by
-  `KeyVault::unlock_with_master` for emergency unlock.
+  `master` (zeroized when the builder or vault drops); plaintext drops
+  and zeroes immediately. Used by `KeyVault::unlock_with_master` for
+  emergency unlock.
 - `with_audit_sink<A: AuditSink + 'static>(self, sink: A) -> Self`
   — attach a Layer-9 audit sink. Every public op emits an
   `AuditEvent` through it. Default is `NoAudit`.
@@ -569,10 +593,10 @@ pub trait KeyFetch: Send + Sync {
 - Sanitized errors. Returned `Error::Acquisition.reason` must not include
   key material or secret-equivalent values.
 
-Four built-in implementations shipped in 0.7.0:
-[`EnvFetch`](#envfetch), [`FileFetch`](#filefetch),
-[`KeychainFetch`](#keychainfetch), [`TpmFetch`](#tpmfetch). Each is
-feature-gated.
+Built-in implementations, each feature-gated:
+[`EnvFetch`](#envfetch), [`FileFetch`](#filefetch) (plaintext file),
+[`KeychainFetch`](#keychainfetch). [`TpmFetch`](#tpmfetch) is **not
+implemented** and always returns an error.
 
 **Example (custom impl):**
 
@@ -611,6 +635,9 @@ environment is readable by other processes with the right privileges
 (`/proc/<pid>/environ` on Linux), debuggers, and crash-dump tooling.
 Best for development and orchestration-managed deployments (Kubernetes
 Secrets → env, systemd `EnvironmentFile=` with restricted permissions).
+The value **stays in the environment** after `fetch`; `EnvFetch` does
+not remove it. UTF-8 values only; a rejected non-UTF-8 value is
+zeroized before the error is returned.
 
 **Example:**
 
@@ -631,9 +658,13 @@ let raw = fetcher.fetch(&FetchContext::new("primary"))?;
 
 Source: `src/fetcher/file.rs` · Feature: `fetcher-file`
 
-Reads key bytes from a file on disk. **On Unix, rejects files with
-permissions stricter than `0o600` by default** (any bit in `0o077`
-set). Windows trusts NTFS ACLs.
+Reads key bytes from a **plaintext** file on disk. There is no
+decryption: the file contents are the key. **On Unix, rejects files
+with permissions looser than `0o600` by default** (any bit in `0o077`
+set). The file is opened once and the mode is read from the open
+handle, so the check and the read always see the same file (1.0.2).
+The owner and parent directory are not checked. Windows trusts NTFS
+ACLs and performs no check.
 
 **Constructors:**
 
@@ -692,9 +723,10 @@ identifier within that service. Both appear in failure messages.
 strings — platform-specific error details never appear in `Error`
 messages.
 
-**Threat profile.** Highest-security general-purpose backend short of
-dedicated hardware. The OS confines access to the user account (and on
-macOS to the signing identity).
+**Threat profile.** The strongest built-in fetcher. The OS confines
+access to the user account (and on macOS to the signing identity).
+Secrets are read with `get_password`, so only UTF-8 values are
+supported; a binary secret fails with "stored value is not UTF-8".
 
 **Example:**
 
@@ -715,13 +747,10 @@ let raw = fetcher.fetch(&FetchContext::new("primary"))?;
 
 Source: `src/fetcher/tpm.rs` · Feature: `fetcher-tpm`
 
-TPM 2.0 fetcher — **detection-only in 1.0**. Always returns
-`Error::Acquisition` with a documented message. Full integration
-(`tss-esapi` wiring, unsealing, attestation) arrives in 1.x.
-
-Use [`tee::detect_tee_capabilities()`](#teedetect_tee_capabilities) to
-probe for TPM presence at startup. `TpmFetch` itself can be wired into
-composite fetcher chains today so the 1.x upgrade is automatic.
+TPM 2.0 fetcher — **not implemented**. `fetch` always returns
+`Error::Acquisition`; it never reads a key and provides no hardware
+protection. Nothing in the crate detects or talks to a TPM
+(`tee::detect_tee_capabilities()` reports CPU/platform TEEs only).
 
 **Constructors:**
 
@@ -733,7 +762,7 @@ composite fetcher chains today so the 1.x upgrade is automatic.
 use key_vault::{FetchContext, KeyFetch, TpmFetch};
 
 let err = TpmFetch.fetch(&FetchContext::new("k")).unwrap_err();
-// 1.0 ships detection only; full integration in the 1.x line.
+// Not implemented in 1.0.x: fetch always fails.
 assert!(format!("{err}").contains("TPM"));
 ```
 
@@ -920,7 +949,9 @@ assert_eq!(recovered.len(), 32);
 
 Source: `src/decoy/mod.rs`
 
-Generates filler bytes that surround real key fragments.
+Generates decoy chunks stored alongside the real fragments when a
+decoy is configured with `KeyVaultBuilder::with_decoy`. Obfuscation
+only: the layout buffer marks every decoy chunk.
 
 ```rust
 pub trait DecoyStrategy: Send + Sync {
@@ -966,7 +997,8 @@ Source: `src/decoy/self_reference.rs`
 
 For each output byte, sample an independent random index into the key
 and emit `key[idx]`. The decoy's byte-value distribution is **identical**
-to the key's — strongest indistinguishability, **recommended default**.
+to the key's, the closest statistical match of the three. Not used
+unless passed to `with_decoy`.
 
 ```rust
 use key_vault::{DecoyStrategy, RawKey, SelfReferenceDecoy};
@@ -1011,7 +1043,9 @@ assert_ne!(a, b);
 
 Source: `src/codex/mod.rs`
 
-Byte-wise involution applied to all stored bytes.
+Byte-wise substitution applied to the key before fragmentation when a
+codex is configured with `KeyVaultBuilder::with_codex`. Obfuscation, not
+encryption: table codices keep their table in the same process memory.
 
 ```rust
 pub trait Codex: Send + Sync {
@@ -1164,8 +1198,10 @@ pub trait SecurityMonitor: Send + Sync {
 - No panics. No key material in calls.
 - `Send + Sync`.
 
-Built-in implementations (`NoMonitor`, `LogMonitor`, `MetricsMonitor`,
-`WebhookMonitor`, `CompositeMonitor`) arrive in 0.8.0.
+Built-in implementations: `NoMonitor`, `CompositeMonitor`, `LogMonitor`
+(`monitor-tracing`). The vault calls the monitor only for failures and
+anomalies the caller reports, wrong master credentials, and threshold
+breaches; it does not detect decryption failures itself.
 
 <hr>
 
@@ -1409,14 +1445,18 @@ Source: `src/tee/mod.rs`
 
 **Fields:**
 
-- `pub sgx: Detection` — Intel SGX (CPUID.07H EBX[2] on x86_64).
+- `pub sgx: Detection` — Intel SGX (CPUID.07H EBX[2] on x86_64; feature
+  bit only, not whether SGX is enabled or usable).
 - `pub tdx: Detection` — Intel TDX (CPUID.21H "IntelTDX    " signature).
 - `pub sev: Detection` — AMD SEV (CPUID 0x8000001F EAX[1]).
 - `pub sev_snp: Detection` — AMD SEV-SNP (CPUID 0x8000001F EAX[4]).
 - `pub trustzone: Detection` — ARM TrustZone (always `Unknown` in 1.0).
 - `pub secure_enclave: Detection` — Apple Secure Enclave
-  (`Detected` on `aarch64-apple-darwin`).
-- `pub nitro: Detection` — AWS Nitro Enclaves (Linux DMI vendor).
+  (`Detected` on every `aarch64-apple-darwin` build; no hardware probe).
+- `pub nitro: Detection` — AWS Nitro Enclaves (Linux DMI vendor is
+  `Amazon EC2`, which is true on EC2 in general).
+
+Detection is informational; it never changes what the vault does.
 
 **Methods:**
 
@@ -1456,7 +1496,7 @@ can't be probed from userspace." Treating `Unknown` as
 
 ## Examples
 
-### Full default stack (every shipped layer)
+### Every optional layer turned on
 
 ```rust
 use key_vault::{
@@ -1574,7 +1614,7 @@ impl KeyFetch for EnvironmentFetch {
 
 ## API Safety
 
-**Public-API guarantees in 0.6.0:**
+**Public-API guarantees in 1.0.x:**
 
 | Guarantee | Verification |
 |-----------|--------------|
@@ -1582,8 +1622,8 @@ impl KeyFetch for EnvironmentFetch {
 | No key bytes leak via `Debug` | `KeyHandle` / `KeyId` / `RawKey` / `Fragments` all print `<redacted>` or `<opaque>`. 1024-handle sweep test in CI. |
 | No key bytes in `Error` variants | All variants carry only sanitized prose. |
 | Constant-time handle equality | `KeyHandle: subtle::ConstantTimeEq`; `PartialEq` routes through it. `Hash` consistent. |
-| Zero-on-drop | Every `LockedBytes` (fragments, layout buffer, codex table) volatile-zeroes its bytes before unlocking and freeing. |
-| mlock / VirtualLock | Applied unconditionally to every `LockedBytes` allocation. Soft-fails (records `is_locked = false`) when `RLIMIT_MEMLOCK` is exceeded. |
+| Zero-on-drop | Every `LockedBytes` (fragments, layout buffer, codex table) zeroizes its bytes before unlocking and freeing. `RawKey` zeroizes its whole allocation including spare capacity. The `with_key` scratch buffer is zeroed after every call. |
+| mlock / VirtualLock | Applied to every `LockedBytes` allocation and the `with_key` scratch buffer, with per-page reference counting so a page stays locked while any buffer on it is alive. Soft-fails (records `is_locked = false`) when `RLIMIT_MEMLOCK` is exceeded. |
 | `RawKey` bytes not exposed | `RawKey::as_bytes()` is `pub(crate)`; outside callers see only `len()`. |
 | Round-trip for every `FragmentStrategy` | 1000-iteration stress + per-strategy unit tests in CI. |
 | Codex involution property | 256-byte sweep verified for `StaticCodex`, `DynamicCodex`, `FnCodex`, `IdentityCodex`. |
@@ -1597,32 +1637,30 @@ per-layer architecture and threat-model coverage.
 
 ## Notes
 
-### What's not in 0.11.0 (yet)
+### What's not in 1.0.x
 
-- **`MetricsMonitor`** (metrics-lib integration) and **`WebhookMonitor`**
-  (HTTP POST to alert endpoint) — deferred to post-1.0; both require
-  external dependencies. Build a custom `SecurityMonitor` impl in the
-  meantime.
-- **Master-key-as-KEK** — the master is an emergency-unlock
-  credential only. Sealing other keys with the master needs a
-  key-derivation scheme; deferred to post-1.0.
-- **`dudect`-asserted constant-time** for the full `with_key` path —
-  `KeyHandle::eq` uses `subtle::ConstantTimeEq` and inherits its
-  guarantee; the full call's constant-time property is not yet
-  automated. Deferred to post-1.0.
-- **True zero-allocation hot path** — `dhat` measures ~2 allocations
-  per `with_key` call (defragment buffer + dispatch glue). Both
-  could be eliminated with a thread-local reusable buffer; the
-  trade-off makes that deferred to post-1.0.
-- **`frag_len` / `frag_symbols` configuration knobs** — deferred to a
-  later phase.
+- **Layer 10 page protection** (`PROT_NONE` between accesses): not
+  implemented.
+- **TPM / HSM acquisition**: `TpmFetch` is a placeholder that always
+  errors.
+- **Selecting the vault's fragmenter**: the vault always uses
+  `StandardFragmenter`; the other strategies are usable directly.
+- **Per-key lockout and master-unlock backoff**: lockout is
+  vault-wide and there is no rate limit; planned for 1.1.
+- **Keyed or slow key derivation**: normalization and the master
+  digest are unsalted BLAKE3; a change would be breaking (2.0).
+- **`MetricsMonitor` / `WebhookMonitor`**: not provided. Build a
+  custom `SecurityMonitor` impl.
+- **Master-key-as-KEK**: the master is an emergency-unlock
+  credential only.
+- **Constant-time `with_key`**: reassembly time depends on the
+  chunk layout; only the master digest check and handle equality use
+  `subtle::ConstantTimeEq`.
 
 ### Stability
 
-`key-vault` is pre-1.0. The public API surface listed above will receive
-additions in every minor release through 0.9.x; renames and removals
-are possible but flagged in the CHANGELOG. The 1.0.0 stability contract
-takes effect at the v1.0.0 tag.
+`key-vault` follows the 1.0 stability contract in
+[`STABILITY-1.0.md`](STABILITY-1.0.md): no breaking changes within 1.x.
 
 ### Cross-platform support
 

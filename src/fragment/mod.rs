@@ -1,15 +1,20 @@
-//! Layer 3 — Fragmentation.
+//! Layer 3: fragmentation.
 //!
 //! The [`FragmentStrategy`] trait splits a [`RawKey`] into a number of
-//! [`Fragments`] that the vault stores separately in mlock'd, non-contiguous
-//! memory. Reassembly is the inverse operation, performed only when the
-//! caller needs to use the key.
+//! [`Fragments`], each chunk in its own page-locked heap allocation.
+//! Reassembly is the inverse operation, performed only when the caller
+//! needs to use the key.
 //!
-//! Phase 0.3 ships [`StandardFragmenter`], which produces variable-size
-//! chunks at independent heap allocations (each `mlock`'d on Unix /
-//! `VirtualLock`'d on Windows) and stores the reconstruction order in a
-//! separately-locked layout buffer. Additional strategies (`Interleaved`,
-//! `Random`, `Layered`) follow in Phase 0.5.
+//! Fragmentation is **obfuscation**: it stops a scan from finding the key
+//! as one contiguous run of bytes. It is not protection against anyone who
+//! can read process memory, because the layout buffer that records how to
+//! reassemble the chunks lives in the same process memory. Separate heap
+//! allocations are usually close together, often on the same page.
+//!
+//! [`KeyVault`](crate::KeyVault) always uses [`StandardFragmenter`]; there
+//! is no builder option to select another strategy in 1.0.x, and the
+//! `fragment-*` Cargo features have no effect. [`InterleavedFragmenter`],
+//! [`RandomFragmenter`] and [`LayeredFragmenter`] can be used directly.
 
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -35,8 +40,8 @@ pub use self::standard::StandardFragmenter;
 ///
 /// Each chunk lives in its own internal `LockedBytes` allocation (a crate-
 /// private wrapper that pins the bytes in RAM via `mlock` / `VirtualLock`
-/// and zeroes them on drop), so chunks are at independent (non-contiguous)
-/// heap addresses by construction. The layout buffer encodes the order in
+/// and zeroes them on drop), so chunks are separate heap allocations. They
+/// are not necessarily far apart in memory. The layout buffer encodes the order in
 /// which chunks must be concatenated to reconstruct the original key and
 /// is itself locked + zeroed on drop.
 ///

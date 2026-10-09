@@ -1,35 +1,85 @@
 //! # key-vault
 //!
-//! ENTERPRISE-GRADE KEY MANAGEMENT VAULT
+//! In-memory key storage for Rust applications.
 //!
-//! 9-layer defense-in-depth in-memory key storage. Fragmented across non-contiguous
-//! mlock'd allocations, interleaved with self-referential decoy bytes, optionally
-//! transformed through a codex layer, with constant-time operations, zero-on-drop,
-//! security monitoring, and audit logging.
+//! `key-vault` keeps key material in page-locked, zero-on-drop buffers,
+//! hands out opaque [`KeyHandle`]s instead of byte slices, gives the bytes
+//! back only inside a scoped callback ([`KeyVault::with_key`]), and supports
+//! atomic rotation, failure monitoring and audit hooks. On top of that it can
+//! split keys into shuffled fragments, mix in decoy chunks and pass bytes
+//! through a codex. Those three are obfuscation, not encryption: see the
+//! threat model below.
 //!
-//! # The 9 Layers (plus bonus Layer 10)
+//! # Threat model
 //!
-//! 1. **Secure Acquisition** ([`KeyFetch`] trait — TPM/HSM/Keychain/File/Env)
-//! 2. **Memory Page Locking** (`mlock` / `VirtualLock` — prevents swap)
-//! 3. **Fragment Strategy** ([`FragmentStrategy`] — variable chunks, shuffled, non-contiguous)
-//! 4. **Decoy Bytes** ([`DecoyStrategy`] — self-referential filler, statistically indistinguishable)
-//! 5. **Codex Transformation** ([`Codex`] — byte swap via involution)
-//! 6. **Constant-Time Operations** (`subtle::ConstantTimeEq`)
-//! 7. **Zero-On-Drop** (`zeroize` crate)
-//! 8. **Security Monitor** ([`SecurityMonitor`] — failed decrypt detection, threshold lockout)
-//! 9. **Audit Logging** (every key access tracked)
-//! 10. **(Bonus) Page Protection Toggling** (PROT_NONE when not in use)
+//! **What it helps with**
 //!
-//! See `docs/SECURITY.md` for the full architecture and `docs/TRANSFORMATION.md`
-//! for a visual walkthrough.
+//! - Keys written to swap: buffers are `mlock`'d / `VirtualLock`'d
+//!   (best effort; check `RLIMIT_MEMLOCK`).
+//! - Keys lingering in freed memory: every buffer the crate owns is
+//!   zeroized before it is freed.
+//! - Accidental exposure through logs, `Debug` output, error messages and
+//!   long-lived `Vec<u8>` copies in application code.
+//! - Casual memory scans and heap dumps that search for a key as a
+//!   contiguous run of bytes or for known key formats. Fragmentation,
+//!   decoys and the codex make that harder.
 //!
-//! # Status
+//! **What it does not protect against**
 //!
-//! Phase 0.2.0 — foundation types defined. [`KeyHandle`], [`KeyVault`],
-//! [`KeyVaultBuilder`], the five core traits, [`IdentityCodex`], and
-//! [`tee::detect_tee_capabilities`] are in place. Real fragmentation, mlock,
-//! decoy, and zeroize land in Phases 0.3 and 0.4. See `.dev/ROADMAP.md` for
-//! the full milestone plan.
+//! - **Anyone who can read the process's memory** (a debugger, a
+//!   same-user process with `ptrace` / `ReadProcessMemory`, a full core
+//!   dump, malware in the process, the kernel). The fragments, the layout
+//!   map that says how to reassemble them and which chunks are decoys, and
+//!   the codex table all live in the same process memory. An attacker with
+//!   read access can rebuild every key. Fragmentation, decoys and the
+//!   codex only raise the effort for tools that do not know this crate's
+//!   layout.
+//! - Code running inside the process, which can simply call
+//!   [`KeyVault::with_key`].
+//! - Hardware attacks (DMA, cold boot) and side channels in the
+//!   cryptographic code that uses the key.
+//!
+//! See `docs/SECURITY.md` for the per-layer details.
+//!
+//! # Layers in 1.0.x
+//!
+//! 1. **Key acquisition** ([`KeyFetch`]): keychain, plaintext file and
+//!    environment-variable fetchers. Fetchers add no in-memory protection.
+//!    `TpmFetch` is not implemented and always returns an error.
+//! 2. **Page locking** (`mlock` / `VirtualLock`): best effort, with
+//!    per-page reference counting so one buffer's drop never unlocks a page
+//!    another live buffer uses.
+//! 3. **Fragmentation** ([`FragmentStrategy`]): obfuscation. The vault
+//!    always uses [`StandardFragmenter`].
+//! 4. **Decoy chunks** ([`DecoyStrategy`]): obfuscation. Off unless set
+//!    with [`KeyVaultBuilder::with_decoy`].
+//! 5. **Codex** ([`Codex`]): obfuscation, a byte substitution whose table is
+//!    stored next to the data. Off unless set with
+//!    [`KeyVaultBuilder::with_codex`].
+//! 6. **Constant-time comparison** (`subtle`): used for the master-key
+//!    digest check and handle equality. Defragmentation itself is not
+//!    constant-time.
+//! 7. **Zero-on-drop** (`zeroize`): every secret-bearing buffer the crate
+//!    allocates. Copies made inside `std`, the OS or your own callback are
+//!    not covered.
+//! 8. **Failure monitor and lockout** ([`SecurityMonitor`]): advisory. The
+//!    vault only counts failures the caller reports; lockout is vault-wide.
+//! 9. **Audit hooks** ([`AuditSink`]): one event per vault operation.
+//!
+//! Layer 10, page protection toggling (`PROT_NONE` / `PAGE_NOACCESS`
+//! between accesses), is **not implemented** in 1.0.x.
+//!
+//! # Cargo features
+//!
+//! Only `std` (required), the `fetcher-*` features and `monitor-tracing`
+//! change what is compiled. The other features (`mlock`, `zeroize`,
+//! `codex`, `codex-dynamic`, `decoy-*`, `fragment-*`, `monitor`, `audit`,
+//! `tee-detect`, `post-quantum`, `preset-*`) are reserved and have no
+//! effect in 1.0.x. Page locking and zeroization are always on; decoys and
+//! the codex are configured on [`KeyVaultBuilder`].
+//!
+//! See `docs/TRANSFORMATION.md` for a walkthrough of what happens to a
+//! key as it is stored.
 //!
 //! # Standard library requirement
 //!

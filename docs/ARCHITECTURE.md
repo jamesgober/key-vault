@@ -67,18 +67,20 @@ zero-on-drop byte buffer — until the caller's scoped callback returns.
 ### `src/vault/` — the orchestrator
 
 `KeyVault` is a thin `Arc<VaultInner>` wrapper. Cloning a vault is
-cheap (atomic refcount); registering / rotating goes through
-`ArcSwap::rcu` for atomic, lock-free writes.
+cheap (atomic refcount). Reads are lock-free through `ArcSwap`; writes
+(register / rotate / unregister) are serialized by a writer mutex
+(since 1.0.2).
 
 ```rust
 struct VaultInner {
     keys: ArcSwap<HashMap<KeyId, KeyEntry>>,
+    writer: Mutex<()>,
     config: VaultConfig,
     codex: Option<Arc<dyn Codex>>,
     fragmenter: StandardFragmenter,
     monitor: Arc<dyn SecurityMonitor>,
     audit: Arc<dyn AuditSink>,
-    master_hash: Option<[u8; 32]>,
+    master_hash: Option<Zeroizing<[u8; 32]>>,
     failure_tracker: Mutex<HashMap<String, VecDeque<Instant>>>,
     locked_out: AtomicBool,
 }
@@ -91,13 +93,18 @@ struct KeyEntry {
 ```
 
 **Hot path** (`with_key`): load the `ArcSwap` snapshot, look up the
-entry, clone the `Arc<Fragments>`, drop the snapshot, defragment, run
-the user closure, optionally emit an audit event.
+entry, clone the `Arc<Fragments>`, drop the snapshot, defragment into
+the thread-local scratch buffer (page-locked, zeroed after every call),
+run the user closure, optionally emit an audit event.
 
-**Write path** (`register` / `rotate` / `unregister`): build the new
-key entry, then `keys.rcu(|current| { let mut next = current.clone(); … ; next })`.
-The atomic swap means readers either see the old map or the new map,
-never a torn intermediate.
+**Write path** (`register` / `rotate` / `unregister`): fragment the new
+key outside any lock, then take the writer mutex, load the current map,
+re-check the precondition (name not taken, key still present), clone
+the map with the change applied and `store` it, and release the mutex.
+Readers either see the old map or the new map, never a torn
+intermediate. Before 1.0.2 writers used `ArcSwap::rcu` with the check
+outside the retry loop, which let two `register` calls insert the same
+name and let `rotate` report success for a key removed concurrently.
 
 ### `src/fragment/` — Layer 3
 
@@ -205,7 +212,7 @@ RawKey  ◄─ caller owns; zeroed on drop
 Fragments  ◄─ contains LockedBytes chunks + LockedBytes layout
    │
    ▼  KeyHandle = next id
-   ▼  ArcSwap::rcu insert into keys map
+   ▼  writer lock: re-check name is free, insert, store new map
    ▼  emit_audit(Register) if audit is not no-op
    │
    ▼
@@ -220,11 +227,12 @@ KeyHandle from caller
    ▼  load snapshot, look up entry, clone Arc<Fragments>
    ▼  drop snapshot
    │
-   ▼  fragmenter.defragment(&fragments)  →  RawKey
-   ▼  (optional) codex.decode each byte
+   ▼  fragmenter.defragment_into(&fragments, scratch)  (thread-local,
+   ▼  page-locked buffer; a guard zeroes it on every exit path)
+   ▼  (optional) codex.decode each byte in place
    │
-   ▼  callback(raw.as_bytes())  ◄─ &[u8] valid for the call only
-   ▼  RawKey drops here — volatile zero
+   ▼  callback(&scratch[..len])  ◄─ &[u8] valid for the call only
+   ▼  guard drops here: volatile zero
    │
    ▼  emit_audit(Read) if audit is not no-op
    │
@@ -238,8 +246,9 @@ T (the callback's return value)
 KeyHandle from caller, new RawKey
    │
    ▼  fragmenter.fragment(new_key)  →  new Fragments
-   ▼  ArcSwap::rcu: build a new HashMap with the entry replaced
-   ▼  swap the Arc atomically — concurrent readers see old or new
+   ▼  writer lock: re-check the key is still registered (KeyNotFound
+   ▼  if not), build a new HashMap with the entry replaced, store it;
+   ▼  concurrent readers see old or new
    │
    ▼  emit_audit(Rotate)
    │
@@ -257,7 +266,7 @@ KeyHandle from caller, new RawKey
 | `arc-swap` | Lock-free reads + atomic writes on the named-key registry |
 | `getrandom` | CSPRNG seeding for the fragmenter and decoy strategies |
 | `blake3` | Key normalisation hash + master-key digest hash + XOF in `KeyDerivedDecoy` |
-| `zeroize` | Optional `ZeroizeOnDrop` derive on internal byte buffers |
+| `zeroize` | Wiping of every secret-bearing buffer the crate owns (always on since 1.0.2) |
 | `keyring` (`fetcher-keychain` feature) | OS keychain integration |
 | `tracing` (`monitor-tracing` feature) | `LogMonitor` and `LogAudit` event emission |
 | `libc` (Unix) | `mlock(2)` / `munlock(2)` |

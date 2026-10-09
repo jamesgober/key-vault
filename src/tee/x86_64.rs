@@ -67,10 +67,10 @@ fn detect_sev(vendor: [u8; 12]) -> (Detection, Detection) {
     }
     // CPUID.80000000H returns the max extended leaf in EAX.
     let extended_max = safe_cpuid_count(0x8000_0000, 0).eax;
-    if extended_max < 0x8000_001F {
+    if extended_max < 0x8000_001f {
         return (Detection::NotDetected, Detection::NotDetected);
     }
-    let leaf = safe_cpuid_count(0x8000_001F, 0);
+    let leaf = safe_cpuid_count(0x8000_001f, 0);
     let sev = if (leaf.eax & (1 << 1)) != 0 {
         Detection::Detected
     } else {
