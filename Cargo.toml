@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -73,7 +73,7 @@ fetcher-keychain = [
 ]                                     # OS keychain (macOS, Windows, Linux Secret Service)
 fetcher-file = ["std"]                # Plaintext key file (no decryption; use disk encryption)
 fetcher-env = ["std"]                 # Environment variable
-fetcher-tpm = ["std"]                 # TpmFetch type only: not implemented, fetch() always errors
+fetcher-tpm = ["std"]                 # TpmFetch type only: not implemented, fetch() always errors; deprecated
 fetcher-all = ["fetcher-keychain", "fetcher-file", "fetcher-env"]
 
 # Fragment strategy chosen by KeyVaultBuilder::from_features(). When

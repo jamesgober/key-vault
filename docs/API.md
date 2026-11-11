@@ -61,7 +61,7 @@ configures, so turning one on changes nothing for existing vaults.
 | `fetcher-env` |   | Compiles `EnvFetch`. Implies `std`. |
 | `fetcher-file` |   | Compiles `FileFetch` (plaintext key file). Implies `std`. |
 | `fetcher-keychain` |   | Compiles `KeychainFetch` with `keyring`'s native stores (Keychain Services, Credential Manager, Secret Service over pure-Rust D-Bus). Implies `std`. |
-| `fetcher-tpm` |   | Compiles `TpmFetch`, which is **not implemented** and always returns an error. Implies `std`. |
+| `fetcher-tpm` |   | Compiles `TpmFetch`, which is **not implemented**, always returns an error, and is deprecated since 1.1.1. Implies `std`. |
 | `fetcher-all` |   | `fetcher-keychain` + `fetcher-file` + `fetcher-env`. |
 | `monitor-tracing` |   | Compiles `LogMonitor` and `LogAudit` (pulls in `tracing`). Implies `monitor` and `std`. |
 | `fragment-standard` | ✅ | `from_features()`: `StandardFragmenter` (when no other `fragment-*` feature is on). |
@@ -941,6 +941,9 @@ let binary = KeychainFetch::new("my-app", "aes-key")
 
 Source: `src/fetcher/tpm.rs` · Feature: `fetcher-tpm`
 
+**Deprecated since 1.1.1**; removed in 2.0 unless TPM support lands
+first.
+
 TPM 2.0 fetcher — **not implemented**. `fetch` always returns
 `Error::Acquisition`; it never reads a key and provides no hardware
 protection. Nothing in the crate detects or talks to a TPM
@@ -953,6 +956,7 @@ protection. Nothing in the crate detects or talks to a TPM
 **Example:**
 
 ```rust
+#![allow(deprecated)]
 use key_vault::{FetchContext, KeyFetch, TpmFetch};
 
 let err = TpmFetch.fetch(&FetchContext::new("k")).unwrap_err();

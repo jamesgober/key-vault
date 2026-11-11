@@ -57,8 +57,8 @@
 //!
 //! 1. **Key acquisition** ([`KeyFetch`]): keychain, plaintext file and
 //!    environment-variable fetchers (`std` only). Fetchers add no
-//!    in-memory protection. `TpmFetch` is not implemented and always
-//!    returns an error.
+//!    in-memory protection. `TpmFetch` is not implemented, always
+//!    returns an error, and is deprecated since 1.1.1.
 //! 2. **Page locking and dump exclusion**: best effort, with per-page
 //!    reference counting so one buffer's drop never releases a page
 //!    another live buffer uses.
@@ -189,6 +189,7 @@ pub use crate::fetcher::FileFetch;
 #[cfg(feature = "fetcher-keychain")]
 pub use crate::fetcher::KeychainFetch;
 #[cfg(feature = "fetcher-tpm")]
+#[allow(deprecated)]
 pub use crate::fetcher::TpmFetch;
 pub use crate::fetcher::{FetchContext, KeyFetch, RawKey};
 pub use crate::fragment::{
