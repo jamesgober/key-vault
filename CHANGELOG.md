@@ -33,6 +33,14 @@ Patch release: no API removed or changed.
   is removed in 2.0 unless TPM support lands first. Code that keeps it
   in a fetcher chain on purpose can use `#[allow(deprecated)]`.
 
+### Supply chain
+
+- `async-executor` 1.14.0 (yanked) -> 1.14.1 in `Cargo.lock`.
+- `deny.toml` ignores RUSTSEC-2026-0370, -0371 and -0372 (`zvariant`,
+  `zbus_names` and `zvariant_derive` unmaintained, informational). They
+  come only through `keyring`'s Linux Secret Service backend
+  (`fetcher-keychain`) and go once a keyring release moves to zbus 6.
+
 ### Tests
 
 - A `compile_fail` doctest: naming `TpmFetch` under
