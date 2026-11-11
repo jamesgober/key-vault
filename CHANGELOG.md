@@ -19,6 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] - 2026-11-11
+
+Patch release: no API removed or changed.
+
+### Deprecated
+
+- **`TpmFetch` is deprecated** (feature `fetcher-tpm`). It is a
+  placeholder that never talked to a TPM: `fetch` always returns
+  `Error::Acquisition`. A build that names it now gets a deprecation
+  warning instead of silently configuring a key source that can never
+  produce a key (#4). It stays in 1.x because the 1.x API is frozen, and
+  is removed in 2.0 unless TPM support lands first. Code that keeps it
+  in a fetcher chain on purpose can use `#[allow(deprecated)]`.
+
+### Tests
+
+- A `compile_fail` doctest: naming `TpmFetch` under
+  `#![deny(deprecated)]` does not compile.
+
+---
+
 ## [1.1.0] - 2026-10-09
 
 Minor release: new API, no breaking changes. Everything new is opt-in

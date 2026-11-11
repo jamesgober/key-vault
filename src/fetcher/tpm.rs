@@ -14,12 +14,24 @@
 //! message so consumers can fall through to another fetcher in a
 //! composite arrangement without a panic.
 //!
-//! # When this exists despite returning errors
+//! # Deprecated
 //!
-//! Code that wants to declare its intended fetcher hierarchy at
-//! configuration time (for example "prefer TPM, then keychain, then
-//! file") can put `TpmFetch` first in its chain; today that entry always
-//! fails and the chain falls through to the next fetcher.
+//! `TpmFetch` is deprecated since 1.1.1 so that a build which names it
+//! gets a warning instead of a key source that can never produce a key.
+//! It stays in 1.x because the 1.x API is frozen; it will be removed in
+//! 2.0 unless TPM support lands first. Code that wants a "prefer TPM,
+//! then keychain, then file" chain can still compile with
+//! `#[allow(deprecated)]`; the TPM entry always fails and the chain falls
+//! through to the next fetcher.
+//!
+//! Naming `TpmFetch` with the `deprecated` lint denied does not compile:
+//!
+//! ```compile_fail
+//! #![deny(deprecated)]
+//! use key_vault::TpmFetch;
+//!
+//! let _fetcher = TpmFetch;
+//! ```
 
 use alloc::borrow::Cow;
 use alloc::string::ToString;
@@ -28,14 +40,18 @@ use super::{FetchContext, KeyFetch, RawKey};
 use crate::Result;
 use crate::error::Error;
 
-/// TPM 2.0 fetcher placeholder. **Not implemented.**
+/// TPM 2.0 fetcher placeholder. **Not implemented**, and deprecated since
+/// 1.1.1.
 ///
 /// Always returns [`Error::Acquisition`](crate::Error::Acquisition). It
-/// never reads a key and offers no hardware protection.
+/// never reads a key and offers no hardware protection. Use
+/// `KeychainFetch`, `FileFetch`, `EnvFetch`, or your own [`KeyFetch`]
+/// implementation instead.
 ///
 /// # Examples
 ///
 /// ```
+/// # #![allow(deprecated)]
 /// use key_vault::{FetchContext, KeyFetch, TpmFetch};
 ///
 /// let fetcher = TpmFetch;
@@ -43,9 +59,14 @@ use crate::error::Error;
 /// // Not implemented: fetch always fails.
 /// assert!(format!("{err}").contains("TPM"));
 /// ```
+#[deprecated(
+    since = "1.1.1",
+    note = "TpmFetch is not implemented: fetch() always returns an error. Use another KeyFetch; TpmFetch is removed in 2.0 unless TPM support lands first."
+)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TpmFetch;
 
+#[allow(deprecated)]
 impl KeyFetch for TpmFetch {
     fn fetch(&self, _ctx: &FetchContext) -> Result<RawKey> {
         Err(Error::Acquisition {
@@ -62,7 +83,7 @@ impl KeyFetch for TpmFetch {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 mod tests {
     use super::*;
 
