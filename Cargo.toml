@@ -1,6 +1,6 @@
 [package]
 name = "key-vault"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -141,13 +141,15 @@ libc = { version = "0.2", default-features = false }
 
 # Windows syscall surface: VirtualLock / VirtualProtect / VirtualAlloc,
 # GetSystemInfo for the page size, GetProcAddress for the WER exclusion
-# API (looked up at run time).
+# API (looked up at run time), Get/SetProcessWorkingSetSize to raise the
+# lock budget.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
@@ -159,6 +161,10 @@ proptest = "1"
 # in when the example is built (cargo treats examples as a separate
 # compile target).
 dhat = "0.3"
+
+# Lowering RLIMIT_MEMLOCK and forking in the lock-limit and fork tests.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [[example]]
 name = "dhat_hot_path"

@@ -10,7 +10,13 @@
 //!   the page is not written to swap. If the call fails (most often
 //!   because the process hit `RLIMIT_MEMLOCK`, or on Windows its minimum
 //!   working-set size), the buffer still works and
-//!   [`LockedBytes::is_locked`] reports `false`.
+//!   [`LockedBytes::is_locked`] reports `false`. Since 1.2 the vault
+//!   reports this ([`KeyVault::memory_status`](crate::KeyVault::memory_status),
+//!   [`Fragments::is_locked`](crate::Fragments::is_locked)) and can refuse
+//!   to store an unlocked key
+//!   ([`KeyVaultBuilder::with_strict_locking`](crate::KeyVaultBuilder::with_strict_locking)).
+//!   On Windows a failed lock first raises the process's working-set
+//!   size (see `windows.rs`).
 //! - **Dump exclusion** (1.1): `madvise(MADV_DONTDUMP)` on Linux and
 //!   Android, `madvise(MADV_NOCORE)` on FreeBSD and DragonFly, and
 //!   `WerRegisterExcludedMemoryBlock` on Windows (Windows Error Reporting
@@ -22,12 +28,21 @@
 //! # Page pool
 //!
 //! Buffers of up to 2048 bytes (fragments, layout maps, codex tables) come
-//! from a pool of pages the crate maps for itself (1.1, `pool.rs`). Each
-//! pool page is locked and excluded from dumps once, when it is mapped,
-//! holds only key buffers, and is kept for the life of the process, so
-//! registering and dropping keys makes no system calls once the pool has
-//! grown to its working size. Before 1.1 every small buffer lived on the
+//! from a pool of pages the crate maps for itself (1.1, `pool.rs`). Pool
+//! pages hold only key buffers and are kept for the life of the process,
+//! so registering and dropping keys makes no system calls once the pool
+//! has grown to its working size. Since 1.2 the pool records which of its
+//! pages are locked, hands out blocks on locked pages first, and retries
+//! pages whose lock failed. Before 1.1 every small buffer lived on the
 //! general heap.
+//!
+//! # After `fork`
+//!
+//! Memory locks are not inherited by a child process. On Unix the crate
+//! registers a `pthread_atfork` child handler that only sets a flag; the
+//! next vault operation in the child locks every pool and heap page
+//! again, and each page-protected key is locked again the first time it
+//! is read.
 //!
 //! # Page reference counting
 //!
@@ -61,7 +76,6 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-#[cfg(any(test, not(feature = "std")))]
 use alloc::vec::Vec;
 use core::fmt;
 use core::ptr::NonNull;
@@ -108,8 +122,6 @@ pub(crate) struct LockedBytes {
     len: usize,
     /// Where the bytes live and who frees them.
     storage: Storage,
-    /// `true` if every page of the buffer is locked.
-    locked: bool,
 }
 
 /// Backing storage of a [`LockedBytes`].
@@ -152,7 +164,6 @@ impl LockedBytes {
                 ptr: block.ptr,
                 len: bytes.len(),
                 storage: Storage::Pooled { class: block.class },
-                locked: block.locked,
             };
         }
         // `Box<[u8]>::from` allocates exactly `bytes.len()` bytes, so the
@@ -164,18 +175,15 @@ impl LockedBytes {
         // SAFETY: `Box::into_raw` never returns null (a zero-length box
         // gives a dangling, non-null pointer).
         let ptr = unsafe { NonNull::new_unchecked(raw) };
-        let locked = if len == 0 {
-            false
-        } else {
+        if len > 0 {
             // SAFETY: `ptr` points to a live `len`-byte allocation that is
             // only freed in `Drop`, after the matching `release_region`.
-            unsafe { acquire_region(ptr.as_ptr(), len) }
-        };
+            let _ = unsafe { acquire_region(ptr.as_ptr(), len) };
+        }
         Self {
             ptr,
             len,
             storage: Storage::Heap,
-            locked,
         }
     }
 
@@ -187,12 +195,11 @@ impl LockedBytes {
     /// outlives the returned value. The value must only be read while the
     /// region is open for reading.
     #[cfg(any(unix, windows))]
-    pub(crate) unsafe fn region_view(ptr: NonNull<u8>, len: usize, locked: bool) -> Self {
+    pub(crate) unsafe fn region_view(ptr: NonNull<u8>, len: usize) -> Self {
         Self {
             ptr,
             len,
             storage: Storage::RegionView,
-            locked,
         }
     }
 
@@ -218,14 +225,53 @@ impl LockedBytes {
         matches!(self.storage, Storage::Heap)
     }
 
-    /// `true` iff every page of the buffer is locked.
+    /// `true` iff every page of the buffer is locked right now.
     ///
     /// A `false` value is not an error in itself: it means the kernel
     /// declined the lock (usually because the process is over its
-    /// `RLIMIT_MEMLOCK`). The buffer still zeroes on drop.
-    #[allow(dead_code)] // used by tests.
+    /// `RLIMIT_MEMLOCK`). The buffer still zeroes on drop. Always `false`
+    /// for an empty buffer and for a view into a guarded region (the
+    /// region reports for itself).
     pub(crate) fn is_locked(&self) -> bool {
-        self.locked
+        self.state().0
+    }
+
+    /// `true` iff every page of the buffer is excluded from dumps right
+    /// now. Same caveats as [`LockedBytes::is_locked`].
+    pub(crate) fn is_excluded_from_dumps(&self) -> bool {
+        self.state().1
+    }
+
+    /// Retry the lock on every page of the buffer that is not locked.
+    /// Returns `true` if the whole buffer is locked now.
+    pub(crate) fn retry_lock(&self) -> bool {
+        if self.len == 0 {
+            return true;
+        }
+        match self.storage {
+            #[cfg(any(unix, windows))]
+            Storage::RegionView => false,
+            #[cfg(any(unix, windows))]
+            Storage::Pooled { class } => pool::retry_block(self.ptr.as_ptr() as usize, class),
+            // SAFETY: a non-empty heap buffer holds the page references
+            // taken in `from_slice` until it is dropped.
+            Storage::Heap => unsafe { retry_region(self.ptr.as_ptr(), self.len) },
+        }
+    }
+
+    /// `(locked, excluded_from_dumps)`, asked of the pool or the page
+    /// table so that a page locked by a later retry reads as locked.
+    fn state(&self) -> (bool, bool) {
+        if self.len == 0 {
+            return (false, false);
+        }
+        match self.storage {
+            #[cfg(any(unix, windows))]
+            Storage::RegionView => (false, false),
+            #[cfg(any(unix, windows))]
+            Storage::Pooled { .. } => pool::block_state(self.ptr.as_ptr() as usize),
+            Storage::Heap => region_state(self.ptr.as_ptr(), self.len),
+        }
     }
 }
 
@@ -241,7 +287,6 @@ impl Drop for LockedBytes {
                 let block = pool::Block {
                     ptr: self.ptr,
                     class,
-                    locked: self.locked,
                 };
                 // SAFETY: the block is ours and `len` bytes of it are in
                 // use; the rest was zero when we got it and never written.
@@ -278,7 +323,7 @@ impl fmt::Debug for LockedBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LockedBytes")
             .field("len", &self.len)
-            .field("locked", &self.locked)
+            .field("locked", &self.is_locked())
             .field("bytes", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -374,6 +419,7 @@ fn page_span(addr: usize, len: usize, page: usize) -> (usize, usize) {
 /// stays valid (and is not moved) until the matching [`release_region`].
 /// `len` must be non-zero.
 pub(crate) unsafe fn acquire_region(ptr: *const u8, len: usize) -> bool {
+    relock_if_forked();
     let page = page_size();
     let (first, last) = page_span(ptr as usize, len, page);
     // The table lock is held across the syscalls so no other thread can
@@ -443,6 +489,112 @@ pub(crate) unsafe fn release_region(ptr: *const u8, len: usize) {
     }
 }
 
+/// `(locked, excluded_from_dumps)` for every page of `[ptr, ptr + len)`
+/// in the page table. `len` must be non-zero.
+fn region_state(ptr: *const u8, len: usize) -> (bool, bool) {
+    let page = page_size();
+    let (first, last) = page_span(ptr as usize, len, page);
+    let table = PAGES.lock();
+    let mut state = (true, true);
+    let mut addr = first;
+    loop {
+        match table.get(&addr) {
+            Some(s) => {
+                state.0 &= s.locked;
+                state.1 &= s.no_dump;
+            }
+            None => return (false, false),
+        }
+        if addr == last {
+            break;
+        }
+        addr += page;
+    }
+    state
+}
+
+/// Retry the lock on every page of `[ptr, ptr + len)` that is not locked.
+/// Returns `true` if every page is now locked.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` must be a live allocation with a reference taken
+/// by [`acquire_region`] that is not yet released. `len` must be
+/// non-zero.
+pub(crate) unsafe fn retry_region(ptr: *const u8, len: usize) -> bool {
+    // Taking a second reference retries the lock on every page that is
+    // not locked; dropping it again leaves the counts as they were, and
+    // cannot unlock anything because the caller's reference remains.
+    // SAFETY: per the caller's contract.
+    let locked = unsafe { acquire_region(ptr, len) };
+    // SAFETY: matches the `acquire_region` just above.
+    unsafe { release_region(ptr, len) };
+    locked
+}
+
+// ------------------------- After fork -------------------------
+
+/// Set in a child process by the `pthread_atfork` handler.
+#[cfg(unix)]
+static FORKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Bumped each time the crate relocks after a `fork`. Guarded regions
+/// compare it with the value they were locked under.
+static FORK_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// `pthread_atfork` child handler. Only sets a flag: the child may have
+/// been forked while another thread held one of the crate's locks, and a
+/// handler must not take them.
+#[cfg(unix)]
+extern "C" fn on_fork_child() {
+    FORKED.store(true, Ordering::Release);
+}
+
+/// Register the `fork` child handler once per process. No-op off Unix.
+pub(crate) fn install_fork_handler() {
+    #[cfg(unix)]
+    {
+        static INSTALLED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !INSTALLED.swap(true, Ordering::AcqRel) {
+            unix::install_fork_handler(on_fork_child);
+        }
+    }
+}
+
+/// Current fork generation (see [`FORK_GENERATION`]).
+#[allow(dead_code)] // only guarded regions read it.
+pub(crate) fn fork_generation() -> usize {
+    FORK_GENERATION.load(Ordering::Acquire)
+}
+
+/// In a child process after `fork`, lock every pool page and every page
+/// in the page table again. Cheap (one atomic load) otherwise.
+#[inline]
+pub(crate) fn relock_if_forked() {
+    #[cfg(unix)]
+    if FORKED.load(Ordering::Acquire) {
+        relock_after_fork();
+    }
+}
+
+#[cfg(unix)]
+#[cold]
+fn relock_after_fork() {
+    if !FORKED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let _ = FORK_GENERATION.fetch_add(1, Ordering::AcqRel);
+    pool::relock_all();
+    let page = page_size();
+    let mut table = PAGES.lock();
+    for (&addr, state) in table.iter_mut() {
+        // SAFETY: every page in the table overlaps a live buffer (it is
+        // removed when the last one is released), so it is mapped.
+        state.locked = unsafe { lock_pages(addr as *const u8, page) };
+    }
+}
+
 /// Number of live buffers that touch the page containing `addr`.
 #[cfg(test)]
 pub(crate) fn page_lock_count(addr: usize) -> usize {
@@ -471,31 +623,42 @@ pub(crate) fn pages_of(bytes: &[u8]) -> Vec<usize> {
 }
 
 /// Per-call scratch buffer used by `with_key` in builds without
-/// thread-local storage: locked and dump-excluded while it lives, wiped
-/// on drop.
-#[cfg(not(feature = "std"))]
+/// thread-local storage, and for a `with_key` nested inside another on
+/// the same thread: locked and dump-excluded while it lives, wiped on
+/// drop.
 pub(crate) struct ScratchBuf {
     buf: Vec<u8>,
+    locked: bool,
 }
 
-#[cfg(not(feature = "std"))]
 impl ScratchBuf {
     pub(crate) fn new(len: usize) -> Self {
         let buf = alloc::vec![0u8; len];
-        if len > 0 {
+        let locked = len == 0 || {
             // SAFETY: `buf` is a live `len`-byte allocation that is never
             // resized and is released in `Drop` before it is freed.
-            let _ = unsafe { acquire_region(buf.as_ptr(), len) };
-        }
-        Self { buf }
+            unsafe { acquire_region(buf.as_ptr(), len) }
+        };
+        Self { buf, locked }
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buf
+    /// The buffer, or [`Error::MemoryLock`](crate::Error::MemoryLock) if
+    /// `strict` and its pages could not be locked.
+    pub(crate) fn slice(&mut self, strict: bool) -> crate::Result<&mut [u8]> {
+        if strict && !self.locked {
+            // SAFETY: the buffer is non-empty (an empty one counts as
+            // locked) and holds a reference from `new`.
+            self.locked = unsafe { retry_region(self.buf.as_ptr(), self.buf.len()) };
+            if !self.locked {
+                return Err(crate::Error::MemoryLock(
+                    "could not lock the scratch buffer for the key".into(),
+                ));
+            }
+        }
+        Ok(&mut self.buf)
     }
 }
 
-#[cfg(not(feature = "std"))]
 impl Drop for ScratchBuf {
     fn drop(&mut self) {
         self.buf.as_mut_slice().zeroize();

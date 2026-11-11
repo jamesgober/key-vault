@@ -1,122 +1,128 @@
-//! Phase 0.10.0 — concurrent read scalability.
+//! Concurrent read scaling.
 //!
-//! The Performance Contract requires that concurrent reads on the same
-//! handle are **lock-free, no degradation**. We measure aggregate
-//! throughput at 1 / 4 / 16 / 64 threads to verify the `ArcSwap`-backed
-//! registry doesn't introduce coordination overhead.
+//! Reader threads are started once per measurement and released together
+//! by a barrier; each does a fixed number of `with_key` calls and the
+//! measurement is the wall time from release to the last reader finishing.
+//! Thread start-up is outside the measured window. (Before 1.2 this bench
+//! spawned the threads inside every iteration and did 1,000 reads each, so
+//! it mostly measured thread creation and could not show contention.)
+//!
+//! Two shapes, at 1 / 2 / 4 / 8 / 16 threads:
+//!
+//! - `same_key`: every thread reads one key (a signing or session key read
+//!   by every request).
+//! - `own_key`: each thread reads its own key.
+//!
+//! With no shared writes on the read path the two scale alike. Reported as
+//! throughput (reads per second, all threads together).
+
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use key_vault::{KeyVault, KeyVaultBuilder, RawKey};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use key_vault::{KeyHandle, KeyVault, KeyVaultBuilder, RawKey};
 
 const KEY_LEN: usize = 32;
-const READS_PER_THREAD: u64 = 1_000;
-const THREAD_COUNTS: &[usize] = &[1, 4, 16, 64];
+const READS_PER_THREAD: u64 = 20_000;
+const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 
-fn build_vault() -> (Arc<KeyVault>, key_vault::KeyHandle) {
-    let vault = Arc::new(KeyVaultBuilder::new().normalize_with_blake3(false).build());
-    let key_bytes: Vec<u8> = (0..KEY_LEN).map(|i| (i as u8).wrapping_mul(7)).collect();
-    let handle = vault
-        .register("shared", RawKey::new(key_bytes))
-        .expect("register");
-    (vault, handle)
+fn key(fill: u8) -> RawKey {
+    RawKey::new(vec![fill; KEY_LEN])
+}
+
+/// Run `threads` readers, released together, each reading its handle
+/// `reads` times; returns the time from release until all are done.
+fn run_readers(vault: &KeyVault, handles: &[KeyHandle], reads: u64) -> Duration {
+    let threads = handles.len();
+    let start = Arc::new(Barrier::new(threads + 1));
+    let joins: Vec<_> = handles
+        .iter()
+        .map(|&h| {
+            let vault = vault.clone();
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                let _ = start.wait();
+                let mut acc = 0u64;
+                for _ in 0..reads {
+                    acc =
+                        acc.wrapping_add(vault.with_key(h, |k| u64::from(k[0])).expect("with_key"));
+                }
+                black_box(acc);
+            })
+        })
+        .collect();
+    let _ = start.wait();
+    let t = Instant::now();
+    for j in joins {
+        j.join().expect("reader");
+    }
+    t.elapsed()
 }
 
 fn bench_concurrent_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_reads");
-    group.sample_size(20);
+    group.sample_size(10);
+    let vault = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+    let shared = vault.register("shared", key(1)).expect("register");
+    let own: Vec<KeyHandle> = (0..THREAD_COUNTS[THREAD_COUNTS.len() - 1])
+        .map(|i| vault.register(format!("own{i}"), key(2)).expect("register"))
+        .collect();
 
     for &threads in THREAD_COUNTS {
-        group.throughput(Throughput::Elements((threads as u64) * READS_PER_THREAD));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(threads),
-            &threads,
-            |b, &threads| {
-                let (vault, handle) = build_vault();
-                b.iter(|| {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let mut handles = Vec::with_capacity(threads);
-                    for _ in 0..threads {
-                        let vault = Arc::clone(&vault);
-                        let stop = Arc::clone(&stop);
-                        handles.push(thread::spawn(move || {
-                            let mut acc: u64 = 0;
-                            for _ in 0..READS_PER_THREAD {
-                                if stop.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                let sum: u64 = vault
-                                    .with_key(handle, |bytes| {
-                                        bytes.iter().copied().map(u64::from).sum()
-                                    })
-                                    .expect("with_key");
-                                acc = acc.wrapping_add(sum);
-                            }
-                            acc
-                        }));
-                    }
-                    let mut total: u64 = 0;
-                    for h in handles {
-                        total = total.wrapping_add(h.join().expect("thread"));
-                    }
-                    black_box(total);
-                });
-            },
-        );
+        group.throughput(Throughput::Elements(threads as u64 * READS_PER_THREAD));
+        let same = vec![shared; threads];
+        group.bench_with_input(BenchmarkId::new("same_key", threads), &same, |b, hs| {
+            b.iter_custom(|iters| {
+                (0..iters)
+                    .map(|_| run_readers(&vault, hs, READS_PER_THREAD))
+                    .sum()
+            });
+        });
+        let mine = own[..threads].to_vec();
+        group.bench_with_input(BenchmarkId::new("own_key", threads), &mine, |b, hs| {
+            b.iter_custom(|iters| {
+                (0..iters)
+                    .map(|_| run_readers(&vault, hs, READS_PER_THREAD))
+                    .sum()
+            });
+        });
     }
-
     group.finish();
 }
 
 fn bench_reads_during_rotation(c: &mut Criterion) {
-    // 4 reader threads contend with 1 rotator thread to verify that
-    // ArcSwap::rcu doesn't stall readers.
+    // 4 readers on one key while another thread rotates it continuously.
+    // Readers never wait for the writer; this shows what the rotations
+    // cost them.
     let mut group = c.benchmark_group("reads_during_rotation");
     group.sample_size(10);
-
+    group.throughput(Throughput::Elements(4 * READS_PER_THREAD));
+    let vault = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+    let handle = vault.register("rotating", key(1)).expect("register");
     group.bench_function("4_readers_1_rotator", |b| {
-        b.iter(|| {
-            let (vault, handle) = build_vault();
-            let stop = Arc::new(AtomicBool::new(false));
-
-            let mut reader_handles = Vec::new();
-            for _ in 0..4 {
-                let vault = Arc::clone(&vault);
-                let stop = Arc::clone(&stop);
-                reader_handles.push(thread::spawn(move || {
-                    let mut acc: u64 = 0;
-                    let mut reads: u64 = 0;
-                    while !stop.load(Ordering::Relaxed) {
-                        let sum: u64 = vault
-                            .with_key(handle, |bytes| bytes.iter().copied().map(u64::from).sum())
-                            .expect("with_key");
-                        acc = acc.wrapping_add(sum);
-                        reads += 1;
-                        if reads >= 500 {
-                            break;
-                        }
-                    }
-                    acc
-                }));
-            }
-
-            // Rotate the key 10 times while readers hammer it.
-            for i in 0..10u8 {
-                let bytes: Vec<u8> = (0..KEY_LEN).map(|j| (j as u8) ^ i).collect();
-                vault.rotate(handle, RawKey::new(bytes)).expect("rotate");
-            }
-            stop.store(true, Ordering::Relaxed);
-
-            let mut total: u64 = 0;
-            for h in reader_handles {
-                total = total.wrapping_add(h.join().expect("thread"));
-            }
-            black_box(total);
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let rotator = {
+                        let (vault, stop) = (vault.clone(), Arc::clone(&stop));
+                        thread::spawn(move || {
+                            let mut i = 0u8;
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                i = i.wrapping_add(1);
+                                vault.rotate(handle, key(i)).expect("rotate");
+                            }
+                        })
+                    };
+                    let elapsed = run_readers(&vault, &[handle; 4], READS_PER_THREAD);
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    rotator.join().expect("rotator");
+                    elapsed
+                })
+                .sum()
         });
     });
-
     group.finish();
 }
 

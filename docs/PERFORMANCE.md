@@ -19,8 +19,16 @@ For the operations downstream callers actually hit on the hot path —
 its 1.0 design targets at the key sizes that matter for symmetric
 crypto (16 / 32 / 64 bytes). One-shot defragment is <150ns for
 typical key sizes and stays under 500ns at 256 bytes. Construction is
-sub-microsecond. Concurrent read throughput scales out to the host's
-physical core count without lock contention.
+sub-microsecond. Since 1.2 a read takes no lock and writes no shared
+memory, so threads reading one key scale like threads reading separate
+keys (see §3 "Concurrent reads"; before 1.2 every read of a key wrote to
+one shared reference count).
+
+Since 1.2 `register`, `rotate` and `unregister` cost the same however
+many keys are registered (the registry is a persistent hash trie; before,
+every write copied the whole map), and `report_failure` costs the same
+however many failures came before (see §4 "Registry writes and failure
+tracking (1.2)").
 
 The slow operations are `fragment` and (by extension) `register` and
 `rotate`. Before 1.1 every chunk was a separate heap allocation whose
@@ -63,7 +71,7 @@ the latest measurement on the reference machine (see §2).
 | Key access (`with_key`, defrag, with codex), 32 B | <1 µs | **~72 ns** | ✅ |
 | Key access (`with_key`, defrag, with codex), 64 B | <1 µs | **~126 ns** | ✅ |
 | Key access (`with_key`, defrag, with codex), 256 B | <1 µs | **~439 ns** | ✅ |
-| Key access concurrent (lock-free, no degradation) | lock-free | scales 1→64 threads, no contention | ✅ |
+| Key access concurrent (lock-free, no degradation) | lock-free | no shared writes on the read path since 1.2; same-key and own-key reads scale alike (§3) | ✅ |
 | Memory overhead per key | <16 KiB | **~5 KiB** observed (1000-key RSS delta on Linux) | ✅ |
 | Allocations per `with_key` (no-op audit sink) | zero | **0** measured by dhat over 100,000 iterations | ✅ |
 
@@ -103,7 +111,7 @@ a `[[bench]]` target in `Cargo.toml` with `harness = false`.
 | File | Covers |
 |------|--------|
 | `access_latency.rs` | `KeyVaultBuilder::build`, `register`, `with_key`, `rotate`, one-shot `fragment` / `defragment` |
-| `concurrent_access.rs` | `with_key` throughput at 1 / 4 / 16 / 64 threads, plus reads-during-rotation contention |
+| `concurrent_access.rs` | `with_key` throughput at 1 / 2 / 4 / 8 / 16 threads, every thread on one key and each on its own key, threads started once and released by a barrier (1.2); plus reads during continuous rotation |
 | `fragment_strategies.rs` | Head-to-head: `StandardFragmenter`, `InterleavedFragmenter`, `RandomFragmenter`, `LayeredFragmenter`, exercised through the `FragmentStrategy` trait |
 | `decoy_strategies.rs` | `RandomDecoy`, `SelfReferenceDecoy`, `KeyDerivedDecoy` through the full vault stack |
 | `codex_overhead.rs` | `IdentityCodex`, `StaticCodex::random_involution`, `DynamicCodex`, plus a no-codex baseline |
@@ -364,11 +372,35 @@ released when the last buffer on it was dropped, which cost system
 calls on every register / rotate / unregister. With the pool, steady
 state register and rotate make no system calls.
 
+### Registry writes and failure tracking (1.2)
+
+Measured with the reproduction harness used for the 1.2 fixes (release
+build, a shared and loaded machine, so compare the columns rather than
+the absolute numbers).
+
+| Operation | 1.1.0 | 1.2.0 |
+|-----------|-------|-------|
+| `register` at ~1,000 / 5,000 / 20,000 keys (Linux, WSL2) | 85 µs / 473 µs / 4.17 ms | 31 / 7.0 / 7.8 µs |
+| `register` at ~1,000 / 5,000 / 20,000 keys (Windows) | 7.3 / 5.1 / 12.3 ms | 7.8 / 16.4 / 7.5 µs |
+| `report_failure`, one name, after 10k / 40k / 160k failures (Linux) | 21 / 77 / 164 µs per call | 101 / 70 / 33 ns per call |
+| `report_failure`, one name, after 10k / 40k / 160k failures (Windows) | 8.4 / 34.6 / 138 µs per call | 50 / 84 / 59 ns per call |
+| 1,000,000 `report_failure` calls with distinct names, default config (Windows private bytes) | +234 MiB | +0 MiB |
+
+`register` no longer grows with the registry: the duplicate-name check
+is a hashed lookup and the write copies one trie path (at most 13 levels
+of 32-way branches). `report_failure` keeps at most 64 slots per name and
+nothing at all while no threshold is on.
+
 ### What is still not tuned
 
 - **Page protection** makes two `mprotect` / `VirtualProtect` calls per
   `with_key`. Readers of the same key share one open window, but each
   call still pays the pair when it is the only reader.
+- **Windows read scaling.** On Windows, reads of separate keys from many
+  threads have scaled less well than on Linux in our measurements, even
+  where nothing on the read path is shared. The cause is not
+  identified; the measurements were taken on a heavily loaded machine,
+  so treat Windows scaling figures with care.
 
 ---
 
@@ -381,7 +413,7 @@ what to expect, not as defects to fix.
 | Operation | Cost | Why |
 |-----------|------|-----|
 | `register` (any size) | see §3 | Every fragment chunk = one pool block (or heap allocation + page reference above 2048 bytes) + Fisher-Yates shuffle of the layout. The cost scales linearly with key size and inversely with `with_chunk_range` max. |
-| `rotate` | same as `register` | Rotation is "fragment new key" + "atomic ArcSwap swap-in". The fragmentation cost is the same; the swap is single-digit nanoseconds. |
+| `rotate` | same as `register` | Rotation is "fragment new key" + install a new registry snapshot under the writer lock. Since 1.2 the snapshot is a persistent trie and the install copies one path (a few microseconds at most, independent of the number of keys); in 1.0 and 1.1 it copied the whole map (milliseconds at 20,000 keys). |
 | `fragment` (one-shot) | 6–110 µs | Same fragmentation cost as `register`, minus the registry insert. |
 | `DynamicCodex::new` | ~10 µs | Generates a 256-byte involution via CSPRNG with no fixed points, then mlocks the table. One-time per vault. |
 | First `KeyDerivedDecoy` chunk | ~150 ns | One BLAKE3 keyed extract; subsequent chunks come from the same XOF stream. |

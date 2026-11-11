@@ -1,9 +1,27 @@
 //! Windows backend: `VirtualLock` / `VirtualUnlock`, exclusion from
 //! Windows Error Reporting dumps, and `VirtualAlloc` / `VirtualProtect`
 //! for page-protected regions.
+//!
+//! # Lock budget
+//!
+//! Windows lets a process lock only as many pages as fit in its minimum
+//! working-set size, less a few pages the system keeps for itself. The
+//! default minimum is 200 KiB, which leaves room for about 44 locked
+//! pages. When `VirtualLock` fails with `ERROR_WORKING_SET_QUOTA`, this
+//! module raises the process's minimum and maximum working-set sizes with
+//! `SetProcessWorkingSetSize` (by at least 1 MiB at a time, and by no
+//! more than [`MAX_WORKING_SET_GROWTH`] in total) and tries once more.
+//! Raising the working set of one's own process needs only the "Increase
+//! a process working set" privilege, which every user holds by default.
+//! If the call fails, the crate stops trying, and locks fail as before.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use windows_sys::Win32::Foundation::{ERROR_WORKING_SET_QUOTA, GetLastError};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
+};
 
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
@@ -17,6 +35,63 @@ use super::Access;
 /// Whether a page lock survives a change to no-access protection.
 pub(super) const LOCK_SURVIVES_NO_ACCESS: bool = false;
 
+/// Whether this platform can exclude pages from dumps (Windows Error
+/// Reporting only).
+pub(super) const DUMP_EXCLUSION_SUPPORTED: bool = true;
+
+/// Most the crate raises the minimum working set by, in total.
+pub(crate) const MAX_WORKING_SET_GROWTH: usize = 256 << 20;
+
+/// Smallest step by which the working set is raised.
+const WORKING_SET_STEP: usize = 1 << 20;
+
+/// Bytes added to the minimum working set so far.
+static WORKING_SET_GROWN: AtomicUsize = AtomicUsize::new(0);
+
+/// Set once raising the working set has failed.
+static WORKING_SET_STUCK: AtomicBool = AtomicBool::new(false);
+
+/// Raise the minimum and maximum working-set sizes by enough for `len`
+/// more locked bytes. Returns `true` if they were raised.
+fn grow_working_set(len: usize) -> bool {
+    static GROWING: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+    if WORKING_SET_STUCK.load(Ordering::Acquire) {
+        return false;
+    }
+    let _serial = GROWING.lock();
+    let step = len.saturating_add(len).max(WORKING_SET_STEP);
+    let grown = WORKING_SET_GROWN.load(Ordering::Acquire);
+    if grown.saturating_add(step) > MAX_WORKING_SET_GROWTH {
+        WORKING_SET_STUCK.store(true, Ordering::Release);
+        return false;
+    }
+    let mut min = 0usize;
+    let mut max = 0usize;
+    // SAFETY: `GetCurrentProcess` returns a pseudo handle that needs no
+    // closing; `min` and `max` are valid out-pointers.
+    let ok = unsafe { GetProcessWorkingSetSize(GetCurrentProcess(), &raw mut min, &raw mut max) };
+    if ok == 0 {
+        WORKING_SET_STUCK.store(true, Ordering::Release);
+        return false;
+    }
+    let new_min = min.saturating_add(step);
+    let new_max = max.saturating_add(step).max(new_min);
+    // SAFETY: as above; the sizes are plain values.
+    let ok = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), new_min, new_max) };
+    if ok == 0 {
+        WORKING_SET_STUCK.store(true, Ordering::Release);
+        return false;
+    }
+    let _ = WORKING_SET_GROWN.fetch_add(step, Ordering::AcqRel);
+    true
+}
+
+/// Bytes the crate has added to the process's minimum working set.
+#[allow(dead_code)] // read by tests and the docs' example only.
+pub(crate) fn working_set_growth() -> usize {
+    WORKING_SET_GROWN.load(Ordering::Acquire)
+}
+
 /// Attempt to lock `len` bytes starting at `ptr` into RAM.
 ///
 /// # Safety
@@ -29,8 +104,17 @@ pub(super) unsafe fn lock_pages(ptr: *const u8, len: usize) -> bool {
     // given range into the working set. The pointer/length pair are passed
     // straight through; the kernel rejects invalid ranges rather than
     // corrupting state.
-    let ok = unsafe { VirtualLock(ptr as *mut c_void, len) };
-    ok != 0
+    if unsafe { VirtualLock(ptr as *mut c_void, len) } != 0 {
+        return true;
+    }
+    // SAFETY: reads the calling thread's last-error value; no
+    // preconditions.
+    let error = unsafe { GetLastError() };
+    if error != ERROR_WORKING_SET_QUOTA || !grow_working_set(len) {
+        return false;
+    }
+    // SAFETY: as above.
+    unsafe { VirtualLock(ptr as *mut c_void, len) != 0 }
 }
 
 /// Release the lock on `len` bytes starting at `ptr`.

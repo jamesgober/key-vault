@@ -171,6 +171,64 @@ impl Fragments {
             .unwrap_or_default()
     }
 
+    /// `true` if every byte of these fragments (chunks and layout) sits in
+    /// page-locked memory right now, so the OS does not write it to swap.
+    ///
+    /// `false` means at least one page could not be locked, usually
+    /// because the process reached its lock limit (`RLIMIT_MEMLOCK` on
+    /// Linux and macOS, the minimum working-set size on Windows; see
+    /// `docs/PLATFORM-NOTES.md`). The bytes are still zeroed on drop.
+    /// Page-protected keys are never locked on Windows, and on targets
+    /// without an OS nothing is. Since 1.2.
+    ///
+    /// For registered keys, [`KeyVault::memory_status`](crate::KeyVault::memory_status)
+    /// and [`KeyVault::is_memory_locked`](crate::KeyVault::is_memory_locked)
+    /// report the same thing.
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        if let Some(region) = &self.store.region {
+            return region.is_locked();
+        }
+        self.buffers().all(LockedBytes::is_locked)
+    }
+
+    /// `true` if every byte of these fragments is excluded from crash
+    /// dumps right now (`MADV_DONTDUMP` on Linux and Android,
+    /// `MADV_NOCORE` on FreeBSD and DragonFly, Windows Error Reporting
+    /// exclusion on Windows). Always `false` on macOS, which has no
+    /// per-page exclusion. Since 1.2.
+    #[must_use]
+    pub fn is_excluded_from_dumps(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        if let Some(region) = &self.store.region {
+            return region.is_excluded_from_dumps();
+        }
+        self.buffers().all(LockedBytes::is_excluded_from_dumps)
+    }
+
+    /// Crate-internal: retry the lock on every page that is not locked.
+    /// Returns `true` if everything is locked now. A page-protected region
+    /// is locked when it is created (it is inaccessible afterwards), so it
+    /// is not retried.
+    pub(crate) fn retry_lock(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        if let Some(region) = &self.store.region {
+            return region.is_locked();
+        }
+        // Every buffer is retried, even after one fails.
+        self.buffers().fold(true, |all, b| b.retry_lock() && all)
+    }
+
+    /// The non-empty buffers behind these fragments.
+    fn buffers(&self) -> impl Iterator<Item = &LockedBytes> {
+        self.store
+            .chunks
+            .iter()
+            .chain(core::iter::once(&self.store.layout))
+            .filter(|b| b.len() > 0)
+    }
+
     /// Crate-internal: borrow the chunks for defragmentation.
     #[inline]
     pub(crate) fn chunks(&self) -> &[LockedBytes] {
@@ -183,10 +241,9 @@ impl Fragments {
         &self.store.layout
     }
 
-    /// Crate-internal: another handle to the same storage. Used by the
-    /// vault registry (whose entries are cloned on every update) and by
-    /// `with_key`, which keeps the key alive while it reads it.
-    #[inline]
+    /// Crate-internal: another handle to the same storage (tests that
+    /// rebuild registry entries).
+    #[cfg(test)]
     pub(crate) fn share(&self) -> Self {
         Self {
             store: Arc::clone(&self.store),
@@ -253,7 +310,6 @@ impl Fragments {
             dst[at..at + layout.len()].copy_from_slice(layout);
         }
         let base = region.base();
-        let locked = region.is_locked();
         let mut chunks = Vec::with_capacity(sizes.len());
         let mut at = 0usize;
         for n in sizes {
@@ -261,11 +317,11 @@ impl Fragments {
             // and the region is stored in the same `Store`, after the
             // views, so it outlives them. Views are only read while the
             // region is open (see `KeyVault::with_key`).
-            chunks.push(unsafe { LockedBytes::region_view(base.add(at), n, locked) });
+            chunks.push(unsafe { LockedBytes::region_view(base.add(at), n) });
             at += n;
         }
         // SAFETY: as above, for the layout bytes after the chunks.
-        let layout = unsafe { LockedBytes::region_view(base.add(at), layout.len(), locked) };
+        let layout = unsafe { LockedBytes::region_view(base.add(at), layout.len()) };
         region.seal()?;
         Ok(Self {
             store: Arc::new(Store {
@@ -298,6 +354,12 @@ impl Fragments {
     #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn region(&self) -> Option<&crate::memory::GuardedRegion> {
         self.store.region.as_ref()
+    }
+
+    /// Crate-internal: strong references to the storage (tests).
+    #[cfg(test)]
+    pub(crate) fn store_refs(&self) -> usize {
+        Arc::strong_count(&self.store)
     }
 }
 

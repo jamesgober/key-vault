@@ -195,13 +195,15 @@ impl FragmentStrategy for StandardFragmenter {
         // attacker a 50/50 prior on any specific chunk even before they
         // try to defeat the layout map.
         //
-        // Each decoy chunk gets an independent size sampled from the same
-        // range so its size distribution matches the real chunks.
+        // Each decoy chunk takes the size of a real chunk picked at random,
+        // so the decoy sizes follow the real ones exactly. (Before 1.2 they
+        // were drawn from the configured range, so a wide range gave small
+        // keys decoys far larger than the key itself.)
         let n_decoy = if self.decoy.is_some() { n_real } else { 0 };
         let mut decoy_chunks: Vec<LockedBytes> = Vec::with_capacity(n_decoy);
         if let Some(ref decoy) = self.decoy {
             for _ in 0..n_decoy {
-                let size = sample_range(self.min_chunk, self.max_chunk)?;
+                let size = sizes[sample_range(0, n_real - 1)?];
                 // Decoy output can be drawn from the key (self-reference,
                 // key-derived), so the temporary buffer is zeroized on
                 // drop, over its whole capacity.
@@ -479,6 +481,24 @@ mod tests {
         assert_eq!(total, 32);
 
         assert_eq!(frag.defragment(&fragments).unwrap().as_bytes(), &bytes[..]);
+    }
+
+    /// Decoy chunks take the sizes of real chunks, so a wide chunk range
+    /// does not give a small key decoys larger than the key. In 1.1 decoy
+    /// sizes were drawn from the range: with `1..=1 MiB` a 32-byte key got
+    /// a decoy of up to 1 MiB.
+    #[test]
+    fn decoys_are_no_larger_than_the_real_chunks() {
+        let frag = StandardFragmenter::with_chunk_range(1, 1 << 20)
+            .with_decoy(crate::decoy::SelfReferenceDecoy);
+        for _ in 0..50 {
+            let f = frag.fragment(&key(&[7u8; 32])).unwrap();
+            for i in 0..f.chunk_count() {
+                let len = f.chunk(i).unwrap().len();
+                assert!(len <= 32, "a {len}-byte chunk for a 32-byte key");
+            }
+            assert_eq!(frag.defragment(&f).unwrap().as_bytes(), &[7u8; 32]);
+        }
     }
 
     #[test]

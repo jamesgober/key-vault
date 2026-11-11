@@ -12,7 +12,7 @@
 
 | Threat | What helps | How much |
 |--------|------------|----------|
-| Keys written to swap | Layer 2 (page locking) | Real, but best effort: locking can fail against `RLIMIT_MEMLOCK` (Linux/macOS) or the minimum working-set size (Windows), and the crate does not report it. Check `ulimit -l`. |
+| Keys written to swap | Layer 2 (page locking) | Real, but bounded by the OS lock limit: `RLIMIT_MEMLOCK` (Linux/macOS) or the working-set size (Windows; the crate raises it as needed, 1.2). A key that cannot be locked is reported (`KeyVault::memory_status`, `SecurityMonitor::on_memory_lock_failure`) and, with strict locking, refused (1.2). Check `ulimit -l`. |
 | Keys in core dumps and crash dumps | Layer 2 (dump exclusion, 1.1) | Linux and Android core dumps (`MADV_DONTDUMP`), FreeBSD and DragonFly core dumps (`MADV_NOCORE`), Windows Error Reporting dumps (`WerRegisterExcludedMemoryBlock`). Not macOS, and not dumps that a debugger or another tool takes (see below). |
 | Keys left in freed memory | Layer 7 (zero-on-drop) | Real for every buffer the crate allocates. Not for copies made by `std`, the OS, `keyring`, or your own code. |
 | Stray reads of key memory from inside the process (a buffer over-read, a scan of readable memory) | Layer 10 (page protection, opt-in, 1.1) | Real while no thread is reading the key: the pages are `PROT_NONE` / `PAGE_NOACCESS` and any access faults. |
@@ -33,7 +33,7 @@
 
   An attacker with that access walks the vault's structures and rebuilds every key. Fragmentation, decoys and the codex only help against tools that do not understand this layout. They are obfuscation, not encryption.
 - **Code running inside the process.** It can call `KeyVault::with_key` like your application does.
-- **Hardware attacks** (DMA, cold boot) and **side channels in the cryptographic code** that uses the key.
+- **Hardware attacks** (DMA, cold boot) and **side channels in the cryptographic code** that uses the key. Nor cache-timing side channels in the vault's own codex lookups (see [Layer 5](#layer-5-codex)).
 - **Offline guessing of low-entropy keys with plain normalization (the default).** The normalized value is a fast, unkeyed BLAKE3 hash. If the input is a passphrase, anyone who obtains the normalized value can test guesses at BLAKE3 speed. Use keyed normalization, or run passphrases through a slow KDF (Argon2, scrypt) before registering them.
 
 ---
@@ -115,7 +115,25 @@ Every `LockedBytes` buffer (fragments, layout maps, codex tables, the normalizat
 
 ### Page pool (1.1)
 
-Buffers of up to 2048 bytes (fragments, layout maps, codex tables, the normalization key, the master verifier) come from a pool of pages the crate maps for itself. Each pool page serves one block size, is locked and excluded from dumps once when it is mapped, holds only key buffers, and stays mapped for the life of the process; freed blocks are zeroed and reused. Registering, rotating and dropping keys therefore makes no system calls once the pool has grown to its working size, and no unrelated data shares a key page. The pool keeps its pages after keys are dropped, so it stays at the peak number of live key buffers.
+Buffers of up to 2048 bytes (fragments, layout maps, codex tables, the normalization key, the master verifier) come from a pool of pages the crate maps for itself. Pool memory is mapped and excluded from dumps 16 pages at a time (1.2); each page serves one block size, is locked when it is handed to that size, holds only key buffers, and stays mapped for the life of the process; freed blocks are zeroed and reused. Registering, rotating and dropping keys therefore makes no system calls once the pool has grown to its working size, and no unrelated data shares a key page. The pool keeps its pages after keys are dropped, so it stays at the peak number of live key buffers.
+
+Since 1.2 the pool records whether each page is locked, hands out blocks on locked pages first, and, when none is free, retries the lock on a page that failed earlier and then on a fresh page. While locks keep failing the retries back off (at most one attempt per 64 allocations), so a process at its limit does not pay a failing system call per block. In 1.1 a pool page that failed to lock stayed unlocked for the life of the process, so raising the limit later did not help keys placed on it.
+
+### Reporting and strict locking (1.2)
+
+A lock failure no longer goes unnoticed:
+
+- `KeyVault::memory_status()` returns how many registered keys are fully locked and fully excluded from dumps; `KeyVault::is_memory_locked(handle)` and `Fragments::is_locked()` answer for one key. They read the current state of the pages, so a page locked by a later retry, or unlocked by a `fork`, reads correctly.
+- `SecurityMonitor::on_memory_lock_failure` fires when `register` or `rotate` stores a key that is not fully locked, once per run of failures.
+- `KeyVaultBuilder::with_strict_locking(true)` turns the failure into `Error::MemoryLock` from `register` and `rotate` (nothing is stored) and from `with_key` when its scratch buffer cannot be locked. Before failing, the vault retries the key's pages once.
+
+### Windows lock budget (1.2)
+
+Windows lets a process lock only as many pages as fit in its minimum working-set size, less a few pages the system keeps. The default minimum is 200 KiB, about 44 lockable pages: in 1.1 roughly a thousand keys. When `VirtualLock` fails for lack of quota, the crate now raises its own process's working-set sizes (`SetProcessWorkingSetSize`, at least 1 MiB at a time, at most 256 MiB in total) and retries. This needs only the "Increase a process working set" privilege, which every user holds by default. See `PLATFORM-NOTES.md` for setting the budget yourself.
+
+### After `fork` (1.2)
+
+A child process does not inherit memory locks. The crate registers a `pthread_atfork` child handler that only sets a flag; the child's next vault call locks every pool page and every page in the page table again, and a page-protected key is locked again the first time the child reads it. Between the `fork` and that call the child's keys are unlocked. Dump exclusion is inherited. In 1.1 a forked child held every key unlocked while the crate's records said they were locked.
 
 ### Reference counting
 
@@ -132,12 +150,12 @@ Larger buffers and the `with_key` scratch buffer live on the general heap. The O
 - Dumps that are not written by the kernel or WER: `gcore`, debuggers, procdump, Task Manager "Create dump file", `MiniDumpWriteDump` with full memory. These read memory directly.
 - macOS core dumps: macOS has no per-page exclusion.
 - Hibernation: platform dependent.
-- Lock or exclusion failures, which leave the buffer working without that protection and are not reported to the caller.
+- Lock or exclusion failures, which leave the buffer working without that protection. Since 1.2 they are reported (see above), and strict locking refuses keys that cannot be locked. Dump exclusion failures are counted (`MemoryStatus::excluded_from_dumps`) but never refused, since macOS has no exclusion at all.
 
 ### Side effects and limits
 
 - Heap pages (large buffers, the scratch buffer) are shared with whatever else the allocator placed on them, so the unrelated objects on such a page are left out of core dumps too. Pool pages hold only key buffers.
-- WER keeps at most 512 excluded blocks per process (measured on Windows 11). Each pool page, each excluded heap page and each page-protected key is one block; beyond that, further pages are not excluded until earlier ones are released.
+- WER keeps at most 512 excluded blocks per process (measured on Windows 11). Each 16-page pool chunk (1.2; one page per block in 1.1), each excluded heap page and each page-protected key is one block. Pool chunks are never released. Beyond 512, new memory is not excluded; a heap page or protected key frees its block when released, and a pool chunk whose exclusion failed is retried when its pages are handed out.
 - Because all small key buffers sit in a few dedicated pages, a reader who can see page flags (locked, no-dump) can find them more easily than on the general heap. That is the memory reader the threat model already excludes.
 
 ---
@@ -195,6 +213,8 @@ When a codex is set with `KeyVaultBuilder::with_codex` (or by `from_features()` 
 ### Does not protect against
 
 - Memory readers: the table is stored in a `LockedBytes` in the same process. A substitution table is not a cipher.
+- Cache-timing observers. Encoding and decoding index the 256-byte table with each key byte, on every `with_key` when a codex is set. The table spans four 64-byte cache lines, so an attacker who shares the CPU cache (a co-resident process running Prime+Probe, say) can learn about two bits of each key byte per read. The vault's other code paths do not index memory by key bytes. If that attacker is in your threat model, do not use a codex.
+- With page protection on, the codex table stays in ordinary (locked, readable) pool memory; only fragments, layouts, the normalization key and the master verifier move into protected mappings. The table is useless without the fragments, but it is not hidden.
 
 ---
 
@@ -202,7 +222,7 @@ When a codex is set with `KeyVaultBuilder::with_codex` (or by `from_features()` 
 
 `subtle::ConstantTimeEq` is used for the master-credential check (`unlock_with_master`) and for `KeyHandle` equality.
 
-Not constant-time: the registry lookup by handle (a `HashMap` with `std`, a `BTreeMap` without), `handle_for_name`, and defragmentation, whose time depends on chunk count and layout. Handle ids are not secret, so the handle comparison is hygiene, not a security property.
+Not constant-time: the registry lookup by handle and by name (a persistent hash trie since 1.2; names are hashed with SipHash under a random per-vault key), and defragmentation, whose time depends on chunk count and layout. The codex lookups are covered under Layer 5. Handle ids are not secret, so the handle comparison is hygiene, not a security property.
 
 ---
 
@@ -218,7 +238,7 @@ Through the `zeroize` crate:
 - The `with_key` scratch buffer after every call, including on defragment errors and panics (per thread with `std`, per call without).
 - Normalization and master-verifier hasher state, output readers and digests, including the keyed variants (1.1).
 - The caller-supplied normalization key passed to `with_normalization_key` (1.1).
-- Decoy generator output and hasher state, codex construction tables, fragmenter temporaries (layout encodings, positions, pools) on every exit path.
+- Decoy generator output and hasher state, codex construction tables, fragmenter temporaries (layout encodings, positions, pools) on every exit path. Each fragmenter reserves its temporaries' full size before writing to them, so no partial copy is left in a buffer freed by growth (1.2 fixed `RandomFragmenter`, whose layout buffer grew by reallocation and left unwiped prefixes of the layout in freed heap memory).
 - `FileFetch` read buffers on error and on growth; rejected non-UTF-8 `EnvFetch` values; the bytes inside `keyring`'s `BadEncoding` error.
 
 ### Not wiped (outside the crate's control)
@@ -258,6 +278,10 @@ The master verifier (1.1) is `BLAKE3-keyed(k, master)` with a random 32-byte `k`
 - **Off by default.** All three controls are off unless configured, so 1.1 behaves like 1.0 for existing code. The backoff is off because turning it on makes a correct credential wait after a wrong one; switching it on by default is planned for 2.0.
 - The vault-wide lockout can be used to deny service by code that reports failures on untrusted input; prefer the per-key lockout for that.
 - Master failures count toward the vault-wide threshold, not the per-key one.
+- Per-key lockout counts failures only for names a key is registered under (1.2). Unregistering a key drops its lockout and its recorded failures.
+- **Bounded on untrusted names (1.2).** `report_failure` accepts any name, so it may be called with a name taken from a request (a token's key id). Nothing is recorded while both thresholds are off. Otherwise each name keeps at most 64 `(time, count)` slots, so each report costs the same however many failures came before; names of registered keys and the master credential are always tracked; other names share a fixed capacity (`with_failure_tracking_capacity`, default 4096) and the one idle longest is forgotten when it is full. Names are stored as keyed 64-bit hashes, so a long name costs nothing extra, and the tracker is split into sixteen independently locked shards. In 1.1 every reported name stayed in memory for the life of the process, and many failures for one name made each report slower (all of them were scanned under one lock).
+- Counts are exact up to 64 failures inside the window. Past that, a failure that finds no free slot is added to the newest slot, which moves to the current time; that can keep failures in the window slightly longer than they belong there, never shorter, so a lockout is never missed.
+- Per-key lockout state lives in a word on each registered key (1.2). In 1.1 it was a map plus a separate count of its entries, and concurrent clears could leave the count at zero while a key was locked, which let `with_key` skip the check.
 - None of this does anything against a memory reader.
 
 Built-in monitors: `NoMonitor` (default), `CompositeMonitor`, `LogMonitor` (`monitor-tracing`).
@@ -286,9 +310,13 @@ Heap pages cannot be made inaccessible (other objects share them), which is why 
 
 Two protection changes per `with_key` call plus a small mutex: about 1.4-1.6 µs per call on Linux against about 40 ns without (see [docs/PERFORMANCE.md](PERFORMANCE.md#opt-in-layers-11)), and one page per key (4 KiB, 16 KiB on Apple Silicon). Many threads reading the same key share one open window, but they contend on its mutex.
 
+If a re-seal (`PROT_NONE` after the last reader) fails, it is tried once more at once; if that fails too, the key stays readable until the next read ends and seals it. No error is returned, since the read itself succeeded.
+
 ### Protects against
 
 - Reads of key memory from inside the process while no thread is reading that key: a buffer over-read elsewhere in the program, a scan of readable memory, a stray pointer. They fault instead of finding the key.
+
+  Readers of one key share one open window, so a key that is read continuously by many threads (a signing key on a busy server) is readable almost all the time, and the protection holds only in the gaps. Page protection helps most for keys that are read now and then.
 
 ### Does not protect against
 
@@ -316,7 +344,7 @@ Without the `std` feature the crate is `#![no_std]` with `alloc`. The vault work
 
 ## Concurrency
 
-Reads load a registry snapshot (lock-free `ArcSwap` with `std`). Writes are serialized by a writer mutex; each writer re-checks its precondition under the lock, so two concurrent `register` calls with the same name cannot both succeed, and `rotate` cannot return `Ok` for a key that a concurrent `unregister` removed.
+Reads load a registry snapshot (lock-free `ArcSwap` with `std`) and take no reference count on the key (1.2). Writes are serialized by a writer mutex; each writer re-checks its precondition under the lock, so two concurrent `register` calls with the same name cannot both succeed, and `rotate` cannot return `Ok` for a key that a concurrent `unregister` removed. A `with_key` may be called from inside another `with_key` callback (1.2): the inner call reassembles into a locked buffer of its own.
 
 ---
 
@@ -356,6 +384,15 @@ These are breaking behavior changes and wait for a major version:
 | `no_std` build (1.1) | Library built for `thumbv7em-none-eabihf`; vault run without `std` on the host | CI `no_std` job, `tests/no_std_vault.rs` |
 | `RawKey` wipes its spare capacity | Truncated buffer inspected after `wipe` | `src/fetcher/mod.rs` unit test |
 | Scratch buffer zeroed on error / panic | Buffer inspected after forced defragment error, codex panic, callback panic | `src/vault/mod.rs` unit tests |
+| Lock failures are reported, refused when strict, and retried after the limit is raised (1.2) | `RLIMIT_MEMLOCK` lowered until a key is unlocked; `memory_status`, the monitor event, strict `register` refused, then all keys locked after raising the limit | `tests/lock_limit_linux.rs` |
+| Windows keys stay locked past the default working set (1.2) | 5,500 keys registered in a fresh process, all reported locked | `tests/lock_budget_windows.rs` |
+| A forked child locks its keys again (1.2) | `VmLck` in the child at `fork` and after one read; a protected key locked after its first read | `tests/fork_relock_linux.rs` |
+| Failure tracking is bounded (1.2) | A million distinct names (none recorded without a threshold; capacity held with one); 160,000 failures for one name in bounded slots at a flat cost; unknown names create no per-key state | `src/vault/mod.rs`, `src/vault/tracker.rs` unit tests |
+| Per-key lockout cannot be hidden by concurrent clears (1.2) | The 1.1 bypass interleaving driven exactly through a test hook; three-thread stress | `src/vault/mod.rs` unit tests |
+| Nested `with_key` works (1.2) | Three nested reads across two vaults; scratch zeroed afterwards | `src/vault/mod.rs` unit test |
+| Registry writes do not copy the registry (1.2) | 600 writes with 200,000 keys registered against 400 on an empty vault; trie checked against `BTreeMap` with sequential and colliding hashes, old versions unchanged | `src/vault/mod.rs`, `src/vault/trie.rs` unit tests |
+| `with_key` takes no reference on the key (1.2) | Reference counts read inside the callback | `src/vault/mod.rs` unit test |
+| Decoys are no larger than real chunks (1.2) | 1..=1 MiB chunk range, 32-byte key | `src/fragment/standard.rs` unit test |
 | One winner per name under concurrent `register` | 8 threads x 200 rounds on the same name | `tests/registry_races.rs` |
 | `rotate` fails cleanly against concurrent `unregister` | `rotate` parked between pre-check and update while `unregister` runs; stress loop | `src/vault/mod.rs` unit tests |
 | No panics on arbitrary input | `cargo-fuzz` targets | `fuzz/fuzz_targets/*.rs` |
@@ -366,6 +403,7 @@ These are breaking behavior changes and wait for a major version:
 - That zeroized memory stays zero after it is freed (would require reading freed memory).
 - Constant-time behavior of `with_key` (it is not constant-time; see Layer 6).
 - That page locks hold under memory pressure on every platform. The refcount table is tested; the OS lock itself is checked only on Linux.
+- A failed `mprotect` / `VirtualProtect` when a protected key is sealed or re-sealed: there is no portable way to make the call fail on demand. The paths are short and read by review.
 - That a real crash dump omits the excluded pages. The kernel flag (Linux) and the WER registration (Windows) are checked; producing and parsing a dump is not.
 - Dump exclusion and page protection on macOS, FreeBSD and DragonFly beyond compiling and the fault test (macOS CI).
 - Cold-boot and DMA resistance (out of scope).

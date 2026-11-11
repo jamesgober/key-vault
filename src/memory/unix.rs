@@ -6,6 +6,23 @@ use super::Access;
 /// Whether a page lock survives a change to no-access protection.
 pub(super) const LOCK_SURVIVES_NO_ACCESS: bool = true;
 
+/// Whether this platform can exclude pages from core dumps.
+pub(super) const DUMP_EXCLUSION_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+));
+
+/// Register `child` to run in the child process after `fork`. Failure
+/// (the handler table is full) only means locks are not restored after a
+/// `fork`; there is nothing else to do about it.
+pub(super) fn install_fork_handler(child: extern "C" fn()) {
+    // SAFETY: `pthread_atfork` only stores the handler pointers. `child`
+    // is a plain function that lives for the whole program.
+    let _ = unsafe { libc::pthread_atfork(None, None, Some(child)) };
+}
+
 /// Attempt to lock `len` bytes starting at `ptr` into RAM.
 ///
 /// # Safety
