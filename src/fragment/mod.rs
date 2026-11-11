@@ -217,7 +217,11 @@ impl Fragments {
             return region.is_locked();
         }
         // Every buffer is retried, even after one fails.
-        self.buffers().fold(true, |all, b| b.retry_lock() && all)
+        let mut all = true;
+        for buffer in self.buffers() {
+            all &= buffer.retry_lock();
+        }
+        all
     }
 
     /// The non-empty buffers behind these fragments.
