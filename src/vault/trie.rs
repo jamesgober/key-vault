@@ -446,7 +446,9 @@ mod tests {
             let mut t = HashTrie::new();
             let mut versions = Vec::new();
             let mut x = 12345u32;
-            for step in 0..3000u32 {
+            // Fewer steps under Miri, which interprets every one.
+            let steps = if cfg!(miri) { 400 } else { 3000u32 };
+            for step in 0..steps {
                 // Small LCG: deterministic and good enough to mix inserts
                 // and removes over a few hundred keys.
                 x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
@@ -467,7 +469,7 @@ mod tests {
                     t = next;
                 }
                 assert_eq!(t.len(), model.len());
-                if step % 500 == 0 {
+                if step % 100 == 0 {
                     versions.push((t.clone(), model.clone()));
                 }
             }
@@ -492,11 +494,12 @@ mod tests {
     /// removed keys never find stale branches.
     #[test]
     fn removing_everything_empties_the_trie() {
+        let n = if cfg!(miri) { 200 } else { 2000u64 };
         let mut t = HashTrie::new();
-        for k in 0..2000u64 {
+        for k in 0..n {
             t = t.insert(k.wrapping_mul(0x9e37_79b9_7f4a_7c15), k, k).0;
         }
-        for k in 0..2000u64 {
+        for k in 0..n {
             t = t
                 .remove(k.wrapping_mul(0x9e37_79b9_7f4a_7c15), &k)
                 .unwrap()

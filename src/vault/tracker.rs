@@ -270,7 +270,9 @@ mod tests {
     #[test]
     fn many_failures_for_one_name_use_bounded_slots() {
         let t = FailureTracker::new(3, 100);
-        for i in 0..100_000u64 {
+        // Fewer under Miri, which interprets every step.
+        let n = if cfg!(miri) { 2_000 } else { 100_000u64 };
+        for i in 0..n {
             let c = t.record(1, true, Duration::from_micros(i), vault_only());
             assert_eq!(u64::from(c.in_window), i + 1);
         }
@@ -282,7 +284,8 @@ mod tests {
         let t = FailureTracker::new(3, 32);
         let pinned = 0x5555;
         let _ = t.record(pinned, true, Duration::ZERO, vault_only());
-        for i in 0..10_000u64 {
+        let n = if cfg!(miri) { 300 } else { 10_000u64 };
+        for i in 0..n {
             let h = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let _ = t.record(h, false, Duration::from_millis(i), vault_only());
         }
