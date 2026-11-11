@@ -169,6 +169,35 @@ and readers of one key no longer contend.
 
 ---
 
+## [1.1.1] - 2026-11-11
+
+Patch release: no API removed or changed.
+
+### Deprecated
+
+- **`TpmFetch` is deprecated** (feature `fetcher-tpm`). It is a
+  placeholder that never talked to a TPM: `fetch` always returns
+  `Error::Acquisition`. A build that names it now gets a deprecation
+  warning instead of silently configuring a key source that can never
+  produce a key (#4). It stays in 1.x because the 1.x API is frozen, and
+  is removed in 2.0 unless TPM support lands first. Code that keeps it
+  in a fetcher chain on purpose can use `#[allow(deprecated)]`.
+
+### Supply chain
+
+- `async-executor` 1.14.0 (yanked) -> 1.14.1 in `Cargo.lock`.
+- `deny.toml` ignores RUSTSEC-2026-0370, -0371 and -0372 (`zvariant`,
+  `zbus_names` and `zvariant_derive` unmaintained, informational). They
+  come only through `keyring`'s Linux Secret Service backend
+  (`fetcher-keychain`) and go once a keyring release moves to zbus 6.
+
+### Tests
+
+- A `compile_fail` doctest: naming `TpmFetch` under
+  `#![deny(deprecated)]` does not compile.
+
+---
+
 ## [1.1.0] - 2026-10-09
 
 Minor release: new API, no breaking changes. Everything new is opt-in

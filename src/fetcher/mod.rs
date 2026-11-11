@@ -13,8 +13,8 @@
 //!   decryption.
 //! - `EnvFetch` (`fetcher-env`): reads an environment variable. The value
 //!   stays in the process environment.
-//! - `TpmFetch` (`fetcher-tpm`): **not implemented**. `fetch` always
-//!   returns an error.
+//! - `TpmFetch` (`fetcher-tpm`): **not implemented** and deprecated since
+//!   1.1.1. `fetch` always returns an error.
 //!
 //! Copies made inside `std` or the `keyring` crate while reading (I/O
 //! buffers, the OS environment block, UTF-16 conversion buffers, platform
@@ -60,6 +60,7 @@ pub use self::file::FileFetch;
 #[cfg(feature = "fetcher-keychain")]
 pub use self::keychain::KeychainFetch;
 #[cfg(feature = "fetcher-tpm")]
+#[allow(deprecated)]
 pub use self::tpm::TpmFetch;
 
 /// Information given to a [`KeyFetch`] implementation when it is asked to

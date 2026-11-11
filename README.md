@@ -48,7 +48,7 @@ What each layer does in 1.2, plainly:
 
 | Layer | What it is | Status in 1.2 | Protects against | Does NOT protect against |
 |-------|-----------|---------------|------------------|--------------------------|
-| **1** | Key acquisition (`KeyFetch`) | OS keychain, plaintext file, env var. **`TpmFetch` is not implemented** (always errors) | Hardcoded keys | Anything once the key is in memory |
+| **1** | Key acquisition (`KeyFetch`) | OS keychain, plaintext file, env var. **`TpmFetch` is not implemented** (always errors; deprecated since 1.1.1) | Hardcoded keys | Anything once the key is in memory |
 | **2** | Page locking + dump exclusion | On, up to the OS lock limit. Failures reported (`memory_status`, monitor event) and refusable (`with_strict_locking`); failed pages retried; Windows working set raised as needed; relocked after `fork`. Dump exclusion on Linux, Android, FreeBSD and Windows (WER) | Keys written to swap; keys in core / WER crash dumps | Memory readers; dumps taken by debuggers; macOS core dumps |
 | **3** | Fragmentation | `StandardFragmenter` by default; any strategy with `with_fragmenter` | Scans for a contiguous key | Memory readers: the layout map is in the same memory |
 | **4** | Decoy chunks | **Off** unless `with_decoy` is called | Statistical scans for key-like regions | Memory readers: the layout map marks every decoy |

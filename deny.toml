@@ -24,7 +24,16 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# zvariant, zvariant_derive and zbus_names were folded into zbus 6 and
+# are marked unmaintained (informational, no vulnerability). They reach
+# the graph only through `keyring`'s Linux Secret Service backend (feature
+# `fetcher-keychain`, keyring 3.x on zbus 4). Leaving them needs a keyring
+# release on zbus 6; drop these entries then.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; via keyring 3 (zbus 4), no zbus 6 keyring yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; via keyring 3 (zbus 4), no zbus 6 keyring yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; via keyring 3 (zbus 4), no zbus 6 keyring yet" },
+]
 
 # -------- licenses --------
 # Only OSI-approved permissive licenses on the dependency graph.
