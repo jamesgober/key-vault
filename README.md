@@ -77,7 +77,9 @@ Measured on Linux (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for methodolog
 | `with_key` defrag, no codex, 16/32/64/256 B | 34 / 41 / 55 / 157 ns | ✅ all under 500 ns |
 | `with_key` defrag, with codex, 32/256 B | 67 / 432 ns | ✅ all under 1 µs |
 | `register` 16 / 256 B | 1.0 / 16 µs (1.0.2: 5.4 / 100 µs) | ✅ |
-| Concurrent reads, 1 → 64 threads | scales out, no contention | ✅ lock-free |
+| `register` with 20,000 keys registered (1.2) | 7.8 µs (1.1: 4.2 ms); independent of the number of keys | ✅ |
+| Concurrent reads of one key (1.2) | no lock, no shared writes; scales like reads of separate keys | ✅ lock-free |
+| `report_failure` after 160,000 failures for one name (1.2) | ~33-60 ns (1.1: 137-164 µs) | ✅ bounded |
 | Allocations per `with_key` (default `NoAudit`) | **0** (dhat-measured over 100k iterations) | ✅ zero-alloc hot path |
 | `with_key` with page protection (opt-in) | ~1.4-1.6 µs | two `mprotect` calls per read |
 

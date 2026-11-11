@@ -26,8 +26,10 @@
 //!
 //! Since 1.2 the pool keeps the lock state of every page and prefers
 //! blocks on locked pages. When no locked block is free it retries the
-//! lock on a page that failed earlier, then on a fresh page, so raising
-//! the lock limit while the process runs helps keys registered afterwards.
+//! lock on a page that failed earlier, then on a fresh page. The first
+//! lock that succeeds after failures retries every page that is still
+//! unlocked, so raising the lock limit while the process runs also locks
+//! the keys already stored on those pages.
 //! While locking keeps failing, retries back off (up to one attempt per
 //! [`MAX_SKIP`] allocations), so a process at its limit does not pay a
 //! failing system call for every block.
@@ -73,6 +75,8 @@ struct ChunkInfo {
 struct PageInfo {
     /// Start of the chunk the page belongs to.
     chunk: usize,
+    /// Size class the page serves.
+    class: u8,
     /// The page is locked.
     locked: bool,
 }
@@ -224,6 +228,7 @@ impl Pool {
             page,
             PageInfo {
                 chunk,
+                class: u8::try_from(class).unwrap_or(u8::MAX),
                 locked: false,
             },
         );
@@ -250,6 +255,37 @@ impl Pool {
             target.push(page + i * block);
         }
         Some(locked)
+    }
+
+    /// Record a successful lock. If locks were failing before (the limit
+    /// has just been raised, or memory freed), retry every page that is
+    /// still unlocked, so keys already stored on them are locked too.
+    fn lock_succeeded(&mut self) {
+        let was_failing = self.backoff.skip > 0;
+        self.backoff.succeeded();
+        if was_failing {
+            self.sweep_unlocked();
+        }
+    }
+
+    /// Try to lock every unlocked page, stopping at the first failure.
+    fn sweep_unlocked(&mut self) {
+        let unlocked: Vec<(usize, usize, u8)> = self
+            .pages
+            .iter()
+            .filter(|(_, info)| !info.locked)
+            .map(|(&page, info)| (page, info.chunk, info.class))
+            .collect();
+        for (page, chunk, class) in unlocked {
+            if !self.lock_page(page) {
+                self.backoff.failed();
+                return;
+            }
+            self.retry_exclusion(chunk);
+            if usize::from(class) < CLASSES.len() {
+                self.promote(usize::from(class), page);
+            }
+        }
     }
 
     /// Lock every page again (after `fork`, which drops memory locks in
@@ -321,11 +357,11 @@ fn take_block(pool: &mut Pool, class: usize) -> Option<usize> {
         if let Some(&addr) = pool.free[class].unlocked.last() {
             let page = page_of(addr);
             if pool.lock_page(page) {
-                pool.backoff.succeeded();
                 if let Some(chunk) = pool.pages.get(&page).map(|p| p.chunk) {
                     pool.retry_exclusion(chunk);
                 }
                 pool.promote(class, page);
+                pool.lock_succeeded();
                 return pool.free[class].locked.pop();
             }
         }
@@ -333,7 +369,7 @@ fn take_block(pool: &mut Pool, class: usize) -> Option<usize> {
     if may_retry || pool.free[class].unlocked.is_empty() {
         match pool.grow(class) {
             Some(true) => {
-                pool.backoff.succeeded();
+                pool.lock_succeeded();
                 return pool.free[class].locked.pop();
             }
             Some(false) => pool.backoff.failed(),
@@ -382,9 +418,9 @@ pub(crate) fn retry_block(addr: usize, class: u8) -> bool {
             if !pool.lock_page(page) {
                 return false;
             }
-            pool.backoff.succeeded();
             pool.retry_exclusion(chunk);
             pool.promote(usize::from(class), page);
+            pool.lock_succeeded();
             true
         }
     }

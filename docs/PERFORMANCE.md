@@ -169,23 +169,34 @@ inside the contract targets.
 
 ### Concurrent reads (`concurrent_access.rs`)
 
-`with_key` against a single registered key, 1000 reads per thread.
+The 1.0 and 1.1 figures in this section came from a bench that spawned
+its threads inside every iteration and did 1,000 reads per thread, so
+they measured thread start-up, not contention, and the claim that reads
+scaled "1 to 64 threads, no contention" did not hold: every `with_key`
+cloned and dropped the key storage's `Arc`, so all threads reading one
+key wrote to one shared counter. Since 1.2 the read path takes no
+reference count (it reads under the registry snapshot and releases it
+before the callback), and the bench starts its threads once and releases
+them with a barrier.
 
-| Threads | Throughput (Melem/s) | Mean latency / read |
-|---------|----------------------|---------------------|
-| 1 | 3.7 | ~270 ns |
-| 4 | 6.0 | ~165 ns/op effective |
-| 16 | 10.6 | ~94 ns/op effective |
-| 64 | 13.7 | ~72 ns/op effective |
+Eight threads, 400,000 reads each, 32-byte key, Linux (WSL2) on a shared
+machine running at a load average near 80 on 32 hardware threads, so the
+absolute numbers are low and noisy; the comparison between columns is
+what matters:
 
-Throughput **monotonically increases** from 1→64 threads — confirms
-the `ArcSwap`-backed registry adds no coordination overhead. Scaling
-flattens around 16 threads on this machine (physical core count
-ceiling), not because of contention but because the CPU is saturated.
+| | 1 thread | 8 threads, one shared key | 8 threads, one key each |
+|---|---|---|---|
+| 1.1.0 | 7.4 Mreads/s | 13.8 Mreads/s | 22.8 Mreads/s |
+| 1.2.0 | 7.2 Mreads/s | 46.9 Mreads/s | 41.2 Mreads/s |
 
-A separate `reads_during_rotation` bench drives 4 reader threads
-against 10 concurrent rotations; readers never block on the
-`ArcSwap::rcu` writer.
+In 1.1 a shared key reached about 60% of the own-key rate; in 1.2 the
+two are the same within noise. Run `cargo bench --bench
+concurrent_access` on a quiet machine for clean figures.
+
+A separate `reads_during_rotation` bench drives 4 reader threads while
+another thread rotates the key continuously. Readers never wait for the
+writer: writers take a mutex among themselves (since 1.0.2) and publish
+with `ArcSwap::swap`, which readers do not block on.
 
 ### Fragment strategies (`fragment_strategies.rs`)
 
