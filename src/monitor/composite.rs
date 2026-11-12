@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};
+use super::{AccessContext, FailureContext, MemoryLockContext, SecurityMonitor, ThresholdContext};
 
 /// `SecurityMonitor` that fans every event out to a list of inner
 /// monitors.
@@ -78,6 +78,12 @@ impl SecurityMonitor for CompositeMonitor {
     fn on_threshold_breach(&self, ctx: &ThresholdContext) {
         for m in &self.inner {
             m.on_threshold_breach(ctx);
+        }
+    }
+
+    fn on_memory_lock_failure(&self, ctx: &MemoryLockContext) {
+        for m in &self.inner {
+            m.on_memory_lock_failure(ctx);
         }
     }
 }

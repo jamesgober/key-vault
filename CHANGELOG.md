@@ -9,13 +9,163 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned for 2.0
+
+- Route key-vault's own cryptography through crypt-io: BLAKE3
+  normalization and the keyed master verifier, `KeyDerivedDecoy`, the
+  constant-time master comparison (`subtle`), and the random source
+  (`getrandom`). The current uses are correct; moving them changes the
+  dependency set and the `no_std` RNG hook (`register_rng!`), so it waits
+  for a major version.
+- Name-taking lockout calls (`report_failure`, `clear_key_lockout`) take
+  a `KeyHandle`; distinct error variants for a duplicate key name and a
+  wrong master credential (today `InvalidConfig` and `Acquisition`).
+- Remove the hidden `KeyHandle::__for_test` constructor from the public
+  surface.
+
+---
+
+## [1.2.0] - 2026-11-11
+
+Minor release: security and performance fixes, new API, no breaking
+changes. Page-lock failures are now reported and can be refused, failure
+tracking is bounded, nested `with_key` works, per-key lockouts cannot be
+lost to concurrent clears, registry writes no longer copy the registry,
+and readers of one key no longer contend.
+
+### Security
+
+- **Page-lock failures are reported, and can be refused.** When the
+  process reaches its lock limit (`RLIMIT_MEMLOCK` on Linux and macOS,
+  the working-set size on Windows), a key is still stored, in memory the
+  OS may write to swap. Before 1.2 nothing reported this. Now
+  `KeyVault::memory_status()` counts registered keys that are fully
+  page-locked and fully excluded from dumps,
+  `KeyVault::is_memory_locked(handle)` and `Fragments::is_locked()` /
+  `Fragments::is_excluded_from_dumps()` answer for one key, and the new
+  `SecurityMonitor::on_memory_lock_failure` fires when a key is stored
+  unlocked (once per run of failures). `KeyVaultBuilder::with_strict_locking(true)`
+  makes `register` and `rotate` fail with `Error::MemoryLock` instead of
+  storing such a key, and `with_key` fail when its scratch buffer cannot
+  be locked.
+- **Pool pages whose lock failed are retried.** The page pool records
+  the lock state of each page, hands out blocks on locked pages first,
+  and retries pages that failed (backing off while locks keep failing).
+  Before, a pool page that failed to lock served keys unlocked for the
+  life of the process, even after the limit was raised.
+- **The Windows lock budget is raised as needed.** A default Windows
+  process can lock about 44 pages (200 KiB minimum working set), which
+  ran out after roughly a thousand keys. When `VirtualLock` fails for
+  lack of quota the crate now raises its own process's working-set sizes
+  with `SetProcessWorkingSetSize` (at least 1 MiB at a time, at most
+  256 MiB in total) and retries. 5,000 keys in a default process are now
+  all locked; in 1.1 at least three quarters of them were not.
+- **Bounded failure tracking.** `report_failure` takes a caller-supplied
+  name, often from a request. Nothing is recorded now while both
+  lockout thresholds are off (the default). With a threshold on, each
+  name keeps at most 64 `(time, count)` slots, names of registered keys
+  and the master credential are always tracked, other names share a
+  fixed capacity (`with_failure_tracking_capacity`, default 4096, the
+  idlest name is forgotten when it is full), names are stored as keyed
+  hashes, and the tracker is split into sixteen shards. Before, every
+  reported name stayed in memory for the life of the process (a million
+  distinct names: +234 MiB), and each report scanned every failure in
+  the window for that name under one global lock (137 to 164 µs per call after
+  160,000 failures). Now: +0 MiB, and 30 to 100 ns per call regardless.
+- **Per-key lockout state cannot be lost to concurrent clears.** Each
+  registered key now carries its own lockout word, replacing a map of
+  lockouts plus a separate count of its entries that could fall out of
+  step when `clear_key_lockout`, `clear_lockout` and a new lockout ran at
+  the same time, leaving a locked-out key readable.
+- **Per-key lockout applies only to registered keys.** Failures reported
+  for a name no key is registered under no longer create lockout state
+  (they used to, permanently with `lock_for = None`). Unregistering a key
+  drops its lockout and its failure history.
+- **Memory locks are restored after `fork`.** A child process does not
+  inherit memory locks. The crate registers a `pthread_atfork` handler;
+  the child's next vault call locks the pool and heap pages again, and a
+  page-protected key is locked again the first time the child reads it.
+  Before, a forked child held every key unlocked while the crate's own
+  records said otherwise.
+- **`RandomFragmenter` no longer leaves partial layouts in freed heap
+  memory.** Its layout buffer grew by reallocation, and the buffers it
+  outgrew were freed without being wiped. It now reserves the full size
+  up front.
+- **Windows Error Reporting exclusion covers 16 pool pages per block.**
+  Pool memory is mapped and excluded 64 KiB at a time, so WER's limit of
+  512 excluded blocks per process covers 16 times as much pool memory.
+- A failed re-seal of a page-protected key (`PROT_NONE` after the last
+  reader) is retried once at once.
+
 ### Added
+
+- `KeyVault::new()` (with `std`), `KeyVault::builder()` and
+  `impl Default for KeyVault`: the default vault without spelling out
+  the builder.
+- `KeyVault::memory_status()` and `MemoryStatus` (`keys`, `locked`,
+  `excluded_from_dumps`, `unlocked()`, `all_locked()`);
+  `KeyVault::is_memory_locked(handle)`; `Fragments::is_locked()` and
+  `Fragments::is_excluded_from_dumps()`.
+- `KeyVaultBuilder::with_strict_locking(bool)` and
+  `VaultConfig::strict_locking`.
+- `SecurityMonitor::on_memory_lock_failure` (default no-op, so existing
+  monitors compile unchanged) and `MemoryLockContext`; `LogMonitor`,
+  `CompositeMonitor` and the `Arc<dyn SecurityMonitor>` forwarding impl
+  forward it.
+- `KeyVaultBuilder::with_failure_tracking_capacity(usize)` and
+  `VaultConfig::failure_tracking_capacity`.
+- `KeyVault::report_failure_with_note(name, note)`: a note built at run
+  time (`impl Into<Cow<'static, str>>`), next to `report_failure`, which
+  takes only `&'static str`.
 
 ### Changed
 
+- **`with_key` may be nested.** A `with_key` inside another `with_key`
+  callback (on any vault) panicked with "RefCell already borrowed"; the
+  inner call now reassembles into a locked buffer of its own.
+- **Registry writes do not copy the registry.** The registry snapshot is
+  a persistent hash trie: `register`, `rotate` and `unregister` copy the
+  nodes on one path instead of the whole map, and the duplicate-name
+  check and `handle_for_name` are hashed lookups instead of scans.
+  `register` with 20,000 keys registered went from 4.2 ms to 7.8 µs
+  (Linux) and from 12 ms to 7.5 µs (Windows); it no longer depends on the
+  number of keys.
+- **Readers of one key no longer contend.** `with_key` holds the
+  registry snapshot (no reference count) while it reassembles the key
+  and releases it before the callback runs; it used to clone the key
+  storage's `Arc`, so every thread reading one key wrote to the same
+  counter. Eight threads reading one key went from below the
+  single-thread rate to the same scaling as eight threads reading eight
+  keys (Linux: see `docs/PERFORMANCE.md`).
+- `FailureContext::consecutive_failures` is `1` (and `window_elapsed`
+  zero) when no lockout threshold is on, since nothing is recorded then.
+  With a threshold on, counts are exact up to 64 failures in the window
+  and can only run slightly high beyond that.
+- Decoy chunks take the sizes of real chunks. They were drawn from the
+  configured chunk range, so a wide range (`with_chunk_range(1, 1 << 20)`)
+  gave a 32-byte key decoys of up to 1 MiB.
+- `benches/concurrent_access.rs` starts its reader threads once per
+  measurement and releases them with a barrier; it used to measure
+  thread start-up.
+- `windows-sys` enables `Win32_System_Threading` (for the working-set
+  calls). `libc` is a Unix dev-dependency for the lock-limit and fork
+  tests. No new runtime dependency.
+
 ### Fixed
 
-### Security
+- `docs/PLATFORM-NOTES.md` and `docs/ARCHITECTURE.md` pointed readers at
+  `LockedBytes::is_locked()`, which is crate-private; they now describe
+  `memory_status()` and the new methods.
+- `docs/PERFORMANCE.md` and the README claimed concurrent reads did not
+  contend (the old bench could not show it) and that a rotation's swap
+  cost single-digit nanoseconds (the map copy was O(n)); both now match
+  the code and the new measurements.
+- `docs/SECURITY.md` said failed locks and exclusions were retried (true
+  for heap pages only), that pages past the WER limit were excluded once
+  earlier ones were released (pool pages never were), and that every
+  fragmenter temporary was wiped (see `RandomFragmenter` above). It now
+  also notes the codex's cache-timing exposure, that a continuously read
+  page-protected key is almost always readable, and how `fork` behaves.
 
 ---
 

@@ -39,10 +39,21 @@ pub use self::no_monitor::NoMonitor;
 pub struct FailureContext {
     /// Logical name of the key whose use produced the failure.
     pub key_name: String,
-    /// Number of consecutive failures observed for this key, including this
-    /// one.
+    /// Failures recorded for this key name inside the window, including
+    /// this one.
+    ///
+    /// Failures are counted only while a lockout threshold is on
+    /// ([`KeyVaultBuilder::with_failure_threshold`](crate::KeyVaultBuilder::with_failure_threshold)
+    /// or [`KeyVaultBuilder::with_key_lockout`](crate::KeyVaultBuilder::with_key_lockout)).
+    /// With both off (the default) the vault keeps no failure history and
+    /// this is always `1` (since 1.2; earlier versions kept an unbounded
+    /// history). The count is exact up to 64 failures in the window; past
+    /// that, failures that arrive close together can be counted as
+    /// slightly newer than they are, so near the edge of the window the
+    /// count can run high, never low.
     pub consecutive_failures: u32,
     /// Time elapsed since the first failure in the current window.
+    /// `Duration::ZERO` when no threshold is on.
     pub window_elapsed: Duration,
     /// Caller-supplied free-form note. Sanitized — never includes key bytes
     /// or ciphertext.
@@ -92,6 +103,24 @@ pub struct ThresholdContext {
     pub scope: LockoutScope,
 }
 
+/// Context for a key stored in memory that could not be page-locked.
+///
+/// Fired by [`SecurityMonitor::on_memory_lock_failure`] when
+/// [`KeyVault::register`](crate::KeyVault::register) or
+/// [`KeyVault::rotate`](crate::KeyVault::rotate) could not lock every page
+/// the key occupies, once per run of such failures: after a key is stored
+/// locked again, the next failure fires again.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct MemoryLockContext {
+    /// Logical name of the key.
+    pub key_name: String,
+    /// `true` if the vault refused the key because strict locking is on
+    /// ([`KeyVaultBuilder::with_strict_locking`](crate::KeyVaultBuilder::with_strict_locking));
+    /// `false` if it stored the key in unlocked memory.
+    pub refused: bool,
+}
+
 /// Outbound channel for anomaly events.
 ///
 /// Implementations should treat monitor calls as advisory and fire-and-forget:
@@ -120,6 +149,17 @@ pub trait SecurityMonitor: Send + Sync {
 
     /// Called when a configured failure threshold is crossed.
     fn on_threshold_breach(&self, ctx: &ThresholdContext);
+
+    /// Called when a key could not be stored in page-locked memory (the
+    /// process reached its lock limit), so the OS may write it to swap.
+    /// See [`MemoryLockContext`] for when it fires and
+    /// [`KeyVault::memory_status`](crate::KeyVault::memory_status) for the
+    /// current state of every key.
+    ///
+    /// The default implementation does nothing. Since 1.2.
+    fn on_memory_lock_failure(&self, ctx: &MemoryLockContext) {
+        let _ = ctx;
+    }
 }
 
 // Blanket forwarding impl so callers can pass a pre-wrapped
@@ -135,5 +175,8 @@ impl SecurityMonitor for alloc::sync::Arc<dyn SecurityMonitor> {
     }
     fn on_threshold_breach(&self, ctx: &ThresholdContext) {
         (**self).on_threshold_breach(ctx);
+    }
+    fn on_memory_lock_failure(&self, ctx: &MemoryLockContext) {
+        (**self).on_memory_lock_failure(ctx);
     }
 }

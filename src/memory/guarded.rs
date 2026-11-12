@@ -26,6 +26,7 @@
 //! permissions.
 
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use zeroize::Zeroize;
 
@@ -33,7 +34,7 @@ use zeroize::Zeroize;
 use super::unix as os;
 #[cfg(windows)]
 use super::windows as os;
-use super::{Access, page_size};
+use super::{Access, fork_generation, page_size};
 use crate::Result;
 use crate::error::Error;
 use crate::sync::Mutex;
@@ -45,7 +46,11 @@ pub(crate) struct GuardedRegion {
     map_len: usize,
     /// Bytes in use.
     len: usize,
-    locked: bool,
+    /// The region was locked (under fork generation `lock_generation`).
+    locked: AtomicBool,
+    /// Fork generation the lock was taken in. A child process after
+    /// `fork` has a newer generation, and its pages are not locked.
+    lock_generation: AtomicUsize,
     no_dump: bool,
     /// Live readers. Protection changes happen under this lock.
     readers: Mutex<usize>,
@@ -90,7 +95,8 @@ impl GuardedRegion {
             ptr,
             map_len,
             len,
-            locked,
+            locked: AtomicBool::new(locked),
+            lock_generation: AtomicUsize::new(fork_generation()),
             no_dump,
             readers: Mutex::new(0),
         })
@@ -110,13 +116,14 @@ impl GuardedRegion {
     }
 
     /// `true` if the whole region is locked into RAM. Always `false` on
-    /// Windows (see the module docs).
+    /// Windows (see the module docs), and in a child process after `fork`
+    /// until the key is read there.
     pub(crate) fn is_locked(&self) -> bool {
-        self.locked
+        self.locked.load(Ordering::Acquire)
+            && self.lock_generation.load(Ordering::Acquire) == fork_generation()
     }
 
     /// `true` if the region is excluded from dumps.
-    #[allow(dead_code)] // used by tests.
     pub(crate) fn is_excluded_from_dumps(&self) -> bool {
         self.no_dump
     }
@@ -154,7 +161,24 @@ impl GuardedRegion {
             }
         }
         *readers += 1;
+        self.relock_after_fork();
         Ok(RegionAccess { region: self })
+    }
+
+    /// In a child process after `fork`, lock the region again. Called
+    /// while the region is open (readable): Linux refuses to populate
+    /// `PROT_NONE` pages for `mlock`.
+    fn relock_after_fork(&self) {
+        let generation = fork_generation();
+        if !os::LOCK_SURVIVES_NO_ACCESS
+            || self.lock_generation.load(Ordering::Acquire) == generation
+        {
+            return;
+        }
+        // SAFETY: our own live mapping, open for reading.
+        let locked = unsafe { os::lock_pages(self.ptr.as_ptr(), self.map_len) };
+        self.locked.store(locked, Ordering::Release);
+        self.lock_generation.store(generation, Ordering::Release);
     }
 
     /// Mapping address and length, for tests that inspect the OS state.
@@ -178,8 +202,9 @@ impl Drop for GuardedRegion {
             // SAFETY: same range that `exclude_from_dumps` registered.
             unsafe { os::include_in_dumps(self.ptr.as_ptr(), self.map_len) };
         }
-        if self.locked {
-            // SAFETY: same range that `lock_pages` locked.
+        if self.locked.load(Ordering::Acquire) {
+            // SAFETY: same range that `lock_pages` locked. Unlocking pages
+            // that a `fork` already unlocked is harmless.
             unsafe { os::unlock_pages(self.ptr.as_ptr(), self.map_len) };
         }
         // Unmapping returns the pages to the kernel, which hands out
@@ -194,7 +219,7 @@ impl core::fmt::Debug for GuardedRegion {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GuardedRegion")
             .field("len", &self.len)
-            .field("locked", &self.locked)
+            .field("locked", &self.is_locked())
             .field("bytes", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -211,10 +236,16 @@ impl Drop for RegionAccess<'_> {
         let mut readers = self.region.readers.lock();
         *readers -= 1;
         if *readers == 0 {
+            let (ptr, len) = (self.region.ptr.as_ptr(), self.region.map_len);
+            // A failed re-seal leaves the key readable until the next read
+            // ends, so try once more straight away: a transient failure
+            // (memory pressure splitting the mapping) is the likely cause.
             // SAFETY: the mapping is live (the guard borrows the region)
             // and no reader remains.
-            let _ =
-                unsafe { os::protect(self.region.ptr.as_ptr(), self.region.map_len, Access::None) };
+            if !unsafe { os::protect(ptr, len, Access::None) } {
+                // SAFETY: as above.
+                let _ = unsafe { os::protect(ptr, len, Access::None) };
+            }
         }
     }
 }

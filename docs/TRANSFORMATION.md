@@ -66,7 +66,7 @@ OFFSET:   0          3                 8    9 ...
 
 ## Step 4: Decoy chunks (optional)
 
-Only when a decoy strategy is configured (`with_decoy(SelfReferenceDecoy)` etc.). One decoy chunk is generated per real chunk, with sizes from the same range. `SelfReferenceDecoy` samples bytes from the key, so the decoys have the same byte statistics as the real chunks.
+Only when a decoy strategy is configured (`with_decoy(SelfReferenceDecoy)` etc.). One decoy chunk is generated per real chunk, each the size of a randomly chosen real chunk (since 1.2; before, decoy sizes came from the configured range, which made decoys for small keys much larger than the key when the range was wide). `SelfReferenceDecoy` samples bytes from the key, so the decoys have the same byte statistics as the real chunks.
 
 ---
 

@@ -25,7 +25,7 @@
 <br>
 
 <p>
-    <strong>key-vault</strong> keeps cryptographic key material in process memory while your application runs. Keys live in page-locked (<code>mlock</code> / <code>VirtualLock</code>), dump-excluded, zero-on-drop buffers. Callers get an opaque <code>KeyHandle</code> instead of a <code>Vec&lt;u8&gt;</code>, and the bytes are handed out only inside a scoped callback, from a buffer that is wiped when the callback returns. Optionally each key lives in its own page-protected mapping that is inaccessible except while it is being read.
+    <strong>key-vault</strong> keeps cryptographic key material in process memory while your application runs. Keys live in page-locked (<code>mlock</code> / <code>VirtualLock</code>), dump-excluded, zero-on-drop buffers, up to the OS limit on locked memory; <code>memory_status()</code> reports any key that could not be locked, and strict locking refuses them. Callers get an opaque <code>KeyHandle</code> instead of a <code>Vec&lt;u8&gt;</code>, and the bytes are handed out only inside a scoped callback, from a buffer that is wiped when the callback returns. Optionally each key lives in its own page-protected mapping that is inaccessible except while it is being read.
 </p>
 
 <p>
@@ -44,18 +44,18 @@
 
 ## Layers
 
-What each layer does in 1.1, plainly:
+What each layer does in 1.2, plainly:
 
-| Layer | What it is | Status in 1.1 | Protects against | Does NOT protect against |
+| Layer | What it is | Status in 1.2 | Protects against | Does NOT protect against |
 |-------|-----------|---------------|------------------|--------------------------|
 | **1** | Key acquisition (`KeyFetch`) | OS keychain, plaintext file, env var. **`TpmFetch` is not implemented** (always errors; deprecated since 1.1.1) | Hardcoded keys | Anything once the key is in memory |
-| **2** | Page locking + dump exclusion | On, best effort, per-page reference counted. Dump exclusion on Linux, Android, FreeBSD and Windows (WER) | Keys written to swap; keys in core / WER crash dumps | Memory readers; dumps taken by debuggers; macOS core dumps |
+| **2** | Page locking + dump exclusion | On, up to the OS lock limit. Failures reported (`memory_status`, monitor event) and refusable (`with_strict_locking`); failed pages retried; Windows working set raised as needed; relocked after `fork`. Dump exclusion on Linux, Android, FreeBSD and Windows (WER) | Keys written to swap; keys in core / WER crash dumps | Memory readers; dumps taken by debuggers; macOS core dumps |
 | **3** | Fragmentation | `StandardFragmenter` by default; any strategy with `with_fragmenter` | Scans for a contiguous key | Memory readers: the layout map is in the same memory |
 | **4** | Decoy chunks | **Off** unless `with_decoy` is called | Statistical scans for key-like regions | Memory readers: the layout map marks every decoy |
 | **5** | Codex (byte substitution table) | **Off** unless `with_codex` is called | Scans for the raw key bytes | Memory readers: the table is in the same memory. Not encryption |
 | **6** | Constant-time comparison | Master-key check, handle equality | Timing on the master check | Timing of key lookup and reassembly (not constant-time) |
 | **7** | Zero-on-drop (`zeroize`) | Every secret-bearing buffer the crate owns | Keys left in freed memory | Copies made by `std`, the OS or your own callback |
-| **8** | Monitor, lockout, backoff | **Advisory**: counts only failures you report. Vault-wide and per-key lockout, master-unlock backoff, all opt-in | Repeated failures you report; master guessing through the API | Memory readers; it never sees decryption failures itself |
+| **8** | Monitor, lockout, backoff | **Advisory**: counts only failures you report. Vault-wide and per-key lockout, master-unlock backoff, all opt-in. Bounded memory and cost on untrusted names | Repeated failures you report; master guessing through the API | Memory readers; it never sees decryption failures itself |
 | **9** | Audit hooks | One event per vault operation | Unnoticed API-level use | Tampering with your sink; reads below the API |
 | **10** | Page protection (`PROT_NONE` / `PAGE_NOACCESS`) | **Opt-in**: `with_page_protection(true)` | Stray reads from inside the process between accesses | Kernel / debugger readers; the scratch copy while your callback runs |
 
@@ -77,7 +77,9 @@ Measured on Linux (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for methodolog
 | `with_key` defrag, no codex, 16/32/64/256 B | 34 / 41 / 55 / 157 ns | ✅ all under 500 ns |
 | `with_key` defrag, with codex, 32/256 B | 67 / 432 ns | ✅ all under 1 µs |
 | `register` 16 / 256 B | 1.0 / 16 µs (1.0.2: 5.4 / 100 µs) | ✅ |
-| Concurrent reads, 1 → 64 threads | scales out, no contention | ✅ lock-free |
+| `register` with 20,000 keys registered (1.2) | 7.8 µs (1.1: 4.2 ms); independent of the number of keys | ✅ |
+| Concurrent reads of one key (1.2) | no lock, no shared writes; scales like reads of separate keys | ✅ lock-free |
+| `report_failure` after 160,000 failures for one name (1.2) | ~33-60 ns (1.1: 137-164 µs) | ✅ bounded |
 | Allocations per `with_key` (default `NoAudit`) | **0** (dhat-measured over 100k iterations) | ✅ zero-alloc hot path |
 | `with_key` with page protection (opt-in) | ~1.4-1.6 µs | two `mprotect` calls per read |
 
@@ -91,7 +93,7 @@ Run `cargo bench --all-features` to reproduce on your hardware.
 
 ```toml
 [dependencies]
-key-vault = "1.1"
+key-vault = "1.2"
 ```
 
 ```rust
@@ -131,8 +133,16 @@ let vault = KeyVaultBuilder::new()
     // Emergency unlock, rate limited: 1 s after a failure, doubling to 1 min.
     .with_master_key(RawKey::new(b"a long random master credential".to_vec()))
     .with_master_unlock_backoff(Duration::from_secs(1), Duration::from_secs(60))
+    // Refuse to store a key the OS will not page-lock.
+    .with_strict_locking(true)
     .build();
+
+// How many keys are page-locked right now.
+let status = vault.memory_status();
+assert!(status.all_locked());
 ```
+
+`KeyVault::new()` is the vault with every default. `with_key` may be nested, to use two keys at once.
 
 `with_keyed_normalization()` / `with_normalization_key(..)` store a keyed BLAKE3 output instead of plain BLAKE3, so a copy of the stored value cannot be used to guess the input offline. Read [docs/SECURITY.md](docs/SECURITY.md#key-normalization-blake3) before using the random-key mode: it changes the effective key every run.
 
@@ -140,7 +150,7 @@ let vault = KeyVaultBuilder::new()
 
 ```toml
 [dependencies]
-key-vault = { version = "1.1", default-features = false }
+key-vault = { version = "1.2", default-features = false }
 ```
 
 Without `std` the crate needs only `alloc`. Build the vault with `build_with_clock(your_clock)` (there is no `build()`, so a missing clock is a compile error), and on targets without a `getrandom` backend register your hardware RNG with `key_vault::register_rng!(fill_fn)` (linking fails without one). The fetchers, `monitor-tracing` and TEE detection need `std`. On bare metal there is no swap or core dump, so page locking and dump exclusion do not apply. CI builds for `thumbv7em-none-eabihf`.
@@ -152,7 +162,7 @@ Without `std` the crate needs only `alloc`. Build the vault with `build_with_clo
 
 key-vault helps against:
 
-- **Keys written to swap**: buffers are page-locked (best effort).
+- **Keys written to swap**: buffers are page-locked, up to the OS limit on locked memory. `memory_status()` shows any key that could not be locked, `with_strict_locking(true)` refuses such keys, and on Windows the crate raises its working-set size as needed (see [docs/PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md)).
 - **Keys in crash and core dumps**: key pages are excluded on Linux, Android, FreeBSD and from Windows Error Reporting dumps. Not on macOS, and not from dumps a debugger takes.
 - **Keys left in freed memory**: every buffer the crate owns is zeroized before it is freed.
 - **Stray reads inside the process** (opt-in page protection): key pages fault unless they are being read.

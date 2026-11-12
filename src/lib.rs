@@ -16,8 +16,10 @@
 //!
 //! **What it helps with**
 //!
-//! - Keys written to swap: buffers are `mlock`'d / `VirtualLock`'d
-//!   (best effort; check `RLIMIT_MEMLOCK`).
+//! - Keys written to swap: buffers are `mlock`'d / `VirtualLock`'d, up
+//!   to the OS limit on locked memory. [`KeyVault::memory_status`]
+//!   reports keys that could not be locked, and
+//!   [`KeyVaultBuilder::with_strict_locking`] refuses them.
 //! - Keys in crash and core dumps: key pages are excluded with
 //!   `MADV_DONTDUMP` on Linux and Android, `MADV_NOCORE` on FreeBSD, and
 //!   from Windows Error Reporting dumps on Windows. macOS has no
@@ -59,9 +61,13 @@
 //!    environment-variable fetchers (`std` only). Fetchers add no
 //!    in-memory protection. `TpmFetch` is not implemented, always
 //!    returns an error, and is deprecated since 1.1.1.
-//! 2. **Page locking and dump exclusion**: best effort, with per-page
-//!    reference counting so one buffer's drop never releases a page
-//!    another live buffer uses.
+//! 2. **Page locking and dump exclusion**: up to the OS lock limit, with
+//!    per-page reference counting so one buffer's drop never releases a
+//!    page another live buffer uses. Failures are reported
+//!    ([`KeyVault::memory_status`],
+//!    [`SecurityMonitor::on_memory_lock_failure`]) and retried; on
+//!    Windows the working-set size is raised as needed; after `fork` the
+//!    child locks its pages again.
 //! 3. **Fragmentation** ([`FragmentStrategy`]): obfuscation.
 //!    [`StandardFragmenter`] by default; any strategy through
 //!    [`KeyVaultBuilder::with_fragmenter`].
@@ -201,10 +207,10 @@ pub use crate::metadata::{AlgorithmHint, KeyMetadata};
 #[cfg(feature = "monitor-tracing")]
 pub use crate::monitor::LogMonitor;
 pub use crate::monitor::{
-    AccessContext, CompositeMonitor, FailureContext, LockoutScope, NoMonitor, SecurityMonitor,
-    ThresholdContext,
+    AccessContext, CompositeMonitor, FailureContext, LockoutScope, MemoryLockContext, NoMonitor,
+    SecurityMonitor, ThresholdContext,
 };
-pub use crate::vault::{KeyVault, KeyVaultBuilder, VaultConfig};
+pub use crate::vault::{KeyVault, KeyVaultBuilder, MemoryStatus, VaultConfig};
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

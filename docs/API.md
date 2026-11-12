@@ -447,6 +447,12 @@ so treat it like the key.
 - `layout_bytes(&self) -> &[u8]` — (1.1) the layout map.
 - `total_len(&self) -> usize` — (1.1) length of the key the chunks
   reassemble into.
+- `is_locked(&self) -> bool`: (1.2) `true` if every byte (chunks and
+  layout) is in page-locked memory right now. `false` when the process
+  hit its lock limit; always `false` for page-protected keys on Windows
+  and on targets without an OS.
+- `is_excluded_from_dumps(&self) -> bool`: (1.2) `true` if every byte is
+  excluded from crash dumps right now. Always `false` on macOS.
 
 `Debug` prints `Fragments { chunks: N, total_len: M, contents: "<opaque>", .. }`.
 
@@ -476,7 +482,15 @@ assert_eq!(mine.chunk(1), Some(&b"hel"[..]));
 Source: `src/vault/mod.rs`
 
 The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
-[`KeyVaultBuilder`](#keyvaultbuilder).
+[`KeyVaultBuilder`](#keyvaultbuilder), or `KeyVault::new()` for every
+default.
+
+**Constructors:**
+
+- `KeyVault::new() -> Self`: (1.2, `std`) same as
+  `KeyVaultBuilder::new().build()`. `KeyVault::default()` is the same.
+- `KeyVault::builder() -> KeyVaultBuilder`: (1.2) same as
+  `KeyVaultBuilder::new()`.
 
 **Named-key registry:**
 
@@ -484,8 +498,11 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
   — fragment a key and insert it under `name`. Returns the opaque
   handle. Errors on duplicate name (`Error::InvalidConfig`), when the
   vault is locked out, or (page protection on) when the private mapping
-  cannot be created (`Error::MemoryLock`). Of several simultaneous
-  `register` calls with the same name, exactly one succeeds.
+  cannot be created (`Error::MemoryLock`), or (strict locking on) when
+  the key's memory could not be page-locked (`Error::MemoryLock`). Of
+  several simultaneous `register` calls with the same name, exactly one
+  succeeds. The cost does not depend on how many keys are registered
+  (1.2).
 - `unregister(handle: KeyHandle) -> Result<()>` — remove. The
   underlying storage drops and zeroizes when the last reference goes
   away. Works on a locked-out key.
@@ -495,7 +512,10 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
   thread with `std`, per call without) and is valid only during the
   call; the buffer is zeroed when `f` returns, panics, or
   defragmentation fails. Copies `f` makes are not wiped. Returns
-  `Error::LockedOut` if the vault or this key is locked out.
+  `Error::LockedOut` if the vault or this key is locked out. `f` may
+  call `with_key` again (1.2): the inner call gets its own locked
+  buffer. Readers take no lock and write no shared memory, so threads
+  reading the same key do not slow each other down (1.2).
 - `rotate(handle, new_key: RawKey) -> Result<()>` — atomic swap.
   Concurrent readers see either the old or the new fragmentation,
   never a torn read. Returns `Error::KeyNotFound` if a concurrent
@@ -504,8 +524,17 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
 - `contains(handle: KeyHandle) -> bool`
 - `metadata(handle: KeyHandle) -> Option<KeyMetadata>` — non-secret
   per-key metadata.
-- `handle_for_name(name: &str) -> Option<KeyHandle>` — lookup.
+- `handle_for_name(name: &str) -> Option<KeyHandle>`: hashed lookup
+  (1.2; a scan before).
 - `key_count() -> usize` — number of registered keys.
+
+**Memory state (1.2):**
+
+- `memory_status(&self) -> MemoryStatus`: how many registered keys are
+  fully page-locked and fully excluded from dumps. Walks the registry;
+  meant for health checks and start-up logs.
+- `is_memory_locked(&self, handle: KeyHandle) -> Option<bool>`: the same
+  for one key; `None` for an unknown handle.
 
 **Master-key emergency unlock:**
 
@@ -546,7 +575,14 @@ The vault itself. `Arc`-backed, `Clone`, `Send + Sync`. Construct via
   lockout and the failure tracker.
 - `report_failure(&self, key_name: &str, note: Option<&'static str>)`
   — caller-driven failure reporting. Forwards to the configured
-  monitor and feeds both thresholds.
+  monitor and feeds both thresholds. Safe with names from untrusted
+  input (1.2): nothing is recorded while both thresholds are off, the
+  per-key threshold counts only names of registered keys, other names
+  share a bounded capacity, and each call costs the same however many
+  failures came before.
+- `report_failure_with_note(&self, key_name: &str, note: impl Into<Cow<'static, str>>)`
+  (1.2) the same with a note built at run time. Never put secrets in
+  it.
 - `report_anomalous_access(&self, key_name: &str, note: Option<&'static str>)`
   — caller-driven anomaly reporting (no state change).
 - `config(&self) -> &VaultConfig` — the configuration.
@@ -638,6 +674,16 @@ Fluent builder for [`KeyVault`](#keyvault). `Clone`.
   1.5 µs per `with_key` and one page per key; see
   [SECURITY.md](SECURITY.md#layer-10-page-protection) for the Windows
   page-file note.
+- `with_strict_locking(self, enabled: bool) -> Self`: (1.2) make
+  `register` and `rotate` fail with `Error::MemoryLock` instead of
+  storing a key whose memory could not be page-locked, and `with_key`
+  fail when its scratch buffer cannot be locked. Default `false`. With
+  page protection on Windows, or on targets without an OS, every
+  registration fails.
+- `with_failure_tracking_capacity(self, names: usize) -> Self`: (1.2)
+  how many names of unregistered keys the failure tracker remembers at
+  once (default 4096, at least 16). Names of registered keys are always
+  tracked.
 - `with_audit_sink<A: AuditSink + 'static>(self, sink: A) -> Self`
   — attach a Layer-9 audit sink. Default is `NoAudit`.
 - `build(self) -> KeyVault` — finalize with `StdClock`. `std` only.
@@ -698,6 +744,36 @@ Source: `src/vault/mod.rs`
 - `pub master_backoff_max: Duration` — (1.1) backoff cap.
 - `pub page_protection: bool` — (1.1) page protection on. Default
   `false`.
+- `pub strict_locking: bool`: (1.2) strict locking on. Default `false`.
+- `pub failure_tracking_capacity: usize`: (1.2) capacity for names of
+  unregistered keys in the failure tracker. Default 4096.
+
+<hr>
+
+### `MemoryStatus`
+
+Source: `src/vault/mod.rs`
+
+(1.2) `#[non_exhaustive]`, `Copy`. Returned by `KeyVault::memory_status()`.
+
+- `pub keys: usize`: keys registered.
+- `pub locked: usize`: keys held entirely in page-locked memory.
+- `pub excluded_from_dumps: usize`: keys held entirely in memory
+  excluded from crash dumps.
+- `unlocked(&self) -> usize`: `keys - locked`.
+- `all_locked(&self) -> bool`: `locked == keys`.
+
+```rust
+use key_vault::{KeyVault, RawKey};
+
+# fn main() -> Result<(), key_vault::Error> {
+let vault = KeyVault::new();
+let _ = vault.register("k", RawKey::new(vec![1; 32]))?;
+let status = vault.memory_status();
+assert_eq!(status.keys, 1);
+# Ok(())
+# }
+```
 
 <hr>
 
@@ -1394,8 +1470,15 @@ pub trait SecurityMonitor: Send + Sync {
     fn on_decryption_failure(&self, ctx: &FailureContext);
     fn on_anomalous_access(&self, ctx: &AccessContext);
     fn on_threshold_breach(&self, ctx: &ThresholdContext);
+    // 1.2, default no-op:
+    fn on_memory_lock_failure(&self, ctx: &MemoryLockContext) {}
 }
 ```
+
+`on_memory_lock_failure` fires when `register` or `rotate` stores (or,
+with strict locking, refuses) a key whose memory could not be
+page-locked, once per run of such failures. `MemoryLockContext` carries
+`key_name: String` and `refused: bool`.
 
 **Contract:**
 
@@ -1581,8 +1664,12 @@ Source: `src/monitor/mod.rs`
 **Fields:**
 
 - `pub key_name: String`
-- `pub consecutive_failures: u32`
-- `pub window_elapsed: Duration`
+- `pub consecutive_failures: u32`: failures for this name inside the
+  window. Since 1.2 it is `1` when no lockout threshold is on (nothing
+  is recorded then), exact up to 64 failures in the window, and can run
+  slightly high beyond that.
+- `pub window_elapsed: Duration`: `Duration::ZERO` when no threshold is
+  on.
 - `pub note: Cow<'static, str>`
 
 <hr>
@@ -1832,7 +1919,7 @@ impl KeyFetch for EnvironmentFetch {
 | No key bytes in `Error` variants | All variants carry only sanitized prose. |
 | Constant-time handle equality | `KeyHandle: subtle::ConstantTimeEq`; `PartialEq` routes through it. `Hash` consistent. |
 | Zero-on-drop | Every `LockedBytes` (fragments, layout buffer, codex table) zeroizes its bytes before unlocking and freeing. `RawKey` zeroizes its whole allocation including spare capacity. The `with_key` scratch buffer is zeroed after every call. |
-| mlock / VirtualLock + dump exclusion | Applied to every `LockedBytes` allocation and the `with_key` scratch buffer, with per-page reference counting so a page stays locked and excluded while any buffer on it is alive. Soft-fails when `RLIMIT_MEMLOCK` is exceeded. |
+| mlock / VirtualLock + dump exclusion | Applied to every `LockedBytes` allocation and the `with_key` scratch buffer, with per-page reference counting so a page stays locked and excluded while any buffer on it is alive. Soft-fails when `RLIMIT_MEMLOCK` (or the Windows working set) is exceeded; since 1.2 reported by `memory_status()` and refusable with `with_strict_locking`. |
 | Page protection (opt-in) | Protected keys' mappings are inaccessible between reads; tests check `/proc/self/maps` / `VirtualQuery` and that a direct read crashes a child process. |
 | `RawKey` bytes exposed only on request | `RawKey::expose_secret()` (1.1) is the only public accessor. |
 | Round-trip for every `FragmentStrategy` | 1000-iteration stress + per-strategy unit tests in CI. |

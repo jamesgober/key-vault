@@ -6,31 +6,40 @@
 //!
 //! # Concurrency
 //!
-//! Reads (`with_key`, `contains`, `metadata`, `handle_for_name`) load an
-//! `Arc` snapshot of the registry: lock-free with `std` (`ArcSwap`), a
-//! short spin lock without it. Writes (`register`, `unregister`, `rotate`)
-//! are serialized by an internal writer lock: each one re-checks the
-//! registry and installs its change while holding the lock, so a duplicate
-//! name cannot be inserted twice and `rotate` cannot report success for a
-//! key that was removed first. Fragmentation (the slow part of `register`
+//! Reads (`with_key`, `contains`, `metadata`, `handle_for_name`) load a
+//! snapshot of the registry: lock-free with `std` (`ArcSwap`), a short
+//! spin lock without it. A read takes no reference count on the key it
+//! reads (since 1.2), so threads reading the same key do not write to a
+//! shared cache line. Writes (`register`, `unregister`, `rotate`) are
+//! serialized by an internal writer lock: each one re-checks the registry
+//! and installs its change while holding the lock, so a duplicate name
+//! cannot be inserted twice and `rotate` cannot report success for a key
+//! that was removed first. Fragmentation (the slow part of `register`
 //! and `rotate`) runs before the lock is taken.
 //!
-//! ```
-//! use key_vault::{KeyVault, KeyVaultBuilder};
+//! The snapshot is a persistent hash trie (`trie.rs`, since 1.2): a write
+//! copies only the few nodes on the path to the key it changes, so its
+//! cost does not grow with the number of keys. Before 1.2 every write
+//! copied the whole map.
 //!
-//! // The builder follows the standard fluent pattern. None of the methods
-//! // perform I/O — construction is cheap and infallible.
-//! let _vault: KeyVault = KeyVaultBuilder::new().build();
+//! ```
+//! use key_vault::KeyVault;
+//!
+//! // `KeyVault::new()` is `KeyVaultBuilder::new().build()`. Construction
+//! // is cheap and infallible.
+//! let _vault = KeyVault::new();
 //! ```
 
+mod tracker;
+mod trie;
+
 use alloc::borrow::Cow;
-use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-#[cfg(any(test, feature = "std"))]
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::hash::Hasher;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 #[cfg(feature = "std")]
@@ -38,6 +47,8 @@ use arc_swap::ArcSwap;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use self::tracker::{FailureCounts, FailureTracker, Windows};
+use self::trie::HashTrie;
 use crate::Result;
 use crate::audit::{AccessKind, AuditEvent, AuditSink};
 use crate::clock::Clock;
@@ -47,27 +58,64 @@ use crate::error::Error;
 use crate::fetcher::RawKey;
 use crate::fragment::{FragmentStrategy, Fragments, StandardFragmenter};
 use crate::handle::{KeyHandle, KeyId};
-use crate::memory::LockedBytes;
+use crate::memory::{LockedBytes, ScratchBuf};
 use crate::metadata::KeyMetadata;
 use crate::monitor::{
-    AccessContext, FailureContext, LockoutScope, SecurityMonitor, ThresholdContext,
+    AccessContext, FailureContext, LockoutScope, MemoryLockContext, SecurityMonitor,
+    ThresholdContext,
 };
 use crate::normalize::{
     blake3_derive_into, blake3_keyed_into, blake3_keyed_normalize, blake3_normalize,
 };
 use crate::sync::Mutex;
 
-/// Registry map. `HashMap` with `std`; `BTreeMap` without.
-#[cfg(feature = "std")]
-type KeyMap = std::collections::HashMap<KeyId, KeyEntry>;
-#[cfg(not(feature = "std"))]
-type KeyMap = BTreeMap<KeyId, KeyEntry>;
+/// The registry: every registered key by id, and the id of every name.
+#[derive(Clone, Default)]
+struct Snapshot {
+    by_id: HashTrie<KeyId, Arc<KeyEntry>>,
+    by_name: HashTrie<String, KeyId>,
+}
+
+impl Snapshot {
+    #[inline]
+    fn get(&self, id: KeyId) -> Option<&Arc<KeyEntry>> {
+        self.by_id.get(id_hash(id), &id)
+    }
+
+    /// The entry registered under `name`, whose hash is `name_hash`.
+    fn find(&self, name_hash: u64, name: &str) -> Option<&Arc<KeyEntry>> {
+        self.by_name
+            .get(name_hash, name)
+            .and_then(|id| self.get(*id))
+    }
+
+    fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    fn for_each_entry(&self, mut f: impl FnMut(&KeyEntry)) {
+        self.by_id.for_each(|_, entry| f(entry));
+    }
+}
+
+/// Trie hash of a key id. Ids are sequential, which spreads them evenly
+/// over the low bits the trie uses first.
+#[inline]
+fn id_hash(id: KeyId) -> u64 {
+    id.get().get()
+}
 
 /// Atomically replaceable registry snapshot.
 #[cfg(feature = "std")]
-type Registry = ArcSwap<KeyMap>;
+type Registry = ArcSwap<Snapshot>;
 #[cfg(not(feature = "std"))]
-type Registry = crate::sync::ArcCell<KeyMap>;
+type Registry = crate::sync::ArcCell<Snapshot>;
+
+/// What `Registry::load` returns.
+#[cfg(feature = "std")]
+type SnapshotGuard = arc_swap::Guard<Arc<Snapshot>>;
+#[cfg(not(feature = "std"))]
+type SnapshotGuard = Arc<Snapshot>;
 
 /// Context string for deriving a 32-byte normalization key from a
 /// caller-supplied one (BLAKE3 `derive_key` mode). Changing it changes
@@ -93,6 +141,7 @@ const DEFAULT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// additive.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)] // independent switches, public since 1.0.
 pub struct VaultConfig {
     /// If `true`, raw key material is BLAKE3-normalized to 32 bytes before
     /// fragmentation. Default is `true`.
@@ -145,6 +194,19 @@ pub struct VaultConfig {
     /// that are inaccessible except while being read
     /// (`KeyVaultBuilder::with_page_protection`). Default: `false`.
     pub page_protection: bool,
+
+    /// `true` if [`KeyVault::register`], [`KeyVault::rotate`] and
+    /// [`KeyVault::with_key`] fail with
+    /// [`Error::MemoryLock`](crate::Error::MemoryLock) rather than hold key
+    /// bytes in memory that could not be page-locked
+    /// ([`KeyVaultBuilder::with_strict_locking`]). Default: `false`.
+    /// Since 1.2.
+    pub strict_locking: bool,
+
+    /// Most names of unregistered keys the failure tracker remembers at
+    /// once ([`KeyVaultBuilder::with_failure_tracking_capacity`]). Names of
+    /// registered keys are always tracked. Default: 4096. Since 1.2.
+    pub failure_tracking_capacity: usize,
 }
 
 impl Default for VaultConfig {
@@ -169,17 +231,51 @@ impl VaultConfig {
             master_backoff_base: Duration::ZERO,
             master_backoff_max: Duration::ZERO,
             page_protection: false,
+            strict_locking: false,
+            failure_tracking_capacity: tracker::DEFAULT_CAPACITY,
         }
+    }
+}
+
+/// Page-locking and dump-exclusion state of a vault's registered keys,
+/// from [`KeyVault::memory_status`].
+///
+/// A key counts as locked only if every page holding its fragments and
+/// layout is locked, and as excluded from dumps only if every such page
+/// is excluded. Since 1.2.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryStatus {
+    /// Keys registered.
+    pub keys: usize,
+    /// Keys held entirely in page-locked memory.
+    pub locked: usize,
+    /// Keys held entirely in memory excluded from crash dumps.
+    pub excluded_from_dumps: usize,
+}
+
+impl MemoryStatus {
+    /// Keys with at least one page that is not locked, and that the OS may
+    /// therefore write to swap.
+    #[must_use]
+    pub fn unlocked(&self) -> usize {
+        self.keys - self.locked
+    }
+
+    /// `true` if every registered key is held in page-locked memory.
+    #[must_use]
+    pub fn all_locked(&self) -> bool {
+        self.locked == self.keys
     }
 }
 
 /// In-memory key vault.
 ///
 /// The vault is the entry point for everything `key-vault` does. Application
-/// code constructs one via [`KeyVaultBuilder`], registers [`RawKey`] values
-/// under a name, and receives [`KeyHandle`](crate::KeyHandle)s in return.
-/// The vault itself is cheap to clone (it is `Arc`-backed internally) and
-/// safe to share across threads.
+/// code constructs one with [`KeyVault::new`] or [`KeyVaultBuilder`],
+/// registers [`RawKey`] values under a name, and receives
+/// [`KeyHandle`](crate::KeyHandle)s in return. The vault itself is cheap to
+/// clone (it is `Arc`-backed internally) and safe to share across threads.
 ///
 /// The vault uses a [`StandardFragmenter`] unless another strategy is set
 /// with [`KeyVaultBuilder::with_fragmenter`]. Decoys and a codex are used
@@ -195,25 +291,101 @@ pub struct KeyVault {
 
 /// Entry in the vault's named-key registry. Holds the fragmented
 /// representation of a key, its name (for audit / threshold tracking),
-/// and non-secret metadata.
-///
-/// Cloning an entry (the registry map is copied on every write) copies
-/// the name and metadata and shares the fragment storage; key bytes are
-/// never duplicated.
+/// and non-secret metadata. Entries are shared between registry
+/// snapshots; `rotate` installs a new entry that shares `lock`.
 struct KeyEntry {
     name: String,
+    /// The vault's hash of `name`.
+    name_hash: u64,
     fragments: Fragments,
     metadata: KeyMetadata,
+    /// Per-key lockout state, kept across rotations.
+    lock: Arc<KeyLock>,
 }
 
-impl Clone for KeyEntry {
-    fn clone(&self) -> Self {
+/// Lock word: not locked out.
+const UNLOCKED: u64 = 0;
+/// Lock word: locked out until cleared.
+const LOCKED_UNTIL_CLEARED: u64 = u64::MAX;
+
+/// Per-key lockout state: one word, `UNLOCKED`, `LOCKED_UNTIL_CLEARED`, or
+/// the clock time in nanoseconds the lockout ends, plus one.
+///
+/// Before 1.2 lockouts lived in a map keyed by name next to a count of its
+/// entries, and the count could drift from the map under concurrent
+/// clears. Each key now carries its own word, so there is nothing to keep
+/// in step: every change is one atomic operation on the key it is about.
+struct KeyLock {
+    #[cfg(target_has_atomic = "64")]
+    word: core::sync::atomic::AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))]
+    word: Mutex<u64>,
+}
+
+impl KeyLock {
+    fn new() -> Self {
         Self {
-            name: self.name.clone(),
-            fragments: self.fragments.share(),
-            metadata: self.metadata.clone(),
+            #[cfg(target_has_atomic = "64")]
+            word: core::sync::atomic::AtomicU64::new(UNLOCKED),
+            #[cfg(not(target_has_atomic = "64"))]
+            word: Mutex::new(UNLOCKED),
         }
     }
+
+    #[inline]
+    fn load(&self) -> u64 {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.word.load(Ordering::Acquire)
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self.word.lock()
+        }
+    }
+
+    fn swap(&self, value: u64) -> u64 {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.word.swap(value, Ordering::AcqRel)
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            core::mem::replace(&mut *self.word.lock(), value)
+        }
+    }
+
+    /// Set the word to `UNLOCKED` if it still holds `current`.
+    fn clear_if(&self, current: u64) -> bool {
+        #[cfg(target_has_atomic = "64")]
+        {
+            self.word
+                .compare_exchange(current, UNLOCKED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            let mut word = self.word.lock();
+            if *word == current {
+                *word = UNLOCKED;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// `d` in nanoseconds, saturating.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Lock word for a lockout that ends at `until` (`None`: until cleared).
+fn lock_word(until: Option<Duration>) -> u64 {
+    until.map_or(LOCKED_UNTIL_CLEARED, |t| {
+        nanos(t).saturating_add(1).min(LOCKED_UNTIL_CLEARED - 1)
+    })
 }
 
 /// The fragmenter a vault uses. The built-in default is held by value so
@@ -334,6 +506,45 @@ impl VaultClock {
             Self::Custom(c) => c.unix_time(),
         }
     }
+
+    /// `true` if the lock word `word` is in force now.
+    fn in_force(&self, word: u64) -> bool {
+        match word {
+            UNLOCKED => false,
+            LOCKED_UNTIL_CLEARED => true,
+            ends => nanos(self.now()) < ends - 1,
+        }
+    }
+}
+
+/// Keyed hash of key names (SipHash-2-4 under a random per-vault key).
+/// Indexes the registry's names and the failure tracker; an attacker who
+/// picks names cannot predict where they land.
+struct NameHasher {
+    k0: u64,
+    k1: u64,
+}
+
+impl NameHasher {
+    fn new() -> Self {
+        // If the RNG fails the keys are fixed. Names are still looked up
+        // by full comparison, so the only effect is that colliding names
+        // could be chosen deliberately to share a tracker entry.
+        Self {
+            k0: crate::rng::random_u64().unwrap_or(0x6b65_792d_7661_756c),
+            k1: crate::rng::random_u64().unwrap_or(0x7420_6e61_6d65_7321),
+        }
+    }
+
+    // `core::hash::SipHasher` is deprecated in favour of std's
+    // `DefaultHasher`, which `no_std` builds do not have. It is stable and
+    // keyed, which is what this needs.
+    #[allow(deprecated)]
+    fn hash(&self, name: &str) -> u64 {
+        let mut h = core::hash::SipHasher::new_with_keys(self.k0, self.k1);
+        h.write(name.as_bytes());
+        h.finish()
+    }
 }
 
 /// Master-unlock backoff state.
@@ -362,25 +573,24 @@ struct VaultInner {
     /// Time source for windows, lockout expiry, backoff and timestamps.
     clock: VaultClock,
     /// Named-key registry. Readers load a snapshot; writers (register,
-    /// unregister, rotate) build a new map and swap it in while holding
+    /// unregister, rotate) build a new one and swap it in while holding
     /// `writer`.
     keys: Registry,
     /// Serializes registry writers. A writer takes this lock, loads the
-    /// current map, checks its precondition (name free, key present),
-    /// stores the new map and only then releases the lock, so the check
-    /// and the update cannot be split by another writer.
+    /// current snapshot, checks its precondition (name free, key present),
+    /// stores the new snapshot and only then releases the lock, so the
+    /// check and the update cannot be split by another writer.
     writer: Mutex<()>,
-    /// Per-name failure timestamps (clock time), shared by the vault-wide
-    /// and per-key thresholds.
-    failure_tracker: Mutex<BTreeMap<String, VecDeque<Duration>>>,
+    /// Hash of key names for the registry and the failure tracker.
+    names: NameHasher,
+    /// Failure history for the thresholds. `None` when both thresholds
+    /// are off: nothing is recorded then.
+    tracker: Option<FailureTracker>,
     /// Set to `true` when the vault-wide threshold has been crossed.
     locked_out: AtomicBool,
-    /// Per-key lockouts: name to the clock time the lockout ends (`None`:
-    /// until cleared).
-    key_locks: Mutex<BTreeMap<String, Option<Duration>>>,
-    /// Number of entries in `key_locks`. Lets `with_key` skip the map (and
-    /// its lock) entirely when no key is locked out.
-    key_locks_active: AtomicUsize,
+    /// `true` while the most recently stored key could not be locked, so
+    /// the monitor hears about each run of lock failures once.
+    lock_failing: AtomicBool,
     /// Optional master credential verifier.
     master: Option<MasterVerifier>,
     /// Master-unlock backoff state. Also serializes master attempts.
@@ -391,6 +601,32 @@ struct VaultInner {
 }
 
 impl KeyVault {
+    /// A vault with the default configuration: the same as
+    /// `KeyVaultBuilder::new().build()`. Since 1.2.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use key_vault::{KeyVault, RawKey};
+    ///
+    /// let vault = KeyVault::new();
+    /// let handle = vault.register("db-key", RawKey::new(vec![7; 32]))?;
+    /// assert_eq!(vault.with_key(handle, |key| key.len())?, 32);
+    /// # Ok::<(), key_vault::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn new() -> Self {
+        KeyVaultBuilder::new().build()
+    }
+
+    /// A builder with the default configuration: the same as
+    /// [`KeyVaultBuilder::new`]. Since 1.2.
+    #[must_use]
+    pub fn builder() -> KeyVaultBuilder {
+        KeyVaultBuilder::new()
+    }
+
     /// Returns `true` if the vault is in vault-wide lock-out state.
     ///
     /// Lock-out is triggered by the threshold detector when
@@ -429,20 +665,29 @@ impl KeyVault {
     pub fn is_key_locked_out(&self, handle: KeyHandle) -> bool {
         let snapshot = self.inner.keys.load();
         snapshot
-            .get(&handle.id())
-            .is_some_and(|entry| self.key_locked(&entry.name))
+            .get(handle.id())
+            .is_some_and(|entry| self.key_locked(entry))
     }
 
-    /// Clear the per-key lockout for `name`. Returns `true` if the name was
-    /// locked out. Also forgets the failures recorded for that name.
+    /// Clear the per-key lockout for `name`. Returns `true` if the key
+    /// registered under `name` was locked out. Also forgets the failures
+    /// recorded for that name.
     #[allow(clippy::must_use_candidate)] // the result is informational.
     pub fn clear_key_lockout(&self, name: &str) -> bool {
-        let removed = self.inner.key_locks.lock().remove(name).is_some();
-        if removed {
-            let _ = self.inner.key_locks_active.fetch_sub(1, Ordering::AcqRel);
+        let hash = self.inner.names.hash(name);
+        let was_locked = {
+            let snapshot = self.inner.keys.load();
+            snapshot.find(hash, name).is_some_and(|entry| {
+                let previous = entry.lock.swap(UNLOCKED);
+                self.inner.clock.in_force(previous)
+            })
+        };
+        #[cfg(test)]
+        hooks::after_clear_key_lockout();
+        if let Some(tracker) = &self.inner.tracker {
+            tracker.remove(hash);
         }
-        let _ = self.inner.failure_tracker.lock().remove(name);
-        removed
+        was_locked
     }
 
     /// Clear every lockout: the vault-wide flag and all per-key lockouts.
@@ -452,12 +697,12 @@ impl KeyVault {
     /// failure tracker; subsequent failures start counting from zero.
     pub fn clear_lockout(&self) {
         self.inner.locked_out.store(false, Ordering::Release);
-        {
-            let mut locks = self.inner.key_locks.lock();
-            locks.clear();
-            self.inner.key_locks_active.store(0, Ordering::Release);
+        if let Some(tracker) = &self.inner.tracker {
+            tracker.clear();
         }
-        self.inner.failure_tracker.lock().clear();
+        self.inner.keys.load().for_each_entry(|entry| {
+            let _ = entry.lock.swap(UNLOCKED);
+        });
     }
 
     /// Report a key-access failure to the configured monitor and the
@@ -468,6 +713,8 @@ impl KeyVault {
     /// an optional caller-supplied free-text label; pass `None` if you
     /// don't have one. **Do not** include key bytes or other secrets in
     /// the note — it is forwarded verbatim to every configured monitor.
+    /// [`KeyVault::report_failure_with_note`] takes a note built at run
+    /// time.
     ///
     /// - If the vault-wide threshold is on and the count for `key_name`
     ///   within [`VaultConfig::failure_window`] reaches
@@ -476,37 +723,83 @@ impl KeyVault {
     /// - If the per-key threshold is on ([`KeyVaultBuilder::with_key_lockout`])
     ///   and the count within [`VaultConfig::key_lockout_window`] reaches
     ///   [`VaultConfig::key_lockout_threshold`], only the key registered
-    ///   under `key_name` is locked out.
+    ///   under `key_name` is locked out. Failures reported for a name
+    ///   that no key is registered under do not count toward it (since
+    ///   1.2).
     ///
     /// Either breach fires the monitor's `on_threshold_breach` with the
     /// matching [`LockoutScope`]. With both thresholds at `0` (the
-    /// default) only the per-failure callback runs.
+    /// default) only the per-failure callback runs, and nothing is
+    /// recorded.
+    ///
+    /// # Cost and memory
+    ///
+    /// Safe to call with names taken from untrusted input. The failure
+    /// history is bounded: names of registered keys are always tracked,
+    /// other names share a fixed capacity
+    /// ([`KeyVaultBuilder::with_failure_tracking_capacity`]) and the
+    /// longest-idle one is forgotten when it is full. Each call costs a
+    /// keyed hash of the name and a few `O(log n)` steps on one of
+    /// sixteen independently locked shards, however many failures came
+    /// before it.
     ///
     /// This is the only way failures reach the threshold detectors: the
     /// vault does not observe decryption failures itself. See
     /// [`KeyVault::is_locked_out`].
     pub fn report_failure(&self, key_name: &str, note: Option<&'static str>) {
-        self.handle_failure(key_name, note, true);
+        self.handle_failure(
+            key_name,
+            note.map_or(Cow::Borrowed(""), Cow::Borrowed),
+            true,
+        );
+    }
+
+    /// [`KeyVault::report_failure`] with a note that can be built at run
+    /// time (an error code from the cipher, say). The note is forwarded
+    /// to the monitor as is: never put key bytes or other secrets in it.
+    /// Since 1.2.
+    pub fn report_failure_with_note(&self, key_name: &str, note: impl Into<Cow<'static, str>>) {
+        self.handle_failure(key_name, note.into(), true);
     }
 
     /// Record a failure and apply the thresholds. `per_key` is `false` for
     /// master-unlock failures, which have their own backoff.
-    fn handle_failure(&self, key_name: &str, note: Option<&'static str>, per_key: bool) {
-        let note = note.map_or(Cow::Borrowed(""), Cow::Borrowed);
+    fn handle_failure(&self, key_name: &str, note: Cow<'static, str>, per_key: bool) {
         let config = &self.inner.config;
-        let key_threshold = if per_key {
-            config.key_lockout_threshold
+        let hash = self.inner.names.hash(key_name);
+        // Only a registered key can be locked out on its own, so only a
+        // registered name is counted for the per-key threshold.
+        let entry = if per_key && config.key_lockout_threshold > 0 {
+            self.inner.keys.load().find(hash, key_name).cloned()
         } else {
-            0
+            None
         };
-        let counts = self.record_failure(key_name, key_threshold > 0);
+        let windows = Windows {
+            vault: (config.max_failures_before_lockout > 0).then_some(config.failure_window),
+            key: entry.as_ref().map(|_| config.key_lockout_window),
+        };
+        let counts = match &self.inner.tracker {
+            Some(tracker) if windows.vault.is_some() || windows.key.is_some() => {
+                // Names of registered keys and the master credential are
+                // pinned: other names cannot push them out of the tracker.
+                let pinned = !per_key
+                    || entry.is_some()
+                    || self.inner.keys.load().find(hash, key_name).is_some();
+                tracker.record(hash, pinned, self.inner.clock.now(), windows)
+            }
+            _ => FailureCounts {
+                in_window: 1,
+                in_key_window: 0,
+                window_elapsed: Duration::ZERO,
+            },
+        };
 
         // Always fire the per-failure callback first.
         let ctx = FailureContext {
             key_name: key_name.to_string(),
             consecutive_failures: counts.in_window,
             window_elapsed: counts.window_elapsed,
-            note: note.clone(),
+            note,
         };
         self.inner.monitor.on_decryption_failure(&ctx);
 
@@ -527,57 +820,50 @@ impl KeyVault {
         }
 
         // Per-key threshold.
-        if key_threshold > 0 && counts.in_key_window >= key_threshold {
-            let until = config
-                .key_lockout_duration
-                .map(|d| self.inner.clock.now().saturating_add(d));
-            let newly_locked = {
-                let mut locks = self.inner.key_locks.lock();
-                let previous = locks.insert(key_name.to_string(), until);
-                if previous.is_none() {
-                    let _ = self.inner.key_locks_active.fetch_add(1, Ordering::AcqRel);
-                }
-                previous.is_none()
-            };
-            let breach = ThresholdContext {
-                key_name: key_name.to_string(),
-                failures_in_window: counts.in_key_window,
-                window: config.key_lockout_window,
-                lockout_triggered: newly_locked,
-                scope: LockoutScope::Key,
-            };
-            self.inner.monitor.on_threshold_breach(&breach);
+        if let Some(entry) = entry {
+            if counts.in_key_window >= config.key_lockout_threshold {
+                let until = config
+                    .key_lockout_duration
+                    .map(|d| self.inner.clock.now().saturating_add(d));
+                let previous = entry.lock.swap(lock_word(until));
+                let breach = ThresholdContext {
+                    key_name: key_name.to_string(),
+                    failures_in_window: counts.in_key_window,
+                    window: config.key_lockout_window,
+                    lockout_triggered: !self.inner.clock.in_force(previous),
+                    scope: LockoutScope::Key,
+                };
+                self.inner.monitor.on_threshold_breach(&breach);
+            }
         }
     }
 
-    /// `true` if `name` is under a per-key lockout that has not expired.
-    /// Expired lockouts are removed here.
+    /// `true` if `entry` is under a per-key lockout that has not expired.
+    /// An expired lockout is cleared here.
     #[inline]
-    fn key_locked(&self, name: &str) -> bool {
-        // Fast path for `with_key`: no key is locked out.
-        if self.inner.key_locks_active.load(Ordering::Acquire) == 0 {
+    fn key_locked(&self, entry: &KeyEntry) -> bool {
+        // Fast path for `with_key`: one load of a word only this key's
+        // lockouts write to.
+        let word = entry.lock.load();
+        if word == UNLOCKED {
             return false;
         }
-        self.key_locked_slow(name)
+        self.key_locked_slow(entry, word)
     }
 
     #[cold]
-    fn key_locked_slow(&self, name: &str) -> bool {
-        let mut locks = self.inner.key_locks.lock();
-        match locks.get(name) {
-            None => false,
-            Some(None) => true,
-            Some(Some(until)) => {
-                if self.inner.clock.now() < *until {
-                    true
-                } else {
-                    let _ = locks.remove(name);
-                    let _ = self.inner.key_locks_active.fetch_sub(1, Ordering::AcqRel);
-                    let _ = self.inner.failure_tracker.lock().remove(name);
-                    false
-                }
+    fn key_locked_slow(&self, entry: &KeyEntry, word: u64) -> bool {
+        if self.inner.clock.in_force(word) {
+            return true;
+        }
+        // Expired. Clear it, unless a new lockout replaced it meanwhile,
+        // and forget the failures that led to it.
+        if entry.lock.clear_if(word) {
+            if let Some(tracker) = &self.inner.tracker {
+                tracker.remove(entry.name_hash);
             }
         }
+        false
     }
 
     /// Report an anomalous (but successful) key access to the monitor.
@@ -614,53 +900,69 @@ impl KeyVault {
         self.inner.audit.on_event(&event);
     }
 
-    /// Append a failure timestamp for `key_name`, evict entries older than
-    /// the longest configured window, and count the entries inside each
-    /// window.
-    fn record_failure(&self, key_name: &str, per_key: bool) -> FailureCounts {
-        let now = self.inner.clock.now();
-        let config = &self.inner.config;
-        let mut keep = config.failure_window;
-        if per_key {
-            keep = keep.max(config.key_lockout_window);
-        }
-        let mut tracker = self.inner.failure_tracker.lock();
-        let entries = tracker.entry(key_name.to_string()).or_default();
-        while let Some(front) = entries.front() {
-            if now.saturating_sub(*front) > keep {
-                let _ = entries.pop_front();
-            } else {
-                break;
-            }
-        }
-        entries.push_back(now);
-        let count_within = |window: Duration| {
-            let n = entries
-                .iter()
-                .filter(|&&t| now.saturating_sub(t) <= window)
-                .count();
-            u32::try_from(n).unwrap_or(u32::MAX)
-        };
-        let oldest_in_window = entries
-            .iter()
-            .find(|&&t| now.saturating_sub(t) <= config.failure_window)
-            .copied()
-            .unwrap_or(now);
-        FailureCounts {
-            in_window: count_within(config.failure_window),
-            in_key_window: if per_key {
-                count_within(config.key_lockout_window)
-            } else {
-                0
-            },
-            window_elapsed: now.saturating_sub(oldest_in_window),
-        }
-    }
-
     /// Snapshot of the vault's configuration.
     #[must_use]
     pub fn config(&self) -> &VaultConfig {
         &self.inner.config
+    }
+
+    /// Page-locking and dump-exclusion state of every registered key.
+    ///
+    /// The OS limits how much memory a process may lock (`RLIMIT_MEMLOCK`
+    /// on Linux and macOS, the minimum working-set size on Windows). A
+    /// key registered after that limit is reached is stored anyway, in
+    /// memory the OS may write to swap; this call shows how many keys are
+    /// in that state. [`KeyVaultBuilder::with_strict_locking`] refuses such
+    /// keys instead, and [`SecurityMonitor::on_memory_lock_failure`] reports
+    /// them as they are stored. See `docs/PLATFORM-NOTES.md` for how to
+    /// raise the limit.
+    ///
+    /// Walks the whole registry: meant for health checks and start-up
+    /// logs, not for every request. Since 1.2.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use key_vault::{KeyVault, RawKey};
+    ///
+    /// let vault = KeyVault::new();
+    /// let _ = vault.register("k", RawKey::new(vec![1; 32]))?;
+    /// let status = vault.memory_status();
+    /// assert_eq!(status.keys, 1);
+    /// if !status.all_locked() {
+    ///     eprintln!("{} key(s) are not page-locked", status.unlocked());
+    /// }
+    /// # Ok::<(), key_vault::Error>(())
+    /// ```
+    #[must_use]
+    pub fn memory_status(&self) -> MemoryStatus {
+        crate::memory::relock_if_forked();
+        let snapshot = self.inner.keys.load();
+        let mut status = MemoryStatus::default();
+        snapshot.for_each_entry(|entry| {
+            status.keys += 1;
+            if entry.fragments.is_locked() {
+                status.locked += 1;
+            }
+            if entry.fragments.is_excluded_from_dumps() {
+                status.excluded_from_dumps += 1;
+            }
+        });
+        status
+    }
+
+    /// `Some(true)` if the key behind `handle` is held entirely in
+    /// page-locked memory, `Some(false)` if it is not (see
+    /// [`KeyVault::memory_status`]), `None` for an unknown handle.
+    /// Since 1.2.
+    #[must_use]
+    pub fn is_memory_locked(&self, handle: KeyHandle) -> Option<bool> {
+        crate::memory::relock_if_forked();
+        self.inner
+            .keys
+            .load()
+            .get(handle.id())
+            .map(|entry| entry.fragments.is_locked())
     }
 
     /// Fragment a raw key through the configured normalizer, codex, and
@@ -718,14 +1020,45 @@ impl KeyVault {
     }
 
     /// Fragment `key` for the registry: the pipeline above, then (with
-    /// page protection on) a move into a private protected mapping.
-    fn fragment_for_registry(&self, key: &RawKey) -> Result<Fragments> {
+    /// page protection on) a move into a private protected mapping, then
+    /// the lock check.
+    fn fragment_for_registry(&self, name: &str, key: &RawKey) -> Result<Fragments> {
         let fragments = self.fragment_pipeline(key)?;
         #[cfg(any(unix, windows))]
-        if self.inner.config.page_protection {
-            return fragments.into_protected();
-        }
+        let fragments = if self.inner.config.page_protection {
+            fragments.into_protected()?
+        } else {
+            fragments
+        };
+        self.check_locked(name, &fragments)?;
         Ok(fragments)
+    }
+
+    /// Report fragments that are not page-locked to the monitor (once per
+    /// run of failures) and, with strict locking, refuse them.
+    fn check_locked(&self, name: &str, fragments: &Fragments) -> Result<()> {
+        let strict = self.inner.config.strict_locking;
+        // With strict locking, retry the pages that failed before giving
+        // up: the pool backs off retries while locks keep failing, and the
+        // limit may have been raised since.
+        if fragments.is_locked() || (strict && fragments.retry_lock()) {
+            self.inner.lock_failing.store(false, Ordering::Release);
+            return Ok(());
+        }
+        if !self.inner.lock_failing.swap(true, Ordering::AcqRel) {
+            self.inner
+                .monitor
+                .on_memory_lock_failure(&MemoryLockContext {
+                    key_name: name.to_string(),
+                    refused: strict,
+                });
+        }
+        if strict {
+            return Err(Error::MemoryLock(
+                "the key's memory could not be page-locked and strict locking is on".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Take the registry writer lock.
@@ -772,6 +1105,14 @@ impl KeyVault {
     /// it. The returned handle is the only way to refer to the key from
     /// outside the crate; the underlying numeric id is not exposed.
     ///
+    /// If the key's memory could not be page-locked (the process is at
+    /// its lock limit), the key is stored anyway and the monitor's
+    /// [`SecurityMonitor::on_memory_lock_failure`] fires, unless strict
+    /// locking is on ([`KeyVaultBuilder::with_strict_locking`]).
+    ///
+    /// The cost does not depend on how many keys are registered (since
+    /// 1.2).
+    ///
     /// # Errors
     ///
     /// - [`Error::LockedOut`](crate::Error::LockedOut) if the vault is
@@ -782,7 +1123,8 @@ impl KeyVault {
     /// - Whatever the configured fragmenter surfaces (typically
     ///   [`Error::Fragment`](crate::Error::Fragment) for empty input).
     /// - [`Error::MemoryLock`](crate::Error::MemoryLock) if page protection
-    ///   is on and the protected mapping cannot be created.
+    ///   is on and the protected mapping cannot be created, or if strict
+    ///   locking is on and the key's memory could not be page-locked.
     // Intentionally take `key` by value: the function consumes the
     // caller's `RawKey` so its `Drop` impl zeroes the original buffer
     // as soon as we've fragmented (and copied) the bytes into
@@ -793,40 +1135,43 @@ impl KeyVault {
             return Err(Error::LockedOut);
         }
         let name: String = name.into();
+        let name_hash = self.inner.names.hash(&name);
         let duplicate = || Error::InvalidConfig(format!("key name {name:?} is already registered"));
 
         // Reject duplicate names early so callers get a clear error
         // before paying the fragmentation cost. This check is only a
         // shortcut; the authoritative one runs under the writer lock.
-        if self.inner.keys.load().values().any(|e| e.name == name) {
+        if self.inner.keys.load().find(name_hash, &name).is_some() {
             return Err(duplicate());
         }
 
         let key_len = key.len();
-        let fragments = self.fragment_for_registry(&key)?;
+        let fragments = self.fragment_for_registry(&name, &key)?;
         let handle = KeyHandle::allocate();
-        let metadata = KeyMetadata::new(self.inner.clock.unix_time(), key_len, None);
+        let id = handle.id();
+        let entry = Arc::new(KeyEntry {
+            name: name.clone(),
+            name_hash,
+            fragments,
+            metadata: KeyMetadata::new(self.inner.clock.unix_time(), key_len, None),
+            lock: Arc::new(KeyLock::new()),
+        });
 
         let previous = {
             let _writer = self.lock_writer();
             let current = self.inner.keys.load_full();
             // Re-check under the lock: another `register` may have
             // inserted the same name while we were fragmenting.
-            if current.values().any(|e| e.name == name) {
+            if current.by_name.get(name_hash, name.as_str()).is_some() {
                 return Err(duplicate());
             }
-            let mut new_map = (*current).clone();
-            let _ = new_map.insert(
-                handle.id(),
-                KeyEntry {
-                    name: name.clone(),
-                    fragments,
-                    metadata,
-                },
-            );
-            self.inner.keys.swap(Arc::new(new_map))
+            let next = Snapshot {
+                by_id: current.by_id.insert(id_hash(id), id, entry).0,
+                by_name: current.by_name.insert(name_hash, name.clone(), id).0,
+            };
+            self.inner.keys.swap(Arc::new(next))
         };
-        // Release the old map outside the writer lock.
+        // Release the old snapshot outside the writer lock.
         drop(previous);
         self.emit_audit(&name, AccessKind::Register, Cow::Borrowed(""));
         Ok(handle)
@@ -836,27 +1181,35 @@ impl KeyVault {
     /// (and their `LockedBytes` chunks) drop and zeroize when the last
     /// reference goes away.
     ///
-    /// Allowed while the key (or the vault) is locked out.
+    /// Allowed while the key (or the vault) is locked out. The key's
+    /// per-key lockout and recorded failures go with it (since 1.2): a key
+    /// registered later under the same name starts clean.
     ///
     /// # Errors
     ///
     /// Returns [`Error::KeyNotFound`](crate::Error::KeyNotFound) if no
     /// key is registered under the given handle.
     pub fn unregister(&self, handle: KeyHandle) -> Result<()> {
-        let (previous, name) = {
+        let (previous, name, name_hash) = {
             let _writer = self.lock_writer();
             let current = self.inner.keys.load_full();
-            let Some(entry) = current.get(&handle.id()) else {
+            let id = handle.id();
+            let Some((by_id, entry)) = current.by_id.remove(id_hash(id), &id) else {
                 return Err(Error::KeyNotFound);
             };
-            let name = entry.name.clone();
-            let mut new_map = (*current).clone();
-            let _ = new_map.remove(&handle.id());
-            (self.inner.keys.swap(Arc::new(new_map)), name)
+            let by_name = match current.by_name.remove(entry.name_hash, entry.name.as_str()) {
+                Some((by_name, _)) => by_name,
+                None => current.by_name.clone(),
+            };
+            let previous = self.inner.keys.swap(Arc::new(Snapshot { by_id, by_name }));
+            (previous, entry.name.clone(), entry.name_hash)
         };
         // The removed entry's fragments are freed (and zeroed) here, or
         // later when the last in-flight `with_key` reader lets go.
         drop(previous);
+        if let Some(tracker) = &self.inner.tracker {
+            tracker.remove(name_hash);
+        }
         self.emit_audit(&name, AccessKind::Unregister, Cow::Borrowed(""));
         Ok(())
     }
@@ -880,6 +1233,31 @@ impl KeyVault {
     /// buffer. Copies the closure makes (into a cipher's key schedule,
     /// a `Vec`, the stack) are not tracked or wiped by the vault.
     ///
+    /// # Nesting
+    ///
+    /// The closure may call `with_key` again, on this vault or another,
+    /// to use two keys at once (since 1.2; earlier versions panicked).
+    /// The inner call gets its own locked scratch buffer, allocated for
+    /// that call and wiped when it returns.
+    ///
+    /// ```
+    /// use key_vault::{KeyVault, RawKey};
+    ///
+    /// let vault = KeyVault::new();
+    /// let kek = vault.register("kek", RawKey::new(vec![1; 32]))?;
+    /// let dek = vault.register("dek", RawKey::new(vec![2; 32]))?;
+    /// let both = vault.with_key(kek, |kek| {
+    ///     vault.with_key(dek, |dek| kek.len() + dek.len())
+    /// })??;
+    /// assert_eq!(both, 64);
+    /// # Ok::<(), key_vault::Error>(())
+    /// ```
+    ///
+    /// # Concurrency
+    ///
+    /// Reads take no lock and write no shared memory, so threads reading
+    /// the same key do not slow each other down (since 1.2).
+    ///
     /// # Errors
     ///
     /// - [`Error::LockedOut`](crate::Error::LockedOut) if the vault, or
@@ -889,7 +1267,8 @@ impl KeyVault {
     /// - [`Error::Defragment`](crate::Error::Defragment) on internal
     ///   inconsistency.
     /// - [`Error::MemoryLock`](crate::Error::MemoryLock) if page protection
-    ///   is on and the OS refuses to make the key readable.
+    ///   is on and the OS refuses to make the key readable, or if strict
+    ///   locking is on and the scratch buffer could not be page-locked.
     pub fn with_key<F, T>(&self, handle: KeyHandle, f: F) -> Result<T>
     where
         F: FnOnce(&[u8]) -> T,
@@ -897,66 +1276,96 @@ impl KeyVault {
         if self.is_locked_out() {
             return Err(Error::LockedOut);
         }
+        crate::memory::relock_if_forked();
         let snapshot = self.inner.keys.load();
-        let entry = snapshot.get(&handle.id()).ok_or(Error::KeyNotFound)?;
-        if self.key_locked(&entry.name) {
-            return Err(Error::LockedOut);
-        }
-        let fragments = entry.fragments.share();
-        // Skip cloning the name when the audit sink is inert — this
-        // is the common case and removes one `String` allocation per
-        // `with_key` call.
-        let name: Option<String> = if self.inner.audit.is_no_op() {
-            None
-        } else {
-            Some(entry.name.clone())
-        };
-        // Drop the snapshot so we don't hold it across the
-        // potentially-slow defragment + user-callback path.
-        drop(snapshot);
-
-        let result = self.read_key(&fragments, f)?;
+        let (result, name) = self.read_key(snapshot, handle.id(), f)?;
         if let Some(name) = name {
             self.emit_audit(&name, AccessKind::Read, Cow::Borrowed(""));
         }
         Ok(result)
     }
 
-    /// Reassemble `fragments` into the per-thread scratch buffer and run
-    /// `f` over it.
+    /// Read the key `id` from `snapshot` into the per-thread scratch
+    /// buffer, or into a buffer of its own when the thread's scratch is
+    /// already in use (a `with_key` inside another one's callback).
     #[cfg(feature = "std")]
-    fn read_key<F, T>(&self, fragments: &Fragments, f: F) -> Result<T>
+    fn read_key<F, T>(
+        &self,
+        snapshot: SnapshotGuard,
+        id: KeyId,
+        f: F,
+    ) -> Result<(T, Option<String>)>
     where
         F: FnOnce(&[u8]) -> T,
     {
-        let total = fragments.total_len();
-        SCRATCH.with(|cell| -> Result<T> {
-            let mut scratch = cell.borrow_mut();
-            // Grow lazily; the buffer is reused across calls so the
-            // typical steady state is a no-op.
-            scratch.ensure_len(total);
-            // The guard is created before the first plaintext byte is
-            // written, so the scratch is volatile-zeroed on every exit
-            // path: normal return, an error from `defragment_into`
-            // after a partial write, or a panic in the codex or the
-            // user callback.
-            let guard = ZeroOnExit(&mut scratch.buf[..total]);
-            self.reassemble(fragments, &mut *guard.0)?;
-            Ok(f(&*guard.0))
+        SCRATCH.with(move |cell| match cell.try_borrow_mut() {
+            Ok(mut scratch) => self.read_into(snapshot, id, Some(&mut scratch), f),
+            Err(_) => self.read_into(snapshot, id, None, f),
         })
     }
 
-    /// Reassemble `fragments` into a per-call scratch buffer (no
-    /// thread-local storage without `std`) and run `f` over it.
+    /// Read the key `id` from `snapshot` into a per-call scratch buffer
+    /// (no thread-local storage without `std`).
     #[cfg(not(feature = "std"))]
-    fn read_key<F, T>(&self, fragments: &Fragments, f: F) -> Result<T>
+    fn read_key<F, T>(
+        &self,
+        snapshot: SnapshotGuard,
+        id: KeyId,
+        f: F,
+    ) -> Result<(T, Option<String>)>
     where
         F: FnOnce(&[u8]) -> T,
     {
-        let mut scratch = crate::memory::ScratchBuf::new(fragments.total_len());
-        let guard = ZeroOnExit(scratch.as_mut_slice());
-        self.reassemble(fragments, &mut *guard.0)?;
-        Ok(f(&*guard.0))
+        self.read_into(snapshot, id, None, f)
+    }
+
+    /// Reassemble the key `id` into `scratch` (or a fresh buffer), let go
+    /// of the snapshot, and run `f` over the bytes. Returns `f`'s result
+    /// and, when auditing, the key's name.
+    ///
+    /// The snapshot is held only while the key is reassembled, and no
+    /// reference count on the key is taken: a writer that replaces or
+    /// removes the key meanwhile keeps the old storage alive through the
+    /// snapshot until it is released here.
+    fn read_into<F, T>(
+        &self,
+        snapshot: SnapshotGuard,
+        id: KeyId,
+        scratch: Option<&mut Scratch>,
+        f: F,
+    ) -> Result<(T, Option<String>)>
+    where
+        F: FnOnce(&[u8]) -> T,
+    {
+        let entry = snapshot.get(id).ok_or(Error::KeyNotFound)?;
+        if self.key_locked(entry) {
+            return Err(Error::LockedOut);
+        }
+        // Skip cloning the name when the audit sink is inert; this is the
+        // common case and removes one `String` allocation per call.
+        let name = if self.inner.audit.is_no_op() {
+            None
+        } else {
+            Some(entry.name.clone())
+        };
+        let total = entry.fragments.total_len();
+        let strict = self.inner.config.strict_locking;
+        let mut own;
+        let buf = if let Some(scratch) = scratch {
+            scratch.slice(total, strict)?
+        } else {
+            own = ScratchBuf::new(total);
+            own.slice(strict)?
+        };
+        // The guard is created before the first plaintext byte is
+        // written, so the buffer is volatile-zeroed on every exit path:
+        // normal return, an error from `defragment_into` after a partial
+        // write, or a panic in the codex or the user callback.
+        let guard = ZeroOnExit(buf);
+        self.reassemble(&entry.fragments, &mut *guard.0)?;
+        // The callback runs on the copy; the registry is not needed for it.
+        drop(snapshot);
+        Ok((f(&*guard.0), name))
     }
 
     /// Defragment into `out` and apply the codex decode in place. Opens
@@ -990,10 +1399,11 @@ impl KeyVault {
     /// registry slot. Concurrent [`KeyVault::with_key`] callers see
     /// either the old or the new fragmentation (never a torn read);
     /// the old `Fragments` drops once all in-flight readers release
-    /// their references.
+    /// their references. The key keeps its per-key lockout state.
     ///
     /// The metadata is updated to record the new key length and a fresh
-    /// registration timestamp.
+    /// registration timestamp. The cost does not depend on how many keys
+    /// are registered (since 1.2).
     ///
     /// # Errors
     ///
@@ -1004,6 +1414,8 @@ impl KeyVault {
     ///   rotation is installed. `rotate` returns `Ok` only if the new
     ///   material was actually stored under the handle.
     /// - Fragmenter errors for the new key.
+    /// - [`Error::MemoryLock`](crate::Error::MemoryLock) as for
+    ///   [`KeyVault::register`].
     // Take `new_key` by value so its `Drop` zeroes the original buffer
     // after we've fragmented and copied the bytes into mlock'd storage.
     #[allow(clippy::needless_pass_by_value)]
@@ -1011,37 +1423,43 @@ impl KeyVault {
         if self.is_locked_out() {
             return Err(Error::LockedOut);
         }
+        let id = handle.id();
 
         // Check the key exists (and is not locked out) first so we don't
         // pay the fragmentation cost for nothing. This check is only a
         // shortcut; the authoritative one runs under the writer lock.
-        {
+        let name = {
             let snapshot = self.inner.keys.load();
-            let entry = snapshot.get(&handle.id()).ok_or(Error::KeyNotFound)?;
-            if self.key_locked(&entry.name) {
+            let entry = snapshot.get(id).ok_or(Error::KeyNotFound)?;
+            if self.key_locked(entry) {
                 return Err(Error::LockedOut);
             }
-        }
+            entry.name.clone()
+        };
 
         let new_len = new_key.len();
-        let new_fragments = self.fragment_for_registry(&new_key)?;
+        let new_fragments = self.fragment_for_registry(&name, &new_key)?;
         let new_metadata = KeyMetadata::new(self.inner.clock.unix_time(), new_len, None);
 
-        let (previous, name) = {
+        let previous = {
             let _writer = self.lock_writer();
             let current = self.inner.keys.load_full();
-            if !current.contains_key(&handle.id()) {
+            let Some(old) = current.get(id) else {
                 // Unregistered while we were fragmenting.
                 return Err(Error::KeyNotFound);
-            }
-            let mut new_map = (*current).clone();
-            let Some(entry) = new_map.get_mut(&handle.id()) else {
-                return Err(Error::KeyNotFound);
             };
-            entry.fragments = new_fragments;
-            entry.metadata = new_metadata;
-            let name = entry.name.clone();
-            (self.inner.keys.swap(Arc::new(new_map)), name)
+            let entry = Arc::new(KeyEntry {
+                name: old.name.clone(),
+                name_hash: old.name_hash,
+                fragments: new_fragments,
+                metadata: new_metadata,
+                lock: Arc::clone(&old.lock),
+            });
+            let next = Snapshot {
+                by_id: current.by_id.insert(id_hash(id), id, entry).0,
+                by_name: current.by_name.clone(),
+            };
+            self.inner.keys.swap(Arc::new(next))
         };
         drop(previous);
         self.emit_audit(&name, AccessKind::Rotate, Cow::Borrowed(""));
@@ -1051,7 +1469,7 @@ impl KeyVault {
     /// `true` if a key is registered under the given handle.
     #[must_use]
     pub fn contains(&self, handle: KeyHandle) -> bool {
-        self.inner.keys.load().contains_key(&handle.id())
+        self.inner.keys.load().get(handle.id()).is_some()
     }
 
     /// Clone the [`KeyMetadata`] for the given handle.
@@ -1064,18 +1482,21 @@ impl KeyVault {
         self.inner
             .keys
             .load()
-            .get(&handle.id())
+            .get(handle.id())
             .map(|e| e.metadata.clone())
     }
 
-    /// Find the handle registered under `name`, if any.
+    /// Find the handle registered under `name`, if any. A hashed lookup
+    /// (since 1.2; earlier versions scanned every key).
     #[must_use]
     pub fn handle_for_name(&self, name: &str) -> Option<KeyHandle> {
+        let hash = self.inner.names.hash(name);
         self.inner
             .keys
             .load()
-            .iter()
-            .find_map(|(id, entry)| (entry.name == name).then(|| KeyHandle::from_id(*id)))
+            .by_name
+            .get(hash, name)
+            .map(|id| KeyHandle::from_id(*id))
     }
 
     /// Number of keys currently registered.
@@ -1172,7 +1593,11 @@ impl KeyVault {
             // Counts toward the vault-wide threshold like any reported
             // failure. Master attempts have their own backoff, so they do
             // not feed the per-key lockout.
-            self.handle_failure(MASTER_NAME, Some("invalid master credential"), false);
+            self.handle_failure(
+                MASTER_NAME,
+                Cow::Borrowed("invalid master credential"),
+                false,
+            );
             Err(Error::Acquisition {
                 source: Cow::Borrowed("master"),
                 reason: "master credential did not match".to_string(),
@@ -1202,14 +1627,38 @@ impl KeyVault {
     }
 }
 
-/// Failure counts returned by `record_failure`.
-struct FailureCounts {
-    /// Failures inside the vault-wide window.
-    in_window: u32,
-    /// Failures inside the per-key window (0 when per-key is off).
-    in_key_window: u32,
-    /// Age of the oldest failure inside the vault-wide window.
-    window_elapsed: Duration,
+#[cfg(feature = "std")]
+impl Default for KeyVault {
+    /// Same as [`KeyVault::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Test hooks: code that runs at a fixed point inside a vault operation,
+/// to drive an exact interleaving of concurrent calls.
+#[cfg(test)]
+mod hooks {
+    use alloc::boxed::Box;
+    use core::cell::RefCell;
+
+    std::thread_local! {
+        static AFTER_CLEAR_KEY_LOCKOUT: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Run `f` (once, on this thread) inside the next
+    /// `clear_key_lockout`, after the key's lockout is cleared and before
+    /// its failures are forgotten.
+    pub(super) fn set_after_clear_key_lockout(f: impl FnOnce() + 'static) {
+        AFTER_CLEAR_KEY_LOCKOUT.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn after_clear_key_lockout() {
+        if let Some(f) = AFTER_CLEAR_KEY_LOCKOUT.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
 }
 
 /// Apply a codex's transformation to every byte of a key.
@@ -1253,15 +1702,39 @@ std::thread_local! {
 }
 
 /// Per-thread scratch buffer for [`KeyVault::with_key`].
-#[cfg(feature = "std")]
+#[cfg_attr(not(feature = "std"), allow(dead_code))] // only `std` has the thread-local.
 struct Scratch {
     buf: Vec<u8>,
+    /// `true` if every page of `buf` is locked.
+    locked: bool,
 }
 
-#[cfg(feature = "std")]
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 impl Scratch {
     const fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            locked: true,
+        }
+    }
+
+    /// The first `len` bytes, growing the buffer if needed. With `strict`,
+    /// retries the lock on a buffer whose pages are not all locked and
+    /// fails with [`Error::MemoryLock`] if that does not help.
+    fn slice(&mut self, len: usize, strict: bool) -> Result<&mut [u8]> {
+        self.ensure_len(len);
+        if strict && !self.locked && !self.buf.is_empty() {
+            let (ptr, len) = (self.buf.as_ptr(), self.buf.len());
+            // SAFETY: the buffer is non-empty and holds the reference
+            // taken in `ensure_len`.
+            self.locked = unsafe { crate::memory::retry_region(ptr, len) };
+            if !self.locked {
+                return Err(Error::MemoryLock(
+                    "could not lock the scratch buffer for the key".into(),
+                ));
+            }
+        }
+        Ok(&mut self.buf[..len])
     }
 
     /// Make sure the buffer holds at least `len` bytes. Growing allocates
@@ -1272,14 +1745,14 @@ impl Scratch {
             return;
         }
         let new_buf = alloc::vec![0u8; len];
-        if !new_buf.is_empty() {
-            // SAFETY: `new_buf` is a live allocation of `len` bytes. It is
-            // moved into `self.buf` (the heap buffer does not move) and
-            // never resized; `release` passes the same pointer and length.
-            let _ = unsafe { crate::memory::acquire_region(new_buf.as_ptr(), new_buf.len()) };
-        }
+        // `len > buf.len() >= 0`, so the new buffer is non-empty.
+        // SAFETY: `new_buf` is a live allocation of `len` bytes. It is
+        // moved into `self.buf` (the heap buffer does not move) and never
+        // resized; `release` passes the same pointer and length.
+        let locked = unsafe { crate::memory::acquire_region(new_buf.as_ptr(), new_buf.len()) };
         self.release();
         self.buf = new_buf;
+        self.locked = locked;
     }
 
     /// Zero the current buffer and drop its page references.
@@ -1291,10 +1764,10 @@ impl Scratch {
             unsafe { crate::memory::release_region(self.buf.as_ptr(), self.buf.len()) };
         }
         self.buf = Vec::new();
+        self.locked = true;
     }
 }
 
-#[cfg(feature = "std")]
 impl Drop for Scratch {
     fn drop(&mut self) {
         self.release();
@@ -1335,12 +1808,15 @@ fn volatile_zero_slice(s: &mut [u8]) {
 
 impl core::fmt::Debug for KeyVault {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut keys_locked_out = 0usize;
+        self.inner.keys.load().for_each_entry(|entry| {
+            if self.inner.clock.in_force(entry.lock.load()) {
+                keys_locked_out += 1;
+            }
+        });
         f.debug_struct("KeyVault")
             .field("locked_out", &self.is_locked_out())
-            .field(
-                "keys_locked_out",
-                &self.inner.key_locks_active.load(Ordering::Acquire),
-            )
+            .field("keys_locked_out", &keys_locked_out)
             .field("fragmenter", &self.inner.fragmenter.describe())
             .field("decoy_ignored", &self.inner.decoy_ignored)
             .field("config", &self.inner.config)
@@ -1372,9 +1848,8 @@ type MasterSeed = core::result::Result<Arc<LockedBytes>, &'static str>;
 
 /// Fluent builder for [`KeyVault`].
 ///
-/// The builder is the only way to construct a vault; the inherent
-/// `KeyVault::new` constructor is intentionally not provided so that future
-/// required configuration cannot be silently bypassed.
+/// [`KeyVault::new`] (since 1.2) is the builder with every default; use the
+/// builder for anything else.
 ///
 /// With `std`, finish with `KeyVaultBuilder::build`. Without `std`,
 /// finish with [`KeyVaultBuilder::build_with_clock`]: there is no default
@@ -1877,6 +2352,65 @@ impl KeyVaultBuilder {
         self
     }
 
+    /// Refuse to hold key bytes in memory that could not be page-locked.
+    ///
+    /// By default a key is stored even when the OS will not lock its pages
+    /// (the process reached `RLIMIT_MEMLOCK` on Linux or macOS, or its
+    /// working-set limit on Windows): it works, but the OS may write it to
+    /// swap. [`KeyVault::memory_status`] counts such keys and
+    /// [`SecurityMonitor::on_memory_lock_failure`] reports them.
+    ///
+    /// With strict locking on, [`KeyVault::register`] and
+    /// [`KeyVault::rotate`] fail with
+    /// [`Error::MemoryLock`](crate::Error::MemoryLock) instead (nothing is
+    /// stored, and the copy made for fragmenting is wiped), and
+    /// [`KeyVault::with_key`] fails the same way if its scratch buffer
+    /// cannot be locked. Raising the limit while the process runs makes
+    /// later calls succeed; the crate retries pages that failed before.
+    ///
+    /// Two combinations always fail and are best avoided: page protection
+    /// on Windows (Windows drops the lock on inaccessible pages, so a
+    /// protected key is never locked there), and targets without an OS,
+    /// where nothing can be locked.
+    ///
+    /// Default: off. Since 1.2.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use key_vault::{Error, KeyVaultBuilder, RawKey};
+    ///
+    /// let vault = KeyVaultBuilder::new().with_strict_locking(true).build();
+    /// match vault.register("k", RawKey::new(vec![7; 32])) {
+    ///     Ok(_) => {}                       // the key is page-locked
+    ///     Err(Error::MemoryLock(_)) => {}   // at the lock limit: not stored
+    ///     Err(e) => return Err(e),
+    /// }
+    /// # Ok::<(), Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_strict_locking(mut self, enabled: bool) -> Self {
+        self.config.strict_locking = enabled;
+        self
+    }
+
+    /// Set how many names of unregistered keys the failure tracker
+    /// remembers at once. Default: 4096.
+    ///
+    /// [`KeyVault::report_failure`] accepts any name. Names that a key is
+    /// registered under are always tracked; other names (an unknown key
+    /// id taken from a request, say) share this capacity, and when it is
+    /// full the name whose last failure is oldest is forgotten. Only the
+    /// vault-wide threshold counts such names. Each tracked name uses
+    /// about 100 bytes plus 24 bytes per remembered failure (at most the
+    /// larger threshold, and at most 64). Values below 16 are raised to
+    /// 16. Since 1.2.
+    #[must_use]
+    pub fn with_failure_tracking_capacity(mut self, names: usize) -> Self {
+        self.config.failure_tracking_capacity = names;
+        self
+    }
+
     /// Attach a Layer-9 audit sink.
     ///
     /// Every vault operation (register, unregister, read, rotate,
@@ -2007,21 +2541,30 @@ impl KeyVaultBuilder {
             },
             Err(reason) => MasterVerifier::Unavailable(reason),
         });
+        let config = self.config;
+        let max_threshold = config
+            .max_failures_before_lockout
+            .max(config.key_lockout_threshold);
+        let tracker = (max_threshold > 0)
+            .then(|| FailureTracker::new(max_threshold, config.failure_tracking_capacity));
+        // Memory locks are not inherited across `fork`; have the crate
+        // lock its pages again in a child process.
+        crate::memory::install_fork_handler();
         KeyVault {
             inner: Arc::new(VaultInner {
-                config: self.config,
+                config,
                 fragmenter,
                 decoy_ignored,
                 normalizer,
                 codex: self.codex,
                 monitor,
                 clock,
-                keys: Registry::from_pointee(KeyMap::new()),
+                keys: Registry::from_pointee(Snapshot::default()),
                 writer: Mutex::new(()),
-                failure_tracker: Mutex::new(BTreeMap::new()),
+                names: NameHasher::new(),
+                tracker,
                 locked_out: AtomicBool::new(false),
-                key_locks: Mutex::new(BTreeMap::new()),
-                key_locks_active: AtomicUsize::new(0),
+                lock_failing: AtomicBool::new(false),
                 master,
                 master_backoff: Mutex::new(Backoff::default()),
                 audit,
@@ -2814,12 +3357,21 @@ mod tests {
 
     /// Replace the fragments stored for `handle` with `fragments`.
     fn replace_fragments(v: &KeyVault, handle: KeyHandle, fragments: &Fragments) {
-        let _previous = v.inner.keys.rcu(|current| {
-            let mut new_map = (**current).clone();
-            let entry = new_map.get_mut(&handle.id()).expect("handle registered");
-            entry.fragments = fragments.share();
-            new_map
+        let current = v.inner.keys.load_full();
+        let id = handle.id();
+        let old = current.get(id).expect("handle registered");
+        let entry = Arc::new(KeyEntry {
+            name: old.name.clone(),
+            name_hash: old.name_hash,
+            fragments: fragments.share(),
+            metadata: old.metadata.clone(),
+            lock: Arc::clone(&old.lock),
         });
+        let next = Snapshot {
+            by_id: current.by_id.insert(id_hash(id), id, entry).0,
+            by_name: current.by_name.clone(),
+        };
+        v.inner.keys.store(Arc::new(next));
     }
 
     #[test]
@@ -3041,7 +3593,7 @@ mod tests {
     }
 
     /// Add `n` filler entries straight into the registry (sharing one
-    /// `Fragments`), so that copying the map is slow.
+    /// `Fragments`).
     fn pad_registry(v: &KeyVault, n: usize) {
         let mut map = (*v.inner.keys.load_full()).clone();
         let shared = v
@@ -3050,14 +3602,18 @@ mod tests {
             .fragment(&RawKey::new(alloc::vec![9u8; 8]))
             .unwrap();
         for i in 0..n {
-            let _ = map.insert(
-                KeyHandle::allocate().id(),
-                KeyEntry {
-                    name: format!("filler-{i}"),
-                    fragments: shared.share(),
-                    metadata: KeyMetadata::new(Duration::ZERO, 8, None),
-                },
-            );
+            let id = KeyHandle::allocate().id();
+            let name = format!("filler-{i}");
+            let name_hash = v.inner.names.hash(&name);
+            map.by_name = map.by_name.insert(name_hash, name.clone(), id).0;
+            let entry = Arc::new(KeyEntry {
+                name,
+                name_hash,
+                fragments: shared.share(),
+                metadata: KeyMetadata::new(Duration::ZERO, 8, None),
+                lock: Arc::new(KeyLock::new()),
+            });
+            map.by_id = map.by_id.insert(id_hash(id), id, entry).0;
         }
         v.inner.keys.store(Arc::new(map));
     }
@@ -3140,7 +3696,7 @@ mod tests {
     /// `handle`'s fragments.
     fn locked_pages_of(v: &KeyVault, handle: KeyHandle) -> Vec<usize> {
         let snapshot = v.inner.keys.load();
-        let frags = &snapshot.get(&handle.id()).expect("registered").fragments;
+        let frags = &snapshot.get(handle.id()).expect("registered").fragments;
         let mut pages = Vec::new();
         for lb in frags
             .chunks()
@@ -3374,7 +3930,7 @@ mod tests {
         clock.advance(Duration::from_secs(1));
         assert!(!v.is_key_locked_out(h));
         assert!(v.with_key(h, |_| ()).is_ok());
-        assert_eq!(v.inner.key_locks_active.load(Ordering::SeqCst), 0);
+        assert!(format!("{v:?}").contains("keys_locked_out: 0"));
     }
 
     #[test]
@@ -3421,6 +3977,7 @@ mod tests {
             .with_failure_threshold(2, Duration::from_secs(60))
             .with_key_lockout(1, Duration::from_secs(60), None)
             .build();
+        let _ = v.register("x", RawKey::new(alloc::vec![1u8; 16])).unwrap();
         v.report_failure("x", None);
         v.report_failure("x", None);
         let breaches = monitor.breaches.lock().unwrap().clone();
@@ -3680,7 +4237,7 @@ mod tests {
         assert_eq!(v.with_key(h, <[u8]>::len).unwrap(), 32);
         if cfg!(feature = "decoy-self-ref") && described == "standard" {
             let snapshot = v.inner.keys.load();
-            let frags = &snapshot.get(&h.id()).unwrap().fragments;
+            let frags = &snapshot.get(h.id()).unwrap().fragments;
             assert!(
                 frags
                     .layout_bytes()
@@ -3709,7 +4266,7 @@ mod page_protection_tests {
     /// Mapping address and length of the protected region behind `h`.
     fn region_of(v: &KeyVault, h: KeyHandle) -> (usize, usize) {
         let snapshot = v.inner.keys.load();
-        let frags = &snapshot.get(&h.id()).unwrap().fragments;
+        let frags = &snapshot.get(h.id()).unwrap().fragments;
         frags.region().expect("key is not page-protected").mapping()
     }
 
@@ -3781,7 +4338,7 @@ mod page_protection_tests {
         );
 
         let snapshot = v.inner.keys.load();
-        let frags = snapshot.get(&h.id()).unwrap().fragments.share();
+        let frags = snapshot.get(h.id()).unwrap().fragments.share();
         drop(snapshot);
         {
             let _open = frags.open().unwrap().expect("region");
@@ -3863,7 +4420,7 @@ mod page_protection_tests {
         let v = protected_vault();
         let h = v.register("k", RawKey::new(alloc::vec![1u8; 32])).unwrap();
         let snapshot = v.inner.keys.load();
-        let region = snapshot.get(&h.id()).unwrap().fragments.region().unwrap();
+        let region = snapshot.get(h.id()).unwrap().fragments.region().unwrap();
         #[cfg(target_os = "linux")]
         {
             let (addr, _) = region.mapping();
@@ -3939,5 +4496,450 @@ mod page_protection_tests {
         assert!(frags.chunk(0).is_some());
         let back = v.defragment(&frags).unwrap();
         assert_eq!(back.expose_secret(), &[3u8; 32]);
+    }
+}
+
+/// Regression tests for the 1.2 fixes: bounded failure tracking, nested
+/// `with_key`, the per-key lockout state, registry write cost, and the
+/// read path's shared state.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod regression_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn key(b: u8) -> RawKey {
+        RawKey::new(alloc::vec![b; 32])
+    }
+
+    // ----- Failure tracking -----
+
+    /// With no threshold on (the default), reported failures leave no
+    /// trace, however many distinct names are reported. In 1.1 every
+    /// name stayed in the tracker forever.
+    #[test]
+    fn a_million_distinct_names_record_nothing_without_a_threshold() {
+        let v = KeyVaultBuilder::new().build();
+        assert!(v.inner.tracker.is_none());
+        for i in 0..1_000_000u32 {
+            v.report_failure(&format!("kid-{i:08x}"), None);
+        }
+        assert!(v.inner.tracker.is_none());
+        assert!(!v.is_locked_out());
+    }
+
+    /// With the vault-wide threshold on, a million distinct names keep the
+    /// tracker at its capacity, and a registered key's count survives the
+    /// flood (its entry is pinned).
+    #[test]
+    fn a_million_distinct_names_keep_the_tracker_bounded() {
+        let v = KeyVaultBuilder::new()
+            .with_failure_threshold(3, Duration::from_secs(600))
+            .with_failure_tracking_capacity(1024)
+            .build();
+        let _ = v.register("real", key(1)).unwrap();
+        v.report_failure("real", None);
+        v.report_failure("real", None);
+        for i in 0..1_000_000u32 {
+            v.report_failure(&format!("kid-{i:08x}"), None);
+        }
+        let tracked = v.inner.tracker.as_ref().unwrap().len();
+        assert!(tracked <= 1024 + 1, "{tracked} names tracked");
+        assert!(!v.is_locked_out(), "one failure per name must not lock out");
+        // The registered key's two failures were not evicted.
+        v.report_failure("real", None);
+        assert!(v.is_locked_out());
+    }
+
+    /// Per-key lockout counts only names of registered keys, so unknown
+    /// names neither use memory nor create lockout state. In 1.1 each one
+    /// added a permanent lockout entry and pushed every `with_key` onto a
+    /// locked slow path.
+    #[test]
+    fn unknown_names_create_no_per_key_state() {
+        let v = KeyVaultBuilder::new()
+            .with_key_lockout(1, Duration::from_secs(60), None)
+            .build();
+        let h = v.register("real", key(3)).unwrap();
+        for i in 0..100_000u32 {
+            v.report_failure(&format!("attacker-{i}"), None);
+        }
+        assert_eq!(v.inner.tracker.as_ref().unwrap().len(), 0);
+        assert!(format!("{v:?}").contains("keys_locked_out: 0"));
+        assert!(v.with_key(h, |k| k[0]).is_ok());
+    }
+
+    /// Many failures for one name use a bounded number of slots and the
+    /// cost per call does not grow with the number of failures. In 1.1
+    /// each call walked every failure in the window (quadratic overall).
+    #[test]
+    fn many_failures_for_one_name_cost_the_same_per_call() {
+        let v = KeyVaultBuilder::new()
+            .with_failure_threshold(5, Duration::from_secs(3600))
+            .build();
+        let hash = v.inner.names.hash("same");
+        let batch = |n: u32| {
+            let t = Instant::now();
+            for _ in 0..n {
+                v.report_failure("same", None);
+            }
+            t.elapsed()
+        };
+        let first = batch(10_000);
+        let _ = batch(140_000);
+        let last = batch(10_000);
+        let slots = v.inner.tracker.as_ref().unwrap().slots_of(hash);
+        assert!(slots <= 5, "{slots} slots for one name");
+        // Quadratic growth made the last batch about 30 times slower than
+        // the first; allow generous noise.
+        assert!(
+            last < first * 8 + Duration::from_millis(50),
+            "first 10k: {first:?}, last 10k: {last:?}"
+        );
+    }
+
+    // ----- Per-key lockout state -----
+
+    /// The interleaving that bypassed a per-key lockout in 1.1, driven
+    /// exactly: thread A's `clear_key_lockout("a")` is paused at the point
+    /// where 1.1 had released the map lock but not yet decremented the
+    /// locked-key count; there, B's `clear_lockout()` and C's failure for
+    /// "b" (which locks "b") run to completion. 1.1 then left "b" locked
+    /// in the map with a count of 0, so `with_key(b)` succeeded.
+    #[test]
+    fn clearing_one_lockout_cannot_hide_another() {
+        let v = KeyVaultBuilder::new()
+            .with_key_lockout(1, Duration::from_secs(600), None)
+            .build();
+        let _a = v.register("a", key(4)).unwrap();
+        let b = v.register("b", key(5)).unwrap();
+        v.report_failure("a", None);
+
+        let (b_vault, c_vault) = (v.clone(), v.clone());
+        hooks::set_after_clear_key_lockout(move || {
+            // B and C on their own threads, run to completion while A is
+            // paused.
+            std::thread::spawn(move || b_vault.clear_lockout())
+                .join()
+                .unwrap();
+            std::thread::spawn(move || c_vault.report_failure("b", None))
+                .join()
+                .unwrap();
+        });
+        assert!(v.clear_key_lockout("a"));
+
+        assert!(v.is_key_locked_out(b));
+        assert!(matches!(v.with_key(b, |_| ()), Err(Error::LockedOut)));
+        assert!(format!("{v:?}").contains("keys_locked_out: 1"));
+        assert!(v.clear_key_lockout("b"));
+        assert!(v.with_key(b, |_| ()).is_ok());
+        assert!(format!("{v:?}").contains("keys_locked_out: 0"));
+    }
+
+    /// The three calls released together, many times: the lockout state
+    /// read by `is_key_locked_out`, `with_key` and `clear_key_lockout`
+    /// always agrees.
+    #[test]
+    fn concurrent_clears_and_lockouts_agree() {
+        let v = KeyVaultBuilder::new()
+            .with_key_lockout(1, Duration::from_secs(600), None)
+            .build();
+        let _ = v.register("a", key(4)).unwrap();
+        let hb = v.register("b", key(5)).unwrap();
+        let rounds = 2000;
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let go = Arc::new(std::sync::Barrier::new(4));
+        let done = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..3)
+            .map(|role| {
+                let (v, start, go, done) = (v.clone(), start.clone(), go.clone(), done.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..rounds {
+                        let _ = go.wait();
+                        let _ = start.wait();
+                        match role {
+                            0 => {
+                                let _ = v.clear_key_lockout("a");
+                            }
+                            1 => v.clear_lockout(),
+                            _ => v.report_failure("b", None),
+                        }
+                        let _ = done.wait();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..rounds {
+            v.clear_lockout();
+            v.report_failure("a", None);
+            let _ = go.wait();
+            let _ = done.wait();
+            let says_locked = v.is_key_locked_out(hb);
+            let readable = v.with_key(hb, |_| ()).is_ok();
+            let was_locked = v.clear_key_lockout("b");
+            assert_eq!(says_locked, !readable, "round {round}");
+            assert_eq!(says_locked, was_locked, "round {round}");
+            assert!(!format!("{v:?}").contains(&usize::MAX.to_string()));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+
+    /// Unregistering a key drops its lockout and failure history; a key
+    /// registered later under the same name starts clean.
+    #[test]
+    fn unregister_forgets_lockout_and_failures() {
+        let v = KeyVaultBuilder::new()
+            .with_key_lockout(2, Duration::from_secs(600), None)
+            .build();
+        let h = v.register("k", key(1)).unwrap();
+        v.report_failure("k", None);
+        v.report_failure("k", None);
+        assert!(v.is_key_locked_out(h));
+        v.unregister(h).unwrap();
+        assert_eq!(v.inner.tracker.as_ref().unwrap().len(), 0);
+        let h = v.register("k", key(1)).unwrap();
+        assert!(!v.is_key_locked_out(h));
+        v.report_failure("k", None);
+        assert!(!v.is_key_locked_out(h), "old failures still counted");
+    }
+
+    /// Rotation keeps the key's lockout.
+    #[test]
+    fn rotate_keeps_the_lockout() {
+        let v = KeyVaultBuilder::new()
+            .with_key_lockout(1, Duration::from_secs(600), None)
+            .build();
+        let h = v.register("k", key(1)).unwrap();
+        v.rotate(h, key(2)).unwrap();
+        v.report_failure("k", None);
+        assert!(v.is_key_locked_out(h));
+        assert!(matches!(v.rotate(h, key(3)), Err(Error::LockedOut)));
+        assert!(v.clear_key_lockout("k"));
+        v.rotate(h, key(3)).unwrap();
+        assert!(!v.is_key_locked_out(h));
+    }
+
+    /// Dynamic notes reach the monitor.
+    #[test]
+    fn report_failure_with_note_forwards_the_note() {
+        #[derive(Default)]
+        struct Notes(std::sync::Mutex<Vec<String>>);
+        impl SecurityMonitor for Notes {
+            fn on_decryption_failure(&self, ctx: &FailureContext) {
+                self.0.lock().unwrap().push(ctx.note.to_string());
+            }
+            fn on_anomalous_access(&self, _: &AccessContext) {}
+            fn on_threshold_breach(&self, _: &ThresholdContext) {}
+        }
+        let notes = Arc::new(Notes::default());
+        let v = KeyVaultBuilder::new()
+            .with_monitor(Arc::clone(&notes) as Arc<dyn SecurityMonitor>)
+            .build();
+        v.report_failure_with_note("k", format!("tag error {}", 7));
+        v.report_failure("k", Some("static"));
+        assert_eq!(
+            *notes.0.lock().unwrap(),
+            alloc::vec!["tag error 7".to_string(), "static".to_string()]
+        );
+    }
+
+    // ----- Nested with_key -----
+
+    /// A `with_key` inside another `with_key` callback works, on the same
+    /// vault and on another one, three levels deep. In 1.1 it panicked
+    /// with "`RefCell` already borrowed".
+    #[test]
+    fn nested_with_key_works() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let other = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let a = v.register("a", key(1)).unwrap();
+        let b = v.register("b", RawKey::new(alloc::vec![2u8; 48])).unwrap();
+        let c = other
+            .register("c", RawKey::new(alloc::vec![3u8; 8]))
+            .unwrap();
+        let sum = v
+            .with_key(a, |ka| {
+                v.with_key(b, |kb| {
+                    other
+                        .with_key(c, |kc| {
+                            assert!(ka.iter().all(|&x| x == 1));
+                            assert!(kb.iter().all(|&x| x == 2));
+                            assert!(kc.iter().all(|&x| x == 3));
+                            ka.len() + kb.len() + kc.len()
+                        })
+                        .unwrap()
+                })
+                .unwrap()
+            })
+            .unwrap();
+        assert_eq!(sum, 32 + 48 + 8);
+        // The thread's scratch was wiped, and is usable again.
+        SCRATCH.with(|cell| assert!(cell.borrow().buf.iter().all(|&x| x == 0)));
+        assert_eq!(v.with_key(b, <[u8]>::len).unwrap(), 48);
+    }
+
+    /// Strict locking applies to the per-call buffer of a nested read too.
+    #[test]
+    fn nested_with_key_under_strict_locking() {
+        let v = KeyVaultBuilder::new().with_strict_locking(true).build();
+        let Ok(a) = v.register("a", key(1)) else {
+            return; // no lock budget on this machine
+        };
+        let Ok(b) = v.register("b", key(2)) else {
+            return;
+        };
+        let r = v.with_key(a, |_| v.with_key(b, <[u8]>::len)).unwrap();
+        assert!(matches!(r, Ok(32) | Err(Error::MemoryLock(_))));
+    }
+
+    // ----- Registry writes -----
+
+    /// Writes cost the same with 200,000 keys registered as with none. In
+    /// 1.1 every write copied the whole map (milliseconds per write at
+    /// this size); the trie copies one path.
+    #[test]
+    fn writes_do_not_copy_the_registry() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let t = Instant::now();
+        let handles: Vec<_> = (0..200)
+            .map(|i| v.register(format!("small-{i}"), key(1)).unwrap())
+            .collect();
+        for &h in &handles {
+            v.rotate(h, key(2)).unwrap();
+        }
+        let small = t.elapsed();
+
+        pad_registry(&v, 200_000);
+        let t = Instant::now();
+        let handles: Vec<_> = (0..200)
+            .map(|i| v.register(format!("large-{i}"), key(1)).unwrap())
+            .collect();
+        for &h in &handles {
+            v.rotate(h, key(2)).unwrap();
+        }
+        for &h in &handles {
+            v.unregister(h).unwrap();
+        }
+        let large = t.elapsed();
+        assert_eq!(v.key_count(), 200_200);
+        assert!(v.handle_for_name("filler-199999").is_some());
+        assert!(v.handle_for_name("large-0").is_none());
+        assert!(
+            large < small * 20 + Duration::from_millis(500),
+            "200 writes: {small:?} on a small registry, {large:?} with 200k keys"
+        );
+    }
+
+    /// Duplicate names are found by hash, including after removals.
+    #[test]
+    fn duplicate_names_are_rejected_by_lookup() {
+        let v = KeyVaultBuilder::new().build();
+        let h = v.register("x", key(1)).unwrap();
+        assert!(matches!(
+            v.register("x", key(2)),
+            Err(Error::InvalidConfig(_))
+        ));
+        v.unregister(h).unwrap();
+        let h2 = v.register("x", key(3)).unwrap();
+        assert_eq!(v.handle_for_name("x"), Some(h2));
+    }
+
+    /// Add `n` filler entries straight into the registry.
+    fn pad_registry(v: &KeyVault, n: usize) {
+        let mut map = (*v.inner.keys.load_full()).clone();
+        let shared = v
+            .inner
+            .fragmenter
+            .fragment(&RawKey::new(alloc::vec![9u8; 8]))
+            .unwrap();
+        for i in 0..n {
+            let id = KeyHandle::allocate().id();
+            let name = format!("filler-{i}");
+            let name_hash = v.inner.names.hash(&name);
+            map.by_name = map.by_name.insert(name_hash, name.clone(), id).0;
+            let entry = Arc::new(KeyEntry {
+                name,
+                name_hash,
+                fragments: shared.share(),
+                metadata: KeyMetadata::new(Duration::ZERO, 8, None),
+                lock: Arc::new(KeyLock::new()),
+            });
+            map.by_id = map.by_id.insert(id_hash(id), id, entry).0;
+        }
+        v.inner.keys.store(Arc::new(map));
+    }
+
+    // ----- Read path -----
+
+    /// `with_key` takes no reference on the key's storage or entry: the
+    /// callback runs with the counts the registry alone holds. In 1.1 each
+    /// read cloned the storage `Arc`, so every thread reading one key
+    /// wrote to the same counter.
+    #[test]
+    fn with_key_takes_no_reference_on_the_key() {
+        let v = KeyVaultBuilder::new().build();
+        let h = v.register("k", key(1)).unwrap();
+        let counts = || {
+            let snapshot = v.inner.keys.load();
+            let entry = snapshot.get(h.id()).unwrap();
+            (Arc::strong_count(entry), entry.fragments.store_refs())
+        };
+        let outside = counts();
+        let inside = v.with_key(h, |_| counts()).unwrap();
+        assert_eq!(outside, (1, 1));
+        assert_eq!(inside, outside);
+    }
+
+    /// A key unregistered while a reader is inside its callback stays
+    /// intact for that reader: the callback works on the copy.
+    #[test]
+    fn unregister_during_a_read_is_safe() {
+        let v = KeyVaultBuilder::new().normalize_with_blake3(false).build();
+        let h = v.register("k", key(7)).unwrap();
+        let seen = v
+            .with_key(h, |k| {
+                v.unregister(h).unwrap();
+                k.to_vec()
+            })
+            .unwrap();
+        assert_eq!(seen, alloc::vec![7u8; 32]);
+        assert!(!v.contains(h));
+    }
+
+    // ----- Memory status -----
+
+    #[test]
+    fn memory_status_counts_every_key() {
+        let v = KeyVaultBuilder::new().build();
+        assert_eq!(v.memory_status(), MemoryStatus::default());
+        let hs: Vec<_> = (0..10)
+            .map(|i| v.register(format!("k{i}"), key(1)).unwrap())
+            .collect();
+        let status = v.memory_status();
+        assert_eq!(status.keys, 10);
+        assert_eq!(status.locked + status.unlocked(), 10);
+        for h in hs {
+            let locked = v.is_memory_locked(h).unwrap();
+            if status.all_locked() {
+                assert!(locked);
+            }
+        }
+        assert_eq!(v.is_memory_locked(KeyHandle::allocate()), None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(status.excluded_from_dumps, 10);
+    }
+
+    #[test]
+    fn new_and_default_match_the_builder() {
+        let a = KeyVault::new();
+        let b = KeyVault::default();
+        let c = KeyVault::builder().build();
+        for v in [&a, &b, &c] {
+            assert!(v.config().key_normalization);
+            assert!(!v.config().strict_locking);
+            assert_eq!(v.config().failure_tracking_capacity, 4096);
+        }
     }
 }

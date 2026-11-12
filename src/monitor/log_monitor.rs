@@ -13,7 +13,7 @@
 //! key material in context structs), so the log lines are safe to ship
 //! to any centralized log aggregator.
 
-use super::{AccessContext, FailureContext, SecurityMonitor, ThresholdContext};
+use super::{AccessContext, FailureContext, MemoryLockContext, SecurityMonitor, ThresholdContext};
 
 /// `SecurityMonitor` implementation that emits `tracing` events.
 ///
@@ -77,6 +77,15 @@ impl SecurityMonitor for LogMonitor {
             lockout_triggered = ctx.lockout_triggered,
             scope = ?ctx.scope,
             "threshold breach",
+        );
+    }
+
+    fn on_memory_lock_failure(&self, ctx: &MemoryLockContext) {
+        tracing::warn!(
+            target: "key_vault::monitor",
+            key_name = %ctx.key_name,
+            refused = ctx.refused,
+            "key memory could not be page-locked",
         );
     }
 }

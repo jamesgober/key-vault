@@ -47,6 +47,8 @@ zero-on-drop byte buffer — until the caller's scoped callback returns.
 |------|------|-----------|
 | `src/lib.rs` | Lint config, module declarations, re-exports | crate root |
 | `src/vault/mod.rs` | `KeyVault`, `KeyVaultBuilder`, `VaultConfig`, the registry, all public ops | external |
+| `src/vault/trie.rs` | Persistent hash trie for the registry snapshot (1.2) | private |
+| `src/vault/tracker.rs` | Bounded, sharded failure tracker for the lockout thresholds (1.2) | private |
 | `src/fetcher/` | `KeyFetch` trait + 4 implementations + `RawKey` + `FetchContext` | external |
 | `src/fragment/` | `FragmentStrategy` trait + 4 implementations + `Fragments` | external |
 | `src/decoy/` | `DecoyStrategy` trait + 3 implementations | external |
@@ -76,7 +78,7 @@ cheap (atomic refcount). Reads are lock-free through `ArcSwap`; writes
 
 ```rust
 struct VaultInner {
-    keys: ArcSwap<HashMap<KeyId, KeyEntry>>,   // no_std: spin-locked Arc<BTreeMap>
+    keys: ArcSwap<Snapshot>,         // no_std: spin-locked Arc<Snapshot>
     writer: Mutex<()>,
     config: VaultConfig,
     fragmenter: Fragmenter,          // Standard (static dispatch) or Arc<dyn FragmentStrategy>
@@ -87,34 +89,59 @@ struct VaultInner {
     clock: Arc<dyn Clock>,           // StdClock, or the caller's without std
     master: Option<MasterVerifier>,  // random hash key + keyed digest, locked
     master_backoff: Mutex<Backoff>,
-    failure_tracker: Mutex<BTreeMap<String, VecDeque<Duration>>>,  // clock time
-    locked_out: AtomicBool,                            // vault-wide lockout
-    key_locks: Mutex<BTreeMap<String, Option<Duration>>>,  // per-key lockout
-    key_locks_active: AtomicUsize,                     // lets with_key skip key_locks
+    names: NameHasher,               // SipHash-2-4 under a random per-vault key
+    tracker: Option<FailureTracker>, // None when no threshold is on
+    locked_out: AtomicBool,          // vault-wide lockout
+    lock_failing: AtomicBool,        // reports lock failures to the monitor once per run
+}
+
+struct Snapshot {                    // persistent hash tries (trie.rs), 1.2
+    by_id: HashTrie<KeyId, Arc<KeyEntry>>,
+    by_name: HashTrie<String, KeyId>,
 }
 
 struct KeyEntry {
     name: String,
-    fragments: Fragments,            // shares an Arc'd store; may own a protected region
+    name_hash: u64,
+    fragments: Fragments,            // Arc'd store; may own a protected region
     metadata: KeyMetadata,
+    lock: Arc<KeyLock>,              // per-key lockout word, kept across rotations
 }
 ```
 
 **Hot path** (`with_key`): load the `ArcSwap` snapshot, look up the
-entry, check the per-key lockout (one atomic load when no key is locked
-out), take a reference to the fragments, drop the snapshot, open the
-protected region if there is one, defragment into the thread-local
-scratch buffer (page-locked, dump-excluded, zeroed after every call),
-close the region, run the user closure, optionally emit an audit event.
+entry in the id trie, check the per-key lockout (one atomic load of the
+key's own lock word), open the protected region if there is one,
+defragment into the thread-local scratch buffer (page-locked,
+dump-excluded, zeroed after every call), close the region, drop the
+snapshot, run the user closure on the scratch copy, optionally emit an
+audit event. No reference count is taken on the key, so readers of one
+key share no written cache line (1.2; before, each read cloned the
+store's `Arc`). A `with_key` inside another one's callback finds the
+thread's scratch in use and reassembles into a buffer of its own (1.2;
+before, it panicked).
 
 **Write path** (`register` / `rotate` / `unregister`): fragment the new
-key outside any lock, then take the writer mutex, load the current map,
-re-check the precondition (name not taken, key still present), clone
-the map with the change applied and `store` it, and release the mutex.
-Readers either see the old map or the new map, never a torn
-intermediate. Before 1.0.2 writers used `ArcSwap::rcu` with the check
+key outside any lock, then take the writer mutex, load the current
+snapshot, re-check the precondition (name not taken, key still
+present), build the new snapshot and `swap` it in, and release the
+mutex. Readers either see the old snapshot or the new one, never a torn
+intermediate. The snapshot is a pair of persistent hash tries (32-way
+branches, at most 13 levels): a write copies the nodes on one path and
+shares everything else, so its cost does not grow with the number of
+keys, and duplicate-name checks and `handle_for_name` are hashed
+lookups (1.2; before, every write cloned the whole map and scanned
+every name). Before 1.0.2 writers used `ArcSwap::rcu` with the check
 outside the retry loop, which let two `register` calls insert the same
 name and let `rotate` report success for a key removed concurrently.
+
+**Failure tracking** (`report_failure`, `tracker.rs`, 1.2): nothing is
+recorded when both thresholds are off. Otherwise each name (by keyed
+hash) keeps at most 64 `(time, count)` slots; names of registered keys
+and the master credential are pinned, other names share a fixed
+capacity with oldest-idle eviction; sixteen shards, each with its own
+lock. Per-key lockouts live in each entry's lock word, so no separate
+map or counter has to be kept in step with them.
 
 ### `src/fragment/` — Layer 3
 
@@ -141,8 +168,11 @@ correctly.
 ### `src/memory/` — Layer 2 + 7
 
 `LockedBytes` takes a block from the page pool (`pool.rs`) when it is
-2048 bytes or smaller: pool pages are mapped by the crate, locked and
-excluded from dumps once, and kept for the life of the process.
+2048 bytes or smaller: pool memory is mapped by the crate in 16-page
+chunks (each excluded from dumps once), pages are locked as they are
+handed to a size class, and everything is kept for the life of the
+process. The pool records each page's lock state, hands out blocks on
+locked pages first, and retries pages whose lock failed (1.2).
 Larger buffers own an exact-size heap buffer, and a page-protected
 key's buffers point into its `GuardedRegion`. A heap buffer takes a
 reference on every page it touches in a process-wide page table; a page
@@ -157,10 +187,16 @@ locked (not on Windows), excluded from dumps, `PROT_NONE` /
 `PAGE_NOACCESS` except while a `RegionAccess` guard is alive, zeroed and
 unmapped on drop.
 
-`LockedBytes::is_locked()` reports whether mlock was actually
-permitted (containers and unprivileged contexts may have
-`RLIMIT_MEMLOCK = 0`). The buffer still works as a plain
-zero-on-drop wrapper when mlock fails.
+Whether a key's memory is actually locked is public since 1.2:
+`Fragments::is_locked()`, `KeyVault::is_memory_locked()` and
+`KeyVault::memory_status()` read the pool's and the page table's
+current state (a lock can fail at the process's `RLIMIT_MEMLOCK` or,
+on Windows, its working-set limit). The buffer still works as a plain
+zero-on-drop wrapper when the lock fails; strict locking
+(`with_strict_locking`) refuses such keys instead. On Windows a failed
+lock first raises the working-set size (`windows.rs`). After `fork`, a
+`pthread_atfork` flag makes the child's next vault call lock every page
+again (`relock_if_forked`).
 
 ### `src/decoy/` — Layer 4
 

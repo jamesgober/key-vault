@@ -125,7 +125,13 @@ impl FragmentStrategy for RandomFragmenter {
         // and turning each group into a chunk. Each chunk's bytes thus
         // come from non-contiguous, randomly-chosen original positions.
         let mut chunks: Vec<LockedBytes> = Vec::new();
-        let mut layout_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+        // The layout is 4 bytes per chunk plus 4 per key byte, and there
+        // are at most `total_len` chunks. Reserve that up front: a `Vec`
+        // that grows frees its old buffers without wiping them, which
+        // would leave partial copies of the layout on the heap.
+        let layout_capacity = total_len.saturating_mul(8);
+        let mut layout_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity(layout_capacity));
         let mut cursor = 0usize;
         while cursor < positions.len() {
             let remaining = positions.len() - cursor;
@@ -159,6 +165,11 @@ impl FragmentStrategy for RandomFragmenter {
 
             cursor += size;
         }
+        debug_assert_eq!(
+            layout_bytes.capacity(),
+            layout_capacity,
+            "layout buffer reallocated"
+        );
 
         let layout = LockedBytes::from_slice(&layout_bytes);
         drop(layout_bytes);

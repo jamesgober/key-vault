@@ -30,16 +30,44 @@ allows.
 
 ## Layer 2 (page locking and dump exclusion) — per platform
 
+Every OS limits how much memory a process may lock. A key registered
+after that limit is reached is still stored, in memory the OS may write
+to swap. Since 1.2 this is visible and can be refused:
+
+- `KeyVault::memory_status()` counts registered keys whose memory is
+  fully page-locked (and fully excluded from dumps);
+  `KeyVault::is_memory_locked(handle)` and `Fragments::is_locked()`
+  answer for one key. These read the current state, so a page locked by
+  a later retry reads as locked.
+- `SecurityMonitor::on_memory_lock_failure` fires when a key is stored
+  unlocked (once per run of failures).
+- `KeyVaultBuilder::with_strict_locking(true)` makes `register` and
+  `rotate` fail with `Error::MemoryLock` instead of storing the key
+  unlocked, and `with_key` fail the same way if its scratch buffer
+  cannot be locked.
+- The page pool records which of its pages are locked, hands out blocks
+  on locked pages first, and retries pages whose lock failed, so raising
+  the limit while the process runs helps keys registered afterwards
+  (before 1.2 a pool page that failed to lock stayed unlocked for the
+  life of the process).
+
+A 32-byte key uses about 0.04 pages of pool memory (fragments and
+layout), so a budget of N locked pages holds roughly 25 * N keys, fewer
+with large keys, decoys, or page protection (one page or more per key).
+
 ### Linux
 
 - `libc::mlock` on construction and `libc::munlock` on drop, applied to
   whole pages through a per-page reference count (1.0.2): a page is
   unlocked only when the last live buffer on it is dropped. Both
-  syscalls are best-effort: when `RLIMIT_MEMLOCK = 0`
-  (unprivileged containers, Docker default), the call fails and
-  `LockedBytes::is_locked()` returns `false`. The buffer still works
-  as a plain zero-on-drop wrapper — no key material leaks, just no
-  swap protection.
+  syscalls are best-effort: once the process's locked memory reaches
+  `RLIMIT_MEMLOCK` (8 MiB by default on many distributions, 64 KiB in
+  many container runtimes), the call fails and the key is stored
+  unlocked. `KeyVault::memory_status()` reports it, and strict locking
+  refuses it (see above). The buffer still works as a plain
+  zero-on-drop wrapper, so no key material leaks, just no swap
+  protection. Check the limit with `ulimit -l` (in kB) or
+  `grep "locked memory" /proc/<pid>/limits`.
 - The `tests/mlock_verified.rs` integration test reads
   `/proc/self/status` `VmLck` before and after registering 64 keys to
   prove the syscall is being honoured. It self-skips when
@@ -62,6 +90,19 @@ allows.
   pages out. `gcore` and debuggers read memory directly and do not.
 - Android uses the same calls. FreeBSD and DragonFly use
   `MADV_NOCORE` / `MADV_CORE`.
+- `fork`: a child process does not inherit memory locks (POSIX; Linux,
+  macOS and the BSDs all behave this way), so before 1.2 a pre-fork
+  server's workers held every key unlocked while the crate believed
+  them locked. Since 1.2 the crate registers a `pthread_atfork` child
+  handler that only sets a flag; the child's next vault call (`with_key`,
+  `register`, `memory_status`, ...) locks every pool page and every
+  page in the page table again, and each page-protected key is locked
+  again the first time the child reads it. Until then the child's
+  status reports those keys as unlocked. Dump exclusion
+  (`MADV_DONTDUMP`) is inherited and needs nothing. As with any
+  `fork` of a threaded process, fork from a quiet point: a child forked
+  while another thread was inside a vault call can block on the crate's
+  locks.
 
 ### macOS
 
@@ -82,18 +123,39 @@ allows.
   `VirtualUnlock(addr, len)`. Both are best-effort and may return
   zero on failure; the wrapper handles the failure path identically
   to the Unix `mlock` failure.
-- `SetProcessWorkingSetSizeEx` controls the per-process working-set
-  limit. The crate does not call it — downstream consumers with very
-  large vaults may need to raise the limit from a privileged
-  bootstrap step.
+- **Lock budget.** Windows lets a process lock only as many pages as
+  fit in its minimum working-set size, less a few pages the system
+  keeps. The default minimum is 200 KiB (maximum 1380 KiB), which
+  leaves room for about 44 locked pages: in 1.1, roughly a thousand
+  keys. Since 1.2, when `VirtualLock` fails with
+  `ERROR_WORKING_SET_QUOTA` the crate raises the process's minimum and
+  maximum working-set sizes with `SetProcessWorkingSetSize` (by at
+  least 1 MiB at a time, 256 MiB in total) and tries again. Raising
+  one's own working set needs only the "Increase a process working
+  set" privilege (`SeIncreaseWorkingSetPrivilege`), which every user
+  holds by default; if the call fails (a policy removed the privilege,
+  or a job object caps the working set) the crate stops trying and
+  locks fail as before, which `memory_status()` shows.
+- To set the budget yourself instead, call
+  `SetProcessWorkingSetSizeEx(GetCurrentProcess(), min, max, 0)` at
+  start-up with `min` at least the memory you want locked plus about
+  200 KiB, before building vaults. A job object with
+  `JOB_OBJECT_LIMIT_WORKINGSET` (some service hosts and containers set
+  one) bounds what either approach can reach.
 - Dump exclusion (1.1): `WerRegisterExcludedMemoryBlock` on every page
   that holds key material, so Windows Error Reporting crash dumps leave
   them out. The function is looked up at run time (it exists from
   Windows 10 1709); on older systems the exclusion is skipped. WER
-  keeps at most 512 excluded blocks per process; pages beyond that are
-  not excluded until earlier ones are released. Dumps taken with
-  Task Manager, procdump, a debugger or `MiniDumpWriteDump` are not
-  affected.
+  keeps at most 512 excluded blocks per process. Since 1.2 the pool
+  maps its memory 64 KiB (16 pages) at a time and excludes each such
+  chunk as one block, so the pool uses one block per 16 pages; pool
+  chunks are never released. Each excluded heap page and each
+  page-protected key is one more block. Past 512 blocks, new memory is
+  not excluded; a heap page or protected key frees its block when
+  released, and a pool chunk whose exclusion failed is retried when
+  its pages are handed out. `memory_status().excluded_from_dumps`
+  shows how many keys are covered. Dumps taken with Task Manager,
+  procdump, a debugger or `MiniDumpWriteDump` are not affected.
 - BitLocker / TPM-backed full-disk encryption is the right
   complementary layer here. `VirtualLock` covers swap; BitLocker
   covers hibernation files, the page file and any dump that is
