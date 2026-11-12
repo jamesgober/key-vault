@@ -36,8 +36,7 @@ corpus so future runs start from a warm set.
 ## Triage
 
 Any panic, infinite loop, or OOM from libFuzzer is a contract
-violation. The fix policy is documented in `.dev/ROADMAP.md` Phase
-0.11.0:
+violation. The fix policy:
 
 - Panic → return `Result<_, Error>` instead.
 - Infinite loop → add an iteration cap proportional to input length.

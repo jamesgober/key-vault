@@ -99,8 +99,8 @@ let handle = vault.register("session", raw).unwrap();
 
 ## Post-1.0 hardware roadmap
 
-These are explicitly **out of scope for 1.0** but tracked in
-`.dev/ROADMAP.md` for future minor releases.
+These are explicitly **out of scope for 1.0** and planned for future
+minor releases.
 
 ### Later 1.x — TPM 2.0 first integration
 
