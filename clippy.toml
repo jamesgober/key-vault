@@ -44,7 +44,6 @@ doc-valid-idents = [
     # Org / product
     "KeyVault",
     "HashiCorp",
-    "HiveDB",
     "CSPRNG",
     "OSes",
     "DragonFly",

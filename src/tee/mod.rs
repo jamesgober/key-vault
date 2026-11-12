@@ -20,7 +20,7 @@
 //!
 //! Detection only. Integration with the underlying enclave APIs (signing
 //! attestation reports, sealing data, running code inside SGX/TDX/SEV/SE/Nitro)
-//! is explicitly deferred to the 1.x line — see `.dev/ROADMAP.md`.
+//! is explicitly deferred to the 1.x line.
 //!
 //! # Verification semantics
 //!
